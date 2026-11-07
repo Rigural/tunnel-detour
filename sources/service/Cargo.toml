@@ -1,0 +1,34 @@
+[package]
+name = "tunnel-detour-service"
+description = "OpenWrt DNS Fake-IP and transparent TCP exception service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tunnel-detour"
+path = "src/main.rs"
+
+[dependencies]
+hickory-proto.workspace = true
+reqwest.workspace = true
+rustix.workspace = true
+ipnet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_path_to_error.workspace = true
+socket2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tunnel-detour-core.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+rustix = { workspace = true, features = ["process"] }

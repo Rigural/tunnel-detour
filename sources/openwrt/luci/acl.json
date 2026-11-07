@@ -1,0 +1,13 @@
+{
+  "luci-app-tunnel-detour": {
+    "description": "Manage Tunnel Detour VPN exceptions",
+    "read": {
+      "ubus": { "tunnel-detour": [ "status", "validate" ] },
+      "uci": [ "tunnel-detour" ]
+    },
+    "write": {
+      "ubus": { "tunnel-detour": [ "check", "restart" ] },
+      "uci": [ "tunnel-detour" ]
+    }
+  }
+}

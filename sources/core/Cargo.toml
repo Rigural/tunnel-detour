@@ -1,0 +1,20 @@
+[package]
+name = "tunnel-detour-core"
+description = "Domain exception policy and durable Fake-IP associations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hickory-proto.workspace = true
+idna.workspace = true
+ipnet.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

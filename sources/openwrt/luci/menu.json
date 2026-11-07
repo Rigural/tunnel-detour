@@ -1,0 +1,8 @@
+{
+  "admin/services/tunnel-detour": {
+    "title": "Tunnel Detour",
+    "order": 65,
+    "action": { "type": "view", "path": "tunnel-detour/overview" },
+    "depends": { "acl": [ "luci-app-tunnel-detour" ], "uci": { "tunnel-detour": true } }
+  }
+}

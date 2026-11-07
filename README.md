@@ -1,0 +1,52 @@
+# tunnel-detour
+
+OpenWrt package for hostname-specific VPN exceptions, implemented in Rust. Selected HTTP and
+HTTPS connections use WAN through DNS Fake-IP mappings and a transparent TCP relay. Other traffic
+keeps its existing route. LuCI manages one exception list and the corresponding AdGuard Home
+forwarding rules automatically. TLS passes through without decryption.
+
+The initial target is OpenWrt One with OpenWrt 25.12.6, firewall4/nftables and APK packages.
+Exceptions support IPv4 TCP ports 80 and 443. Selected AAAA and HTTPS/SVCB answers are suppressed,
+and QUIC is rejected to allow TCP fallback. Exception traffic fails closed when its path is unavailable.
+
+## Domain rules
+
+| Rule | Matches |
+| --- | --- |
+| `example.test` | The exact hostname |
+| `*.example.test` | One subdomain level |
+| `**.example.test` | All subdomain levels, excluding the root |
+| `***.example.test` | The root and all subdomain levels |
+
+Rules combine. Adding a narrower rule does not cancel a broader one.
+
+## Configuration
+
+Packages are disabled initially. In LuCI, configure LAN/WAN networks, AdGuard API access and the
+real DNS upstream, then add exceptions and enable the service. The real upstream uses IPv4 DNS
+over TCP and must avoid AdGuard's Fake-IP forwarding path. Changes to AdGuard's DNS servers are
+not yet synchronized with this setting automatically.
+
+## Development
+
+All implementation and tooling live under `sources/`. Use Rust 1.96; isolated network and native
+OpenWrt tests require Linux and Docker. Packaging also requires the matching mediatek/filogic SDK
+and the `aarch64-unknown-linux-musl` Rust target. Native OpenWrt tests additionally require the
+`x86_64-unknown-linux-musl` target and host curl/OpenSSL.
+
+```sh
+cargo xtask build
+cargo xtask test
+cargo xtask test-network
+cargo xtask test-openwrt
+cargo xtask package --sdk /path/to/openwrt-sdk
+```
+
+The package command produces runtime and LuCI APKs in `target/packages/mediatek-filogic/` and
+checks their contents. Real-router acceptance is a separate, explicitly authorized SSH phase;
+keep its credentials and backups private. Run `cargo xtask` for available commands and prerequisites.
+
+## License
+
+The project's original code is licensed under the GNU General Public License, version 3 only
+(`GPL-3.0-only`). See [LICENSE](LICENSE) for the full terms.

@@ -1,0 +1,16 @@
+**
+!sources/
+!sources/tests/
+!sources/tests/openwrt/
+!sources/tests/openwrt/network
+!sources/tests/openwrt/firewall
+!sources/tests/openwrt/unbound.conf
+!sources/tests/openwrt/lab.init
+!sources/openwrt/
+!sources/openwrt/files/
+!sources/openwrt/files/tunnel-detour.init
+!sources/openwrt/files/tunnel-detour.config
+!sources/openwrt/luci/
+!sources/openwrt/luci/overview.js
+!sources/openwrt/luci/menu.json
+!sources/openwrt/luci/acl.json
