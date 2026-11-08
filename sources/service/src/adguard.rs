@@ -75,8 +75,15 @@ struct DnsInfo {
 
 #[derive(Deserialize)]
 struct ServerStatus {
+    running: bool,
     dns_addresses: Vec<String>,
     dns_port: u16,
+    protection_enabled: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct AdguardHealth {
+    dns_running: bool,
     protection_enabled: bool,
 }
 
@@ -210,6 +217,15 @@ impl AdguardManager {
 }
 
 impl AdguardControl {
+    /// Verify access to the local AdGuard API without changing DNS, filtering, or ownership state.
+    pub(crate) async fn probe(&self) -> Result<AdguardHealth, AdguardError> {
+        let status: ServerStatus = self.get("status").await?;
+        Ok(AdguardHealth {
+            dns_running: status.running,
+            protection_enabled: status.protection_enabled,
+        })
+    }
+
     pub(crate) fn new(settings: AdguardSettings) -> Result<Self, ServiceError> {
         let endpoint = settings.endpoint()?;
         let client = Client::builder()

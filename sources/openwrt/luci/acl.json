@@ -1,12 +1,16 @@
 {
   "luci-app-tunnel-detour": {
-    "description": "Manage Tunnel Detour VPN exceptions",
+    "description": "Manage Tunnel Detour for AdGuard Home",
     "read": {
-      "ubus": { "tunnel-detour": [ "status", "validate" ] },
+      "ubus": {
+        "tunnel-detour": [ "status", "validate" ],
+        "network.interface": [ "dump" ],
+        "luci-rpc": [ "getDHCPLeases" ]
+      },
       "uci": [ "tunnel-detour" ]
     },
     "write": {
-      "ubus": { "tunnel-detour": [ "check", "restart" ] },
+      "ubus": { "tunnel-detour": [ "check", "test_adguard", "restart" ] },
       "uci": [ "tunnel-detour" ]
     }
   }

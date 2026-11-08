@@ -1,6 +1,6 @@
-# tunnel-detour
+# Tunnel Detour for AdGuard Home
 
-OpenWrt package for hostname-specific VPN exceptions, implemented in Rust. Selected HTTP and
+Domain-based VPN exceptions for OpenWrt and AdGuard Home, implemented in Rust. Selected HTTP and
 HTTPS connections use WAN through DNS Fake-IP mappings and a transparent TCP relay. Other traffic
 keeps its existing route. LuCI manages one exception list and the corresponding AdGuard Home
 forwarding rules automatically. TLS passes through without decryption.
@@ -8,6 +8,25 @@ forwarding rules automatically. TLS passes through without decryption.
 The initial target is OpenWrt One with OpenWrt 25.12.6, firewall4/nftables and APK packages.
 Exceptions support IPv4 TCP ports 80 and 443. Selected AAAA and HTTPS/SVCB answers are suppressed,
 and QUIC is rejected to allow TCP fallback. Exception traffic fails closed when its path is unavailable.
+
+## LuCI interface
+
+Status shows service health and active connections. Exceptions provides per-rule validation, match
+examples and undo before saving. Settings groups network selection and AdGuard access, including a
+connection test that uses the form values without saving them.
+
+Screenshots use an isolated demo with synthetic domains, addresses and connection data.
+
+![Service status and active connections](docs/screenshots/status.jpg)
+
+<details>
+<summary>Exception list and settings</summary>
+
+![Exception scopes and matching examples](docs/screenshots/exceptions.jpg)
+
+![Network settings and local AdGuard connection](docs/screenshots/settings.jpg)
+
+</details>
 
 ## Domain rules
 
@@ -21,6 +40,9 @@ and QUIC is rejected to allow TCP fallback. Exception traffic fails closed when 
 Rules combine. Adding a narrower rule does not cancel a broader one.
 
 ## Configuration
+
+Requires AdGuard Home on the router. The packages are named `tunnel-detour` and
+`luci-app-tunnel-detour`.
 
 Packages are disabled initially. In LuCI, configure LAN/WAN networks, AdGuard API access and the
 real DNS upstream, then add exceptions and enable the service. The real upstream uses IPv4 DNS
@@ -45,6 +67,17 @@ cargo xtask package --sdk /path/to/openwrt-sdk
 The package command produces runtime and LuCI APKs in `target/packages/mediatek-filogic/` and
 checks their contents. Real-router acceptance is a separate, explicitly authorized SSH phase;
 keep its credentials and backups private. Run `cargo xtask` for available commands and prerequisites.
+
+After building the APKs, an authorized same-version hardware update preserves configuration and
+keeps a private recovery copy. The probe checks an existing rule through DNS and verified HTTPS,
+including redirects covered by existing rules; it requires host dig/curl. Private records stay
+outside the repository.
+
+```sh
+TUNNEL_DETOUR_PACKAGE_SDK=/path/to/openwrt-sdk \
+  cargo xtask test-router --host ROUTER --access /private/access.env reinstall-active
+cargo xtask test-router --host ROUTER --access /private/access.env probe-active
+```
 
 ## License
 

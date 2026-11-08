@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::Read,
     num::NonZeroUsize,
@@ -6,15 +7,21 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tunnel_detour_core::RuleSet;
+use tunnel_detour_core::{DomainPattern, RuleSet};
 
-use crate::{ServiceError, adguard::AdguardManager, config::ResourceLimits, kernel::Kernel, uci};
+use crate::{
+    ServiceError,
+    adguard::{AdguardControl, AdguardError, AdguardManager},
+    config::{AdguardSettings, ResourceLimits},
+    kernel::Kernel,
+    uci,
+};
 
 const INPUT_LIMIT: u64 = 1_048_576;
 
 /// rpcd executable-plugin signature. No arbitrary commands or file paths are accepted.
 pub fn rpc_methods() -> Value {
-    json!({"status": {}, "validate": {"patterns": ""}, "check": {}, "restart": {}})
+    json!({"status": {}, "validate": {"patterns": ""}, "check": {}, "test_adguard": {"api_url":"", "username":"", "password":""}, "restart": {}})
 }
 
 fn read_private(path: &Path) -> Result<Option<Vec<u8>>, ServiceError> {
@@ -45,7 +52,27 @@ pub fn validate_patterns(lines: &str) -> Value {
     let Some(capacity) = NonZeroUsize::new(ResourceLimits::default().max_rules) else {
         return json!({"valid": false, "error": "invalid_capacity"});
     };
-    match RuleSet::from_lines(lines, capacity) {
+    // Row diagnostics use the production hostname type; errors never echo invalid input.
+    // Bound diagnostics independently of the request-size limit.
+    let mut rows = Vec::new();
+    let mut seen = BTreeMap::new();
+    for line in lines.lines().take(capacity.get()) {
+        let row = match line.trim().parse::<DomainPattern>() {
+            Ok(pattern) => {
+                let pattern = pattern.to_string();
+                let duplicate = seen.insert(pattern.clone(), rows.len());
+                if let Some(first) = duplicate {
+                    rows[first] = json!({"pattern":pattern,"error":"duplicate"});
+                    json!({"pattern":pattern,"error":"duplicate"})
+                } else {
+                    json!({"pattern":pattern})
+                }
+            }
+            Err(_) => json!({"error":"invalid_domain"}),
+        };
+        rows.push(row);
+    }
+    let mut result = match RuleSet::from_lines(lines, capacity) {
         Ok(rules) => {
             let patterns: Vec<_> = rules
                 .rules()
@@ -55,7 +82,9 @@ pub fn validate_patterns(lines: &str) -> Value {
             json!({"valid": true, "patterns": patterns})
         }
         Err(error) => json!({"valid": false, "error": error.to_string()}),
-    }
+    };
+    result["rows"] = json!(rows);
+    result
 }
 
 /// Serve one rpcd request. rpcd owns authentication and applies method-specific ACLs.
@@ -65,10 +94,12 @@ pub async fn rpc_call(method: &str, input: &[u8]) -> Result<Value, ServiceError>
     }
     let request: Value = serde_json::from_slice(input)?;
     let object = request.as_object().ok_or(ServiceError::Protocol)?;
-    if object
-        .keys()
-        .any(|key| key != "ubus_rpc_session" && !(method == "validate" && key == "patterns"))
-    {
+    if object.keys().any(|key| {
+        key != "ubus_rpc_session"
+            && !(method == "validate" && key == "patterns")
+            && !(method == "test_adguard"
+                && matches!(key.as_str(), "api_url" | "username" | "password"))
+    }) {
         return Err(ServiceError::Protocol);
     }
     match method {
@@ -94,7 +125,7 @@ pub async fn rpc_call(method: &str, input: &[u8]) -> Result<Value, ServiceError>
                 || (pid.is_none()
                     && matches!(status["phase"].as_str(), Some("failed" | "stopped")));
             Ok(
-                json!({"running": pid.is_some(), "status": if current { status } else { Value::Null }}),
+                json!({"enabled":uci::is_enabled().await?, "running": pid.is_some(), "status": if current { status } else { Value::Null }}),
             )
         }
         "validate" => {
@@ -106,6 +137,66 @@ pub async fn rpc_call(method: &str, input: &[u8]) -> Result<Value, ServiceError>
             Ok(None) => Err(ServiceError::Protocol),
             Err(error) => Ok(json!({"valid": false, "error": error.code()})),
         },
+        "test_adguard" => {
+            let result = async {
+                let settings = if ["api_url", "username", "password"]
+                    .iter()
+                    .any(|key| object.contains_key(*key))
+                {
+                    // Draft credentials are transient: no UCI writes, persistence, or logging.
+                    // Partial drafts must never silently fall back to applied credentials.
+                    let field = |key: &str| request[key].as_str().ok_or(ServiceError::Protocol);
+                    let username = field("username")?;
+                    let password = field("password")?;
+                    let authenticated = !username.is_empty() || !password.is_empty();
+                    let settings = AdguardSettings {
+                        api_url: field("api_url")?.to_owned(),
+                        username: authenticated.then(|| username.to_owned()),
+                        password: authenticated.then(|| password.to_owned()),
+                    };
+                    settings.endpoint()?;
+                    settings
+                } else {
+                    uci::cleanup_settings().await?
+                };
+                AdguardControl::new(settings)?
+                    .probe()
+                    .await
+                    .map_err(ServiceError::from)
+            }
+            .await;
+            match result {
+                Ok(health) => Ok(json!({"connected":true,"health":health})),
+                Err(error) => {
+                    let code = match &error {
+                        ServiceError::Adguard(AdguardError::HttpStatus(401 | 403)) => {
+                            "adguard_authentication_failed"
+                        }
+                        ServiceError::Adguard(AdguardError::Request(source))
+                            if source.is_timeout() =>
+                        {
+                            "adguard_timeout"
+                        }
+                        ServiceError::Adguard(AdguardError::Request(source))
+                            if source.is_connect() =>
+                        {
+                            "adguard_unreachable"
+                        }
+                        ServiceError::Adguard(
+                            AdguardError::Endpoint | AdguardError::RemoteEndpoint,
+                        )
+                        | ServiceError::Config(crate::config::ConfigError::AdguardEndpoint) => {
+                            "adguard_endpoint_invalid"
+                        }
+                        ServiceError::Adguard(
+                            AdguardError::Response { .. } | AdguardError::Json(_),
+                        ) => "adguard_response_invalid",
+                        _ => error.code(),
+                    };
+                    Ok(json!({"connected":false,"error":code}))
+                }
+            }
+        }
         "restart" => {
             let output =
                 crate::kernel::command("/etc/init.d/tunnel-detour", &["restart".into()], None)

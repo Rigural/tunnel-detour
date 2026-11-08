@@ -1,0 +1,78 @@
+name: Release Tunnel Detour for AdGuard Home
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test and build APKs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Refresh system package metadata
+        run: sudo apt-get update
+      - name: Install build prerequisites
+        run: sudo apt-get install --yes --no-install-recommends curl openssl zstd
+      - name: Install targets with the repository's pinned Rust toolchain
+        run: rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check lints
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run workspace tests
+        run: cargo xtask test
+      - name: Run isolated network acceptance tests
+        run: cargo xtask test-network
+      - name: Run native OpenWrt management acceptance tests
+        run: cargo xtask test-openwrt
+      - name: Build and inspect reference-target packages
+        run: cargo xtask package --download-sdk "$RUNNER_TEMP/openwrt-sdk" --release-tag "$RELEASE_TAG"
+      - name: Transfer verified release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: openwrt-apks
+          path: |
+            target/packages/mediatek-filogic/*.apk
+            target/packages/mediatek-filogic/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+          archive: true
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download verified build assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: openwrt-apks
+          path: artifacts
+          digest-mismatch: error
+      - name: Verify transferred package checksums
+        working-directory: artifacts
+        run: sha256sum --check SHA256SUMS
+      - name: Create release and upload APKs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$RELEASE_TAG" artifacts/*.apk artifacts/SHA256SUMS --repo "$GITHUB_REPOSITORY" --verify-tag --title "Tunnel Detour for AdGuard Home $RELEASE_TAG" --generate-notes

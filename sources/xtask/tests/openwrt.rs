@@ -239,7 +239,9 @@ impl Lab {
         let url = format!("http://127.0.0.1:13000/control/{operation}");
         arguments.push(&url);
         let result = self.exec(&arguments, bytes.as_deref())?;
-        if result.is_empty()
+        // Removing a subscription returns a plain-text acknowledgement.
+        if operation == "filtering/remove_url"
+            || result.is_empty()
             || result
                 .iter()
                 .copied()
@@ -277,7 +279,63 @@ impl Lab {
         self.api("install/configure", Some(json!({"web":{"ip":"127.0.0.1", "port":13000}, "dns":{"ip":"127.0.0.1", "port":53}, "username":"lab-admin", "password":self.password})), false)?;
         wait(|| Ok(self.api("status", None, true).is_ok()))
             .map_err(|error| format!("AdGuard authenticated API: {error}"))?;
-        self.api("dns_config", Some(json!({"upstream_dns":["tcp://127.0.0.1:15353"], "fallback_dns":[], "cache_optimistic":false})), true)?;
+        self.api("dns_config", Some(json!({"upstream_dns":["tcp://127.0.0.1:15353"], "bootstrap_dns":["127.0.0.1:15353"], "fallback_dns":[], "cache_optimistic":false})), true)?;
+        let subscriptions = self.api("filtering/status", None, true)?;
+        for subscription in subscriptions["filters"]
+            .as_array()
+            .ok_or("missing laboratory filter subscriptions")?
+        {
+            self.api(
+                "filtering/remove_url",
+                Some(json!({"url":subscription["url"]})),
+                true,
+            )?;
+        }
+        assert!(
+            self.api("filtering/status", None, true)?["filters"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        );
+        self.exec(&["killall", "-TERM", "AdGuardHome"], None)?;
+        wait(|| Ok(!self.raw(&["pidof", "AdGuardHome"], None)?.status.success()))?;
+        self.exec(
+            &[
+                "sed",
+                "-i",
+                "s/^    whois: true$/    whois: false/",
+                "/tmp/adguard/config.yaml",
+            ],
+            None,
+        )?;
+        self.exec(
+            &[
+                "grep",
+                "-q",
+                "^    whois: false$",
+                "/tmp/adguard/config.yaml",
+            ],
+            None,
+        )?;
+        checked(
+            "docker",
+            &[
+                "exec",
+                "--detach",
+                &self.name,
+                "AdGuardHome",
+                "--no-check-update",
+                "--web-addr",
+                "127.0.0.1:13000",
+                "-w",
+                "/tmp/adguard",
+                "-c",
+                "/tmp/adguard/config.yaml",
+                "--logfile",
+                "/tmp/adguard.log",
+            ],
+            None,
+        )?;
+        wait(|| Ok(self.api("status", None, true).is_ok()))?;
         let batch = format!(
             "set tunnel-detour.globals.real_upstream='127.0.0.1:15353'\nset tunnel-detour.globals.adguard_url='http://127.0.0.1:13000'\nset tunnel-detour.globals.adguard_username='lab-admin'\nset tunnel-detour.globals.adguard_password='{}'\ncommit tunnel-detour\n",
             self.password
@@ -352,8 +410,16 @@ fn r030_uci_changes_reconcile_through_procd_and_uninstall_removes_owned_configur
 -> TestResult {
     let lab = Lab::new()?;
     lab.configure()?;
+    assert_eq!(
+        lab.ubus("tunnel-detour", "status", json!({}))?["enabled"],
+        false
+    );
     lab.change("set tunnel-detour.selected=exception\nset tunnel-detour.selected.pattern='selected.example.test'\nset tunnel-detour.selected.enabled='1'\nset tunnel-detour.globals.enabled='1'")?;
     let first = lab.ready(None)?;
+    assert_eq!(
+        lab.ubus("tunnel-detour", "status", json!({}))?["enabled"],
+        true
+    );
     assert!(lab.lookup("selected.example.test")?.contains("198.18.0.1"));
     lab.change("set tunnel-detour.selected.enabled='0'")?;
     let second = lab.ready(Some(first))?;
@@ -370,6 +436,10 @@ fn r030_uci_changes_reconcile_through_procd_and_uninstall_removes_owned_configur
         )
     })
     .map_err(|error| format!("global disable: {error}"))?;
+    assert_eq!(
+        lab.ubus("tunnel-detour", "status", json!({}))?["enabled"],
+        false
+    );
     assert!(lab.lookup("selected.example.test")?.contains("203.0.113.2"));
     lab.change("set tunnel-detour.globals.enabled='1'")?;
     lab.ready(Some(third))?;
@@ -432,6 +502,114 @@ fn r030_uci_changes_reconcile_through_procd_and_uninstall_removes_owned_configur
 
 #[test]
 #[ignore = "requires the isolated OpenWrt management laboratory"]
+fn r039_adguard_connection_test_checks_applied_and_draft_local_credentials_without_mutating_settings()
+-> TestResult {
+    let lab = Lab::new()?;
+    lab.configure()?;
+    let dns = lab.api("dns_info", None, true)?;
+    let filters = lab.api("filtering/status", None, true)?;
+    let configuration = lab.exec(&["uci", "export", "tunnel-detour"], None)?;
+    let probe = lab.ubus("tunnel-detour", "test_adguard", json!({}))?;
+    assert_eq!(
+        probe,
+        json!({"connected":true,"health":{"dns_running":true,"protection_enabled":true}})
+    );
+    assert_eq!(lab.api("dns_info", None, true)?, dns);
+    assert_eq!(lab.api("filtering/status", None, true)?, filters);
+
+    for (url, username, password, expected) in [
+        (
+            "http://127.0.0.1:13000",
+            "lab-admin",
+            lab.password.as_str(),
+            None,
+        ),
+        (
+            "http://127.0.0.1:13000",
+            "lab-admin",
+            "incorrect-draft-password",
+            Some("adguard_authentication_failed"),
+        ),
+        (
+            "http://192.0.2.2:13000",
+            "lab-admin",
+            lab.password.as_str(),
+            Some("adguard_endpoint_invalid"),
+        ),
+    ] {
+        let draft = lab.ubus(
+            "tunnel-detour",
+            "test_adguard",
+            json!({"api_url":url,"username":username,"password":password}),
+        )?;
+        if let Some(error) = expected {
+            assert_eq!(draft, json!({"connected":false,"error":error}));
+        } else {
+            assert_eq!(draft, probe);
+        }
+    }
+    // A partial draft must be rejected rather than using the stored password.
+    let partial = lab.ubus(
+        "tunnel-detour",
+        "test_adguard",
+        json!({"api_url":"http://127.0.0.1:13000"}),
+    )?;
+    assert_eq!(partial["connected"], false);
+    assert_eq!(
+        lab.exec(&["uci", "export", "tunnel-detour"], None)?,
+        configuration
+    );
+    assert_eq!(lab.api("dns_info", None, true)?, dns);
+    assert_eq!(lab.api("filtering/status", None, true)?, filters);
+
+    lab.exec(
+        &[
+            "uci",
+            "set",
+            "tunnel-detour.globals.adguard_password=incorrect-lab-password",
+        ],
+        None,
+    )?;
+    lab.exec(&["uci", "commit", "tunnel-detour"], None)?;
+    assert_eq!(
+        lab.ubus("tunnel-detour", "test_adguard", json!({}))?,
+        json!({"connected":false,"error":"adguard_authentication_failed"})
+    );
+
+    lab.exec(
+        &[
+            "uci",
+            "set",
+            "tunnel-detour.globals.adguard_url=http://192.0.2.2:13000",
+        ],
+        None,
+    )?;
+    lab.exec(&["uci", "commit", "tunnel-detour"], None)?;
+    assert_eq!(
+        lab.ubus("tunnel-detour", "test_adguard", json!({}))?,
+        json!({"connected":false,"error":"adguard_endpoint_invalid"})
+    );
+
+    lab.exec(
+        &[
+            "uci",
+            "set",
+            "tunnel-detour.globals.adguard_url=http://127.0.0.1:13000",
+        ],
+        None,
+    )?;
+    lab.exec(&["uci", "commit", "tunnel-detour"], None)?;
+    lab.exec(&["killall", "-TERM", "AdGuardHome"], None)?;
+    wait(|| Ok(!lab.raw(&["pidof", "AdGuardHome"], None)?.status.success()))?;
+    assert_eq!(
+        lab.ubus("tunnel-detour", "test_adguard", json!({}))?,
+        json!({"connected":false,"error":"adguard_unreachable"})
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the isolated OpenWrt management laboratory"]
 fn r031_real_rpcd_read_only_permissions_allow_status_and_validation_but_deny_writes_and_commands()
 -> TestResult {
     let lab = Lab::new()?;
@@ -462,6 +640,10 @@ fn r031_real_rpcd_read_only_permissions_allow_status_and_validation_but_deny_wri
     let token = token.ok_or("read-only login did not return a session")?;
     for (object, method, payload, expected) in [
         ("tunnel-detour", "status", json!({}), 0),
+        ("network.interface", "dump", json!({}), 0),
+        ("luci-rpc", "getDHCPLeases", json!({"family":4}), 0),
+        ("luci-rpc", "getHostHints", json!({}), 6),
+        ("uci", "get", json!({"config":"network"}), 6),
         (
             "tunnel-detour",
             "validate",
@@ -469,6 +651,13 @@ fn r031_real_rpcd_read_only_permissions_allow_status_and_validation_but_deny_wri
             0,
         ),
         ("tunnel-detour", "check", json!({}), 6),
+        ("tunnel-detour", "test_adguard", json!({}), 6),
+        (
+            "tunnel-detour",
+            "test_adguard",
+            json!({"api_url":"http://127.0.0.1:13000","username":"","password":""}),
+            6,
+        ),
         ("tunnel-detour", "restart", json!({}), 6),
         (
             "uci",

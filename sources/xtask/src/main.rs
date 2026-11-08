@@ -80,6 +80,16 @@ fn run() -> Result<(), Box<dyn Error>> {
         [task, option, sdk] if task == "package" && option == "--sdk" => {
             return package::build(&root, &cargo, Path::new(sdk));
         }
+        [task, option, directory, tag_option, tag]
+            if task == "package" && option == "--download-sdk" && tag_option == "--release-tag" =>
+        {
+            return package::download_and_build(
+                &root,
+                &cargo,
+                Path::new(directory),
+                tag.to_str().ok_or("release tag must be UTF-8")?,
+            );
+        }
         [task] if task == "test-network" => return network_tests(command, &root, None),
         [task] if task == "test-openwrt" => return openwrt_tests(&cargo, &root, None),
         [task, filter] if task == "test-openwrt" => {
@@ -98,6 +108,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "cargo xtask package --sdk <directory>  Build ARM64 APKs with the OpenWrt 25.12.6 ",
                 "mediatek/filogic SDK (requires Docker, Rust 1.96 and its aarch64-unknown-linux-musl ",
                 "target); output: target/packages/mediatek-filogic\n",
+                "cargo xtask package --download-sdk <temporary-directory> --release-tag <vX.Y.Z>\n",
+                "  Verify release versions, download the pinned SDK, build and inspect APKs, and emit SHA256SUMS.\n",
                 "cargo xtask test-router --host <host> --access <private-env> ",
                 "[--run <private-directory>] <phase> [target-url]\n",
                 "  Authorized hardware phase only. Requires OpenSSH and host dig/curl/sha256sum; ",
@@ -107,6 +119,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "windows-dns, inspect-test, audit-test.\n",
                 "  install-disabled installs only the two local APKs, offline, ",
                 "with dependencies already present.\n",
+                "  reinstall-active replaces an already-active same-version installation offline, ",
+                "preserving configuration and retaining private recovery payloads; requires ",
+                "TUNNEL_DETOUR_PACKAGE_SDK to verify the actual APK payload.\n",
+                "  probe-active checks DNS and verified HTTPS for an existing rule without ",
+                "changing configuration; omit --run to use fresh private probe records.\n",
                 "  verify-disabled also requires TUNNEL_DETOUR_PACKAGE_SDK ",
                 "for exact APK payload inspection.\n",
                 "  configure-disabled <https-url> prepares own settings and a private test plan; ",

@@ -12,6 +12,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use tunnel_detour_core::{DomainPattern, MatchScope};
 
 const ASKPASS: &str = "TUNNEL_DETOUR_SSH_ASKPASS";
 const ACCESS: &str = "TUNNEL_DETOUR_SSH_ACCESS_FILE";
@@ -270,6 +271,16 @@ impl Router {
         if ready != "ready\n" {
             return Err("SSH forward did not become ready; see private validation data".into());
         }
+        let resolver = String::from_utf8(
+            self.secret_output("uci -q get tunnel-detour.globals.real_upstream || true\n")?,
+        )?;
+        let resolver = resolver.trim();
+        let current_real = resolver.parse::<std::net::SocketAddrV4>().ok().or_else(|| {
+            resolver
+                .parse::<std::net::Ipv4Addr>()
+                .ok()
+                .map(|ip| std::net::SocketAddrV4::new(ip, 53))
+        });
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async {
             let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).timeout(Duration::from_secs(15)).build()?;
@@ -296,7 +307,6 @@ impl Router {
                                 if let Some(upstreams) = unowned["upstream_dns"].as_array_mut() { upstreams.retain(|line| line.as_str()!=Some(owned.as_str())); }
                         }
                         let schemes: Vec<_> = baseline["upstream_dns"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|value|value.split_once("://").map_or("plain",|(scheme,_)|scheme)).collect();
-                        let current_real = self.acceptance_plan().ok().and_then(|plan| plan["real_upstream"].as_str().and_then(|value|value.parse::<std::net::SocketAddrV4>().ok()));
                         let matches_primary = baseline["upstream_dns"].as_array().into_iter().flatten().filter_map(Value::as_str).any(|value| {
                             let value = value.strip_prefix("tcp://").unwrap_or(value);
                             value.parse::<std::net::SocketAddrV4>().ok().or_else(||value.parse::<std::net::Ipv4Addr>().ok().map(|ip|std::net::SocketAddrV4::new(ip,53))).is_some_and(|address| Some(address)==current_real)
@@ -645,6 +655,126 @@ impl Router {
         }
         self.management("after-client-acceptance")?;
         Ok(())
+    }
+
+    fn probe_active(&self) -> Result<(), Box<dyn Error>> {
+        let status: Value = serde_json::from_slice(
+            &self.capture("active-status", "ubus -S call tunnel-detour status '{}'\n")?,
+        )?;
+        if status["running"] != true || status["status"]["phase"] != "ready" {
+            return Err("the service must be ready before testing an existing exception".into());
+        }
+        let configuration: Value = serde_json::from_slice(&self.capture(
+            "active-configuration",
+            "ubus -S call uci get '{\"config\":\"tunnel-detour\"}'\n",
+        )?)?;
+        let values = configuration["values"]
+            .as_object()
+            .ok_or("missing active configuration")?;
+        let patterns: Vec<DomainPattern> = values
+            .values()
+            .filter(|value| value[".type"] == "exception" && value["enabled"] != "0")
+            .filter_map(|value| value["pattern"].as_str())
+            .map(str::parse)
+            .collect::<Result<_, _>>()?;
+        let pattern = patterns
+            .iter()
+            .min_by_key(|pattern| match pattern.scope {
+                MatchScope::Exact => 0,
+                MatchScope::DomainAndSubdomains => 1,
+                MatchScope::DirectSubdomains => 2,
+                MatchScope::AllSubdomains => 3,
+            })
+            .ok_or("an existing enabled rule is required for this read-only probe")?;
+        let hostname = match pattern.scope {
+            MatchScope::Exact | MatchScope::DomainAndSubdomains => pattern.domain.to_string(),
+            MatchScope::DirectSubdomains | MatchScope::AllSubdomains => {
+                format!("www.{}", pattern.domain)
+            }
+        };
+        if !pattern.matches(&hostname.parse()?) {
+            return Err("the probe hostname is not selected by the existing rule".into());
+        }
+        let url = reqwest::Url::parse(&format!("https://{hostname}/"))?;
+        if url.host_str() != Some(hostname.as_str())
+            || !hostname
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+        {
+            return Err("the existing test hostname is invalid".into());
+        }
+        let interfaces: Value = serde_json::from_slice(
+            &self.capture("active-interfaces", "ubus -S call network.interface dump\n")?,
+        )?;
+        let vpn_devices: Vec<_> = interfaces["interface"]
+            .as_array()
+            .ok_or("missing interface inventory")?
+            .iter()
+            .filter(|interface| interface["proto"] == "wireguard" && interface["up"] == true)
+            .filter_map(|interface| interface["l3_device"].as_str())
+            .collect();
+        let ordinary_route: Value = serde_json::from_slice(
+            &self.capture("active-ordinary-route", "ip -j -4 route get 192.0.2.123\n")?,
+        )?;
+        if !ordinary_route[0]["dev"]
+            .as_str()
+            .is_some_and(|device| vpn_devices.contains(&device))
+        {
+            return Err(
+                "ordinary IPv4 traffic does not select an active WireGuard interface".into(),
+            );
+        }
+        println!("Ordinary IPv4 routing still selects WireGuard.");
+        let mut url = url;
+        for hop in 0..3 {
+            let hostname = url.host_str().ok_or("the probe URL has no hostname")?;
+            if url.scheme() != "https"
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.port().is_some_and(|port| port != 443)
+                || !patterns
+                    .iter()
+                    .any(|pattern| hostname.parse().is_ok_and(|name| pattern.matches(&name)))
+            {
+                return Err("the redirect is outside the existing HTTPS exception rules; no request was sent".into());
+            }
+            write_private(
+                &self.directory.join("acceptance-plan.json"),
+                &serde_json::to_vec(&json!({"hostname":hostname,"url":url.as_str()}))?,
+            )?;
+            self.probe_test()?;
+            let headers = fs::read_to_string(self.directory.join("acceptance-https.headers"))?;
+            let code = headers
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|code| code.parse::<u16>().ok())
+                .ok_or("missing HTTP response status")?;
+            if (200..300).contains(&code) {
+                return Ok(());
+            }
+            if !(300..400).contains(&code) {
+                return Err("the selected website returned an unsuccessful HTTP response; see private records".into());
+            }
+            let location = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+                .map(|(_, value)| value.trim())
+                .ok_or("the HTTP redirect has no destination")?;
+            url = url.join(location)?;
+            for name in [
+                "acceptance-plan.json",
+                "acceptance-https.body",
+                "acceptance-https.headers",
+            ] {
+                fs::rename(
+                    self.directory.join(name),
+                    self.directory.join(format!("redirect-{hop}-{name}")),
+                )?;
+            }
+        }
+        Err("the website exceeded the bounded redirect allowance".into())
     }
 
     fn windows_dns(&self) -> Result<(), Box<dyn Error>> {
@@ -1017,6 +1147,158 @@ impl Router {
         Ok(())
     }
 
+    fn reinstall_active(&self) -> Result<(), Box<dyn Error>> {
+        // This is a same-version acceptance deployment, not a general firmware upgrader.
+        let board: Value = serde_json::from_slice(
+            &self.capture("reinstall-board", "ubus -S call system board\n")?,
+        )?;
+        if board["board_name"] != "openwrt,one" || board["release"]["version"] != "25.12.6" {
+            return Err("reinstallation requires the reference router and firmware".into());
+        }
+        let installed: Value = serde_json::from_slice(&self.capture("reinstall-version", "set -e\ntest \"$(uci -q get tunnel-detour.globals.enabled)\" = 1\napk query --installed --from installed --fields name,version --format json tunnel-detour\n")?)?;
+        if installed[0]["name"] != "tunnel-detour"
+            || installed[0]["version"] != format!("{}-r1", env!("CARGO_PKG_VERSION"))
+        {
+            return Err("active reinstallation requires the same installed package version".into());
+        }
+        let expected_binary_hash = self.packaged_binary_hash()?;
+        self.management("before-reinstall")?;
+        let before: Value = serde_json::from_slice(&self.capture(
+            "reinstall-status-before",
+            "ubus -S call tunnel-detour status '{}'\n",
+        )?)?;
+        if before["running"] != true || before["status"]["phase"] != "ready" {
+            return Err("the active service must be healthy before reinstallation".into());
+        }
+        let configuration =
+            self.capture("reinstall-config-before", "uci export tunnel-detour\n")?;
+        let network = self.capture("reinstall-network-before", "uci export network\n")?;
+        let firewall = self.capture("reinstall-firewall-before", "uci export firewall\n")?;
+        // Keep live lease state out of automatic rollback: cached Fake-IPs must never lose
+        // mappings allocated after this backup. Archive only the owned executable/UI payload.
+        let archive = self.capture("reinstall-payload-before.tar.gz", "set -e\nset -- /usr/bin/tunnel-detour /usr/libexec/rpcd/tunnel-detour /etc/init.d/tunnel-detour /etc/config/tunnel-detour /usr/share/luci/menu.d/luci-app-tunnel-detour.json /usr/share/rpcd/acl.d/luci-app-tunnel-detour.json /www/luci-static/resources/view/tunnel-detour/overview.js\nif test -f /www/luci-static/resources/view/tunnel-detour/overview.css; then set -- \"$@\" /www/luci-static/resources/view/tunnel-detour/overview.css; fi\ntar -czf - \"$@\"\n")?;
+        if archive.is_empty() {
+            return Err("the recoverable installed-payload archive is empty".into());
+        }
+        self.capture(
+            "reinstall-state-before.tar.gz",
+            "tar -czf - /etc/tunnel-detour /lib/apk/db/installed /etc/apk/world\n",
+        )?;
+        let run_id = self
+            .directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("invalid validation directory")?;
+        let remote = format!("/tmp/tunnel-detour-validation-{run_id}");
+        self.capture(
+            "reinstall-directory",
+            &format!(
+                "umask 077\nmkdir -p {}\nchmod 700 {}\n",
+                quote(&remote),
+                quote(&remote)
+            ),
+        )?;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files = Vec::new();
+        for name in ["tunnel-detour", "luci-app-tunnel-detour"] {
+            let file = format!("{name}-{}-r1.apk", env!("CARGO_PKG_VERSION"));
+            let destination = format!("{remote}/{file}");
+            self.upload(
+                &root.join("target/packages/mediatek-filogic").join(file),
+                &destination,
+            )?;
+            files.push(quote(&destination));
+        }
+        let files = files.join(" ");
+        let simulation = self.capture(
+            "reinstall-simulation",
+            &format!(
+                "apk add --simulate --force-reinstall --allow-untrusted --no-network {files}\n"
+            ),
+        )?;
+        validate_reinstallation_plan(&String::from_utf8(simulation)?)?;
+        // Upload recovery before mutation, so recovery does not require a working WAN.
+        let recovery = format!("{remote}/payload-before.tar.gz");
+        self.upload(
+            &self
+                .directory
+                .join("reinstall-payload-before.tar.gz.stdout"),
+            &recovery,
+        )?;
+        let result = (|| -> Result<(), Box<dyn Error>> {
+            self.capture("reinstall-apk", &format!("set -e\napk add --force-reinstall --allow-untrusted --no-network {files}\n/etc/init.d/tunnel-detour restart\n"))?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let status: Value = serde_json::from_slice(&self.capture(
+                    "reinstall-status-after",
+                    "ubus -S call tunnel-detour status '{}'\n",
+                )?)?;
+                if status["running"] == true
+                    && status["status"]["phase"] == "ready"
+                    && status["status"]["process_id"] != before["status"]["process_id"]
+                {
+                    break;
+                }
+                if status["status"]["phase"] == "failed" || std::time::Instant::now() >= deadline {
+                    return Err("the reinstalled service did not become ready".into());
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            if self.capture("reinstall-config-after", "uci export tunnel-detour\n")?
+                != configuration
+                || self.capture("reinstall-network-after", "uci export network\n")? != network
+                || self.capture("reinstall-firewall-after", "uci export firewall\n")? != firewall
+            {
+                return Err("configuration changed during reinstallation".into());
+            }
+            let check: Value = serde_json::from_slice(
+                &self.capture("reinstall-check", "ubus -S call tunnel-detour check '{}'\n")?,
+            )?;
+            let adguard: Value = serde_json::from_slice(&self.capture(
+                "reinstall-adguard",
+                "ubus -S call tunnel-detour test_adguard '{}'\n",
+            )?)?;
+            if check["valid"] != true
+                || adguard["connected"] != true
+                || adguard["health"]["dns_running"] != true
+            {
+                return Err(
+                    "reinstalled configuration or local AdGuard access failed validation".into(),
+                );
+            }
+            for name in ["overview.js", "overview.css"] {
+                if self.capture(
+                    "reinstall-ui",
+                    &format!("cat /www/luci-static/resources/view/tunnel-detour/{name}\n"),
+                )? != fs::read(root.join("sources/openwrt/luci").join(name))?
+                {
+                    return Err("the installed UI payload differs from the build".into());
+                }
+            }
+            let remote_hash = self.capture(
+                "reinstall-binary-hash",
+                "sha256sum /usr/bin/tunnel-detour\n",
+            )?;
+            if expected_binary_hash
+                .split(|byte| byte.is_ascii_whitespace())
+                .next()
+                != remote_hash.split(|byte| byte.is_ascii_whitespace()).next()
+            {
+                return Err("the installed runtime differs from the APK payload".into());
+            }
+            self.management("after-reinstall")?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.capture("reinstall-recovery", &format!("set -e\n/etc/init.d/tunnel-detour stop\ntar -xzf {} -C /\n/etc/init.d/rpcd reload\n/etc/init.d/tunnel-detour start\n", quote(&recovery)))?;
+            return Err(format!("reinstallation failed ({error}); the previous payload was restored without reverting live lease state; package metadata and private backups need review").into());
+        }
+        println!(
+            "Active package reinstallation passed: a new process is ready, configuration is preserved, and SSH, LuCI and DNS remain reachable."
+        );
+        Ok(())
+    }
+
     fn verify_disabled(&self) -> Result<(), Box<dyn Error>> {
         let status: Value = serde_json::from_slice(&self.capture("verify-disabled-status", "set -e\ntest \"$(uci -q get tunnel-detour.globals.enabled)\" = 0\npermissions=$(ls -ld /etc/config/tunnel-detour)\ncase \"$permissions\" in '-rw------- '*) ;; *) exit 1 ;; esac\nubus -S call tunnel-detour status '{}'\n")?)?;
         if status["running"] != false {
@@ -1027,38 +1309,13 @@ impl Router {
             "verify-installed-hash",
             "sha256sum /usr/bin/tunnel-detour\n",
         )?;
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let sdk = PathBuf::from(env::var_os("TUNNEL_DETOUR_PACKAGE_SDK").ok_or(
-            "verify-disabled requires TUNNEL_DETOUR_PACKAGE_SDK for APK payload inspection",
-        )?);
-        let extracted = tempfile::tempdir()?;
-        let extraction = Command::new(sdk.join("staging_dir/host/bin/apk"))
-            .args([
-                "extract",
-                "--allow-untrusted",
-                "--no-chown",
-                "--destination",
-            ])
-            .arg(extracted.path())
-            .arg(root.join(format!(
-                "target/packages/mediatek-filogic/tunnel-detour-{}-r1.apk",
-                env!("CARGO_PKG_VERSION")
-            )))
-            .output()?;
-        self.record("verify-local-apk-extract.stdout", &extraction.stdout)?;
-        self.record("verify-local-apk-extract.stderr", &extraction.stderr)?;
-        if !extraction.status.success() {
-            return Err("local APK payload inspection failed".into());
-        }
-        let local = Command::new("sha256sum")
-            .arg(extracted.path().join("usr/bin/tunnel-detour"))
-            .output()?;
-        if !local.status.success()
-            || local.stdout.split(|byte| byte.is_ascii_whitespace()).next()
-                != binary.split(|byte| byte.is_ascii_whitespace()).next()
+        let local = self.packaged_binary_hash()?;
+        if local.split(|byte| byte.is_ascii_whitespace()).next()
+            != binary.split(|byte| byte.is_ascii_whitespace()).next()
         {
             return Err("installed ARM binary differs from the inspected APK payload".into());
         }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let runtime = tokio::runtime::Runtime::new()?;
         let asset = runtime.block_on(async {
             let response = reqwest::Client::builder()
@@ -1095,6 +1352,39 @@ impl Router {
         Ok(())
     }
 
+    fn packaged_binary_hash(&self) -> Result<Vec<u8>, Box<dyn Error>> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let sdk = PathBuf::from(env::var_os("TUNNEL_DETOUR_PACKAGE_SDK").ok_or(
+            "package verification requires TUNNEL_DETOUR_PACKAGE_SDK for APK payload inspection",
+        )?);
+        let extracted = tempfile::tempdir()?;
+        let extraction = Command::new(sdk.join("staging_dir/host/bin/apk"))
+            .args([
+                "extract",
+                "--allow-untrusted",
+                "--no-chown",
+                "--destination",
+            ])
+            .arg(extracted.path())
+            .arg(root.join(format!(
+                "target/packages/mediatek-filogic/tunnel-detour-{}-r1.apk",
+                env!("CARGO_PKG_VERSION")
+            )))
+            .output()?;
+        self.record("verify-local-apk-extract.stdout", &extraction.stdout)?;
+        self.record("verify-local-apk-extract.stderr", &extraction.stderr)?;
+        if !extraction.status.success() {
+            return Err("local APK payload inspection failed".into());
+        }
+        let local = Command::new("sha256sum")
+            .arg(extracted.path().join("usr/bin/tunnel-detour"))
+            .output()?;
+        if !local.status.success() {
+            return Err("APK binary hash failed".into());
+        }
+        Ok(local.stdout)
+    }
+
     fn cleanup_uploaded_packages(&self) -> Result<(), Box<dyn Error>> {
         let run_id = self
             .directory
@@ -1102,7 +1392,7 @@ impl Router {
             .and_then(|name| name.to_str())
             .ok_or("invalid validation directory")?;
         let remote = format!("/tmp/tunnel-detour-validation-{run_id}");
-        let files: Vec<_> = ["tunnel-detour", "luci-app-tunnel-detour"]
+        let mut files: Vec<_> = ["tunnel-detour", "luci-app-tunnel-detour"]
             .iter()
             .map(|name| {
                 quote(&format!(
@@ -1111,6 +1401,7 @@ impl Router {
                 ))
             })
             .collect();
+        files.push(quote(&format!("{remote}/payload-before.tar.gz")));
         self.capture(
             "remove-uploaded-packages",
             &format!(
@@ -1330,6 +1621,37 @@ fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn validate_reinstallation_plan(plan: &str) -> Result<(), Box<dyn Error>> {
+    let mut packages = std::collections::BTreeSet::new();
+    for line in plan
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with('('))
+    {
+        let (_, change) = line
+            .split_once(") ")
+            .ok_or("invalid APK transaction line")?;
+        let (operation, package) = change.split_once(' ').ok_or("invalid APK package change")?;
+        let (name, _) = package
+            .split_once(" (")
+            .ok_or("invalid APK package version")?;
+        if !matches!(
+            operation,
+            "Installing" | "Reinstalling" | "Upgrading" | "Downgrading"
+        ) || !matches!(name, "tunnel-detour" | "luci-app-tunnel-detour")
+            || !packages.insert(name)
+        {
+            return Err(
+                "APK simulation includes unexpected package changes; reinstallation stopped".into(),
+            );
+        }
+    }
+    if packages != std::collections::BTreeSet::from(["tunnel-detour", "luci-app-tunnel-detour"]) {
+        return Err("APK simulation must include exactly the two owned packages".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn run(
     host: &str,
     input: &Path,
@@ -1347,10 +1669,12 @@ pub(crate) fn run(
         "adguard" => router.adguard(),
         "preflight" => router.preflight(),
         "install-disabled" => router.install_disabled(),
+        "reinstall-active" => router.reinstall_active(),
         "verify-disabled" => router.verify_disabled(),
         "start-test" => router.start_test(),
         "stop-test" => router.stop_test(),
         "probe-test" => router.probe_test(),
+        "probe-active" => router.probe_active(),
         "windows-dns" => router.windows_dns(),
         "inspect-test" => router.inspect_test(),
         "audit-test" => router.audit_test(),
@@ -1367,4 +1691,29 @@ pub(crate) fn configure(
     target: &str,
 ) -> Result<(), Box<dyn Error>> {
     Router::open(host, input, Some(resume))?.configure_disabled(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_reinstallation_plan;
+
+    #[test]
+    fn r040_hardware_reinstallation_rejects_foreign_removal_unknown_or_incomplete_apk_transactions()
+    {
+        let owned = "(1/2) Reinstalling tunnel-detour (0.1.0-r1)\n(2/2) Reinstalling luci-app-tunnel-detour (0.1.0-r1)\nOK: 81 MiB in 147 packages\n";
+        assert!(validate_reinstallation_plan(owned).is_ok());
+        for plan in [
+            format!("{owned}(3/3) Upgrading firewall4 (1-r1 -> 1-r2)\n"),
+            format!("{owned}(3/3) Removing adguardhome (1-r1)\n"),
+            owned.replace("Reinstalling tunnel-detour", "Removing tunnel-detour"),
+            owned.replace("Reinstalling tunnel-detour", "Unexpected tunnel-detour"),
+            "(1/1) Reinstalling tunnel-detour (0.1.0-r1)\n".into(),
+            "OK: nothing to do\n".into(),
+        ] {
+            assert!(
+                validate_reinstallation_plan(&plan).is_err(),
+                "unsafe transaction was accepted"
+            );
+        }
+    }
 }

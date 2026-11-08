@@ -91,6 +91,17 @@ fn r018_management_validation_uses_the_production_rule_capacity_and_returns_acti
             .as_str()
             .is_some_and(|message| !message.is_empty())
     );
+    let rows =
+        validate_patterns("EXAMPLE.test.\nexample.test\n*.example.test\nhttps://example.test/path");
+    assert_eq!(rows["valid"], false);
+    assert_eq!(
+        rows["rows"][0],
+        json!({"pattern":"example.test","error":"duplicate"})
+    );
+    assert_eq!(rows["rows"][1], rows["rows"][0]);
+    assert_eq!(rows["rows"][2], json!({"pattern":"*.example.test"}));
+    assert_eq!(rows["rows"][3], json!({"error":"invalid_domain"}));
+    assert_eq!(result["rows"].as_array().map(Vec::len), Some(256));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

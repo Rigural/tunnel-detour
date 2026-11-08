@@ -53,6 +53,7 @@ fn r032_sdk_apks_have_the_required_architecture_license_owned_hooks_and_public_p
     ];
     let luci_files = [
         "www/luci-static/resources/view/tunnel-detour/overview.js",
+        "www/luci-static/resources/view/tunnel-detour/overview.css",
         "usr/share/luci/menu.d/luci-app-tunnel-detour.json",
         "usr/share/rpcd/acl.d/luci-app-tunnel-detour.json",
         "lib/apk/packages/luci-app-tunnel-detour.list",

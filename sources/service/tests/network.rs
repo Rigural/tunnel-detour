@@ -76,6 +76,7 @@ struct Lab {
     config: Value,
     adguard_auth: Option<(String, String)>,
     adguard_bind: String,
+    adguard_dns_bind: String,
     foreign_route_created: bool,
 }
 
@@ -110,6 +111,7 @@ impl Lab {
             config,
             adguard_auth: None,
             adguard_bind: "127.0.0.1".into(),
+            adguard_dns_bind: "0.0.0.0".into(),
             foreign_route_created: false,
         };
         for name in ["td-client", "td-wan", "td-vpn"] {
@@ -573,10 +575,12 @@ impl Lab {
             ]);
         }
         args.push(&url);
-        let response = command("curl", &args, bytes.as_deref())?;
-        // Mutation endpoints legitimately return an empty successful HTTP body.
+        let response = command("curl", &args, bytes.as_deref())
+            .map_err(|error| format!("AdGuard {operation}: {error}"))?;
+        // Some mutation endpoints return an empty body or a plain-text acknowledgement.
         if !expects_json
-            && (response.is_empty()
+            && (operation == "filtering/remove_url"
+                || response.is_empty()
                 || response
                     .iter()
                     .copied()
@@ -585,7 +589,8 @@ impl Lab {
         {
             Ok(Value::Null)
         } else {
-            Ok(serde_json::from_slice(&response)?)
+            serde_json::from_slice(&response)
+                .map_err(|error| format!("AdGuard {operation} JSON response: {error}").into())
         }
     }
 
@@ -594,28 +599,57 @@ impl Lab {
         fs::create_dir(&root)?;
         let config = root.join("AdGuardHome.yaml");
         let web_address = format!("{}:13000", self.adguard_bind);
-        self.spawn(
-            "AdGuardHome",
-            &[
-                "--no-check-update",
-                "--web-addr",
-                &web_address,
-                "-w",
-                root.to_str().ok_or("AdGuard work path")?,
-                "-c",
-                config.to_str().ok_or("AdGuard config path")?,
-            ],
-            "adguard",
-        )?;
+        let arguments = [
+            "--no-check-update",
+            "--web-addr",
+            &web_address,
+            "-w",
+            root.to_str().ok_or("AdGuard work path")?,
+            "-c",
+            config.to_str().ok_or("AdGuard config path")?,
+        ];
+        let child_index = self.children.len();
+        self.spawn("AdGuardHome", &arguments, "adguard")?;
         wait_until(|| Ok(self.api("install/get_addresses", None).is_ok()))?;
         let password = format!(
             "Lab!{}",
             String::from_utf8(command("openssl", &["rand", "-hex", "24"], None)?)?.trim()
         );
-        self.api("install/configure", Some(json!({"web":{"ip":self.adguard_bind,"port":13000},"dns":{"ip":"0.0.0.0","port":10534},"username":"lab-admin","password":password})))?;
+        self.api("install/configure", Some(json!({"web":{"ip":self.adguard_bind,"port":13000},"dns":{"ip":self.adguard_dns_bind,"port":10534},"username":"lab-admin","password":password})))?;
         self.adguard_auth = Some(("lab-admin".into(), password.clone()));
         wait_until(|| Ok(self.api("status", None).is_ok()))?;
-        self.api("dns_config", Some(json!({"upstream_dns":["tcp://10.254.0.2:5353", "[/unrelated.test/]tcp://10.254.0.2:5353"],"fallback_dns":[],"upstream_dns_file":"","cache_optimistic":false,"blocking_mode":"null_ip"})))?;
+        self.api("dns_config", Some(json!({"upstream_dns":["tcp://10.254.0.2:5353", "[/unrelated.test/]tcp://10.254.0.2:5353"],"bootstrap_dns":["10.254.0.2:5353"],"fallback_dns":[],"upstream_dns_file":"","cache_optimistic":false,"blocking_mode":"null_ip"})))?;
+        let subscriptions = self.api("filtering/status", None)?;
+        for subscription in subscriptions["filters"]
+            .as_array()
+            .ok_or("missing laboratory filter subscriptions")?
+        {
+            self.api(
+                "filtering/remove_url",
+                Some(json!({"url":subscription["url"]})),
+            )?;
+        }
+        assert!(
+            self.api("filtering/status", None)?["filters"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        );
+        command(
+            "kill",
+            &["-TERM", &self.children[child_index].id().to_string()],
+            None,
+        )?;
+        wait_until(|| Ok(self.children[child_index].try_wait()?.is_some()))?;
+        let settings = fs::read_to_string(&config)?;
+        if !settings.contains("    whois: true\n") {
+            return Err("unexpected laboratory WHOIS configuration".into());
+        }
+        fs::write(
+            &config,
+            settings.replace("    whois: true\n", "    whois: false\n"),
+        )?;
+        self.spawn("AdGuardHome", &arguments, "adguard")?;
+        wait_until(|| Ok(self.api("status", None).is_ok()))?;
         self.api(
             "filtering/set_rules",
             Some(json!({"rules":["||blocked.example.test^"]})),
@@ -626,6 +660,125 @@ impl Lab {
         )?;
         self.config["adguard"] = json!({"api_url":format!("http://{web_address}/"),"username":"lab-admin","password":password});
         Ok(())
+    }
+
+    fn enable_adguard_dot(&self) -> TestResult {
+        let key = self.directory.path().join("dns-tls.key");
+        let certificate = self.directory.path().join("dns-tls.crt");
+        command(
+            "openssl",
+            &[
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "2",
+                "-subj",
+                "/CN=dns.example.test",
+                "-addext",
+                "subjectAltName=DNS:dns.example.test,IP:192.0.2.1,IP:2001:db8:1::1",
+                "-addext",
+                "basicConstraints=critical,CA:FALSE",
+                "-addext",
+                "keyUsage=critical,digitalSignature,keyEncipherment",
+                "-addext",
+                "extendedKeyUsage=serverAuth",
+                "-keyout",
+                key.to_str().ok_or("invalid DNS TLS key path")?,
+                "-out",
+                certificate
+                    .to_str()
+                    .ok_or("invalid DNS TLS certificate path")?,
+            ],
+            None,
+        )?;
+        let mut settings = self.api("tls/status", None)?;
+        settings["enabled"] = json!(true);
+        settings["server_name"] = json!("dns.example.test");
+        settings["force_https"] = json!(false);
+        settings["port_https"] = json!(0);
+        settings["port_dns_over_tls"] = json!(853);
+        settings["port_dns_over_quic"] = json!(0);
+        settings["strict_sni_check"] = json!(false);
+        settings["serve_plain_dns"] = json!(true);
+        settings["certificate_chain"] = json!("");
+        settings["private_key"] = json!("");
+        settings["certificate_path"] = json!(certificate);
+        settings["private_key_path"] = json!(key);
+        let validation = self.api("tls/validate", Some(settings.clone()))?;
+        assert_eq!(validation["valid_cert"], true);
+        assert_eq!(validation["valid_key"], true);
+        assert_eq!(validation["valid_pair"], true);
+        self.api("tls/configure", Some(settings))?;
+        wait_until(|| Ok(self.api("status", None).is_ok()))?;
+        Ok(())
+    }
+
+    fn query_dot(
+        &self,
+        name: &str,
+        kind: RecordType,
+        ipv6: bool,
+    ) -> Result<Message, Box<dyn Error>> {
+        let mut query = Message::query();
+        query.metadata.recursion_desired = true;
+        query.add_query(Query::query(Name::from_ascii(format!("{name}."))?, kind));
+        let packet = query.to_vec()?;
+        let certificate = self.directory.path().join("dns-tls.crt");
+        let address = if ipv6 {
+            "[2001:db8:1::1]:853"
+        } else {
+            "192.0.2.1:853"
+        };
+        let ip = if ipv6 { "2001:db8:1::1" } else { "192.0.2.1" };
+        let mut child = Command::new("ip")
+            .args([
+                "netns",
+                "exec",
+                "td-client",
+                "timeout",
+                "7",
+                "openssl",
+                "s_client",
+                "-quiet",
+                "-no_ign_eof",
+                "-connect",
+                address,
+                "-CAfile",
+            ])
+            .arg(certificate)
+            .args(["-verify_return_error", "-verify_ip", ip])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut input = child.stdin.take().ok_or("missing DNS TLS client stdin")?;
+        let response = (|| -> Result<Vec<u8>, Box<dyn Error>> {
+            input.write_all(&u16::try_from(packet.len())?.to_be_bytes())?;
+            input.write_all(&packet)?;
+            input.flush()?;
+            let mut output = child.stdout.take().ok_or("missing DNS TLS client stdout")?;
+            let mut length = [0; 2];
+            output.read_exact(&mut length)?;
+            let mut response = vec![0; usize::from(u16::from_be_bytes(length))];
+            output.read_exact(&mut response)?;
+            Ok(response)
+        })();
+        drop(input);
+        let result = child.wait_with_output()?;
+        if !result.status.success() {
+            return Err(format!(
+                "DNS TLS client failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            )
+            .into());
+        }
+        let response = Message::from_vec(&response?)?;
+        assert_eq!(response.metadata.id, query.metadata.id);
+        assert_eq!(response.queries, query.queries);
+        Ok(response)
     }
 
     fn start_tls(&mut self) -> TestResult {
@@ -1100,6 +1253,69 @@ fn r025_adguard_reconciliation_adds_and_removes_only_owned_upstreams_preserving_
             .contains("AdGuard control endpoint must belong to this router")
     );
     assert_eq!(lab.api("dns_info", None)?["upstream_dns"], baseline);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the isolated Docker network laboratory"]
+fn r037_adguard_dns_over_tls_on_ipv4_and_ipv6_preserves_fake_ip_filtering_and_management_access()
+-> TestResult {
+    let mut lab = Lab::new()?;
+    lab.enable_ipv6()?;
+    lab.adguard_bind = "192.0.2.1".into();
+    lab.adguard_dns_bind = "::".into();
+    lab.start_adguard()?;
+    assert_eq!(lab.api("status", None)?["version"], "v0.107.79");
+    let baseline = lab.api("dns_info", None)?["upstream_dns"].clone();
+    lab.enable_adguard_dot()?;
+    lab.config["rules"] = json!([{"pattern":"selected.example.test","enabled":true},{"pattern":"blocked.example.test","enabled":true}]);
+    lab.start()?;
+    for ipv6 in [false, true] {
+        let selected = lab.query_dot("selected.example.test", RecordType::A, ipv6)?;
+        assert!(
+            matches!(selected.answers.first().map(|answer|&answer.data),Some(RData::A(address)) if address.0==Ipv4Addr::new(198,18,0,1))
+        );
+        for kind in [RecordType::AAAA, RecordType::HTTPS, RecordType::SVCB] {
+            let response = lab.query_dot("selected.example.test", kind, ipv6)?;
+            assert_eq!(
+                response.metadata.response_code,
+                hickory_proto::op::ResponseCode::NoError
+            );
+            assert!(response.answers.is_empty());
+        }
+        let blocked = lab.query_dot("blocked.example.test", RecordType::A, ipv6)?;
+        assert!(
+            matches!(blocked.answers.first().map(|answer|&answer.data),Some(RData::A(address)) if address.0.is_unspecified())
+        );
+        let other = lab.query_dot("other.example.test", RecordType::A, ipv6)?;
+        assert!(
+            matches!(other.answers.first().map(|answer|&answer.data),Some(RData::A(address)) if address.0==Ipv4Addr::new(203,0,113,2))
+        );
+    }
+    let tls = lab.api("tls/status", None)?;
+    assert_eq!(tls["enabled"], true);
+    assert_eq!(tls["port_dns_over_tls"], 853);
+    assert!(matches!(tls["port_https"].as_u64(), None | Some(0)));
+    assert!(matches!(tls["port_dns_over_quic"].as_u64(), None | Some(0)));
+    assert_eq!(tls["force_https"], false);
+    assert_eq!(
+        lab.address("selected.example.test")?,
+        Ipv4Addr::new(198, 18, 0, 1)
+    );
+    assert_eq!(
+        lab.http("selected.example.test", Ipv4Addr::new(198, 18, 0, 1), 80)?
+            .stdout,
+        b"wan"
+    );
+    lab.stop()?;
+    lab.config["rules"] = json!([]);
+    lab.start()?;
+    let response = lab.query_dot("selected.example.test", RecordType::A, false)?;
+    assert!(
+        matches!(response.answers.first().map(|answer|&answer.data),Some(RData::A(address)) if address.0==Ipv4Addr::new(203,0,113,2))
+    );
+    assert_eq!(lab.api("dns_info", None)?["upstream_dns"], baseline);
+    lab.stop()?;
     Ok(())
 }
 

@@ -10,6 +10,7 @@ COPY --chmod=755 sources/tests/openwrt/lab.init /etc/init.d/tunnel-detour-lab
 COPY --chmod=755 sources/openwrt/files/tunnel-detour.init /etc/init.d/tunnel-detour
 COPY sources/openwrt/files/tunnel-detour.config /etc/config/tunnel-detour
 COPY sources/openwrt/luci/overview.js /www/luci-static/resources/view/tunnel-detour/overview.js
+COPY sources/openwrt/luci/overview.css /www/luci-static/resources/view/tunnel-detour/overview.css
 COPY sources/openwrt/luci/menu.json /usr/share/luci/menu.d/luci-app-tunnel-detour.json
 COPY sources/openwrt/luci/acl.json /usr/share/rpcd/acl.d/luci-app-tunnel-detour.json
 RUN chmod 600 /etc/config/tunnel-detour && mkdir -p /usr/libexec/rpcd && ln -s /usr/bin/tunnel-detour /usr/libexec/rpcd/tunnel-detour && ln -s ../init.d/tunnel-detour-lab /etc/rc.d/S15tunnel-detour-lab

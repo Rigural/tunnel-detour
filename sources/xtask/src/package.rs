@@ -12,8 +12,89 @@ use crate::checked;
 const TARGET: &str = "aarch64-unknown-linux-musl";
 const COMPILER: &str =
     "toolchain-aarch64_cortex-a53_gcc-14.3.0_musl/bin/aarch64-openwrt-linux-musl-gcc";
+const SDK_NAME: &str = "openwrt-sdk-25.12.6-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64";
+const SDK_SHA256: &str = "1c04ac47bdfc361d6aab299eb520d570e368013dedcb8d29cf39dc7168ae642e";
+
+fn validate_version(tag: Option<&str>, makefile: &str) -> Result<(), Box<dyn Error>> {
+    let version = env!("CARGO_PKG_VERSION");
+    let package_versions: Vec<_> = makefile
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("PKG_VERSION:="))
+        .map(str::trim)
+        .collect();
+    if package_versions != [version] {
+        return Err("Cargo and OpenWrt package versions must match".into());
+    }
+    if let Some(tag) = tag
+        && tag != format!("v{version}")
+    {
+        return Err("release tag must be v followed by the exact Cargo package version".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn download_and_build(
+    root: &Path,
+    cargo: &OsStr,
+    directory: &Path,
+    tag: &str,
+) -> Result<(), Box<dyn Error>> {
+    validate_version(
+        Some(tag),
+        &fs::read_to_string(root.join("sources/openwrt/Makefile"))?,
+    )?;
+    fs::create_dir_all(directory)?;
+    let staging = tempfile::Builder::new()
+        .prefix("openwrt-sdk-")
+        .tempdir_in(directory)?;
+    let archive = staging.path().join("sdk.tar.zst");
+    let url = format!(
+        "https://downloads.openwrt.org/releases/25.12.6/targets/mediatek/filogic/{SDK_NAME}.tar.zst"
+    );
+    checked(
+        Command::new("curl")
+            .args([
+                "--fail",
+                "--show-error",
+                "--location",
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
+                "--connect-timeout",
+                "20",
+                "--max-time",
+                "600",
+                "--retry",
+                "3",
+                "--retry-max-time",
+                "900",
+                "--output",
+            ])
+            .arg(&archive)
+            .arg(url),
+    )?;
+    let digest = Command::new("sha256sum").arg(&archive).output()?;
+    if !digest.status.success()
+        || String::from_utf8(digest.stdout)?.split_whitespace().next() != Some(SDK_SHA256)
+    {
+        return Err("downloaded OpenWrt SDK failed the pinned SHA-256 check".into());
+    }
+    checked(
+        Command::new("tar")
+            .args(["--zstd", "--extract", "--no-same-owner", "--file"])
+            .arg(&archive)
+            .arg("--directory")
+            .arg(staging.path()),
+    )?;
+    build(root, cargo, &staging.path().join(SDK_NAME))
+}
 
 pub(crate) fn build(root: &Path, cargo: &OsStr, sdk: &Path) -> Result<(), Box<dyn Error>> {
+    validate_version(
+        None,
+        &fs::read_to_string(root.join("sources/openwrt/Makefile"))?,
+    )?;
     let sdk = sdk.canonicalize()?;
     if !fs::read_to_string(sdk.join("include/version.mk"))?.contains("25.12.6") {
         return Err("packaging requires the OpenWrt 25.12.6 SDK".into());
@@ -107,6 +188,7 @@ pub(crate) fn build(root: &Path, cargo: &OsStr, sdk: &Path) -> Result<(), Box<dy
         "files/tunnel-detour.init",
         "files/tunnel-detour.config",
         "luci/overview.js",
+        "luci/overview.css",
         "luci/menu.json",
         "luci/acl.json",
     ] {
@@ -138,16 +220,24 @@ pub(crate) fn build(root: &Path, cargo: &OsStr, sdk: &Path) -> Result<(), Box<dy
             env!("CARGO_PKG_VERSION")
         ),
     ];
-    for name in names {
+    for name in &names {
         let mut found = Vec::new();
-        find(&sdk.join("bin/packages"), &name, &mut found)?;
+        find(&sdk.join("bin/packages"), name, &mut found)?;
         if found.len() != 1 {
             return Err(format!("expected one generated {name}, found {}", found.len()).into());
         }
         let source = found.first().ok_or("missing generated APK")?;
-        fs::copy(source, artifacts.join(&name))?;
+        fs::copy(source, artifacts.join(name))?;
         println!("Generated {}", artifacts.join(name).display());
     }
+    let checksums = Command::new("sha256sum")
+        .current_dir(&artifacts)
+        .args(&names)
+        .output()?;
+    if !checksums.status.success() {
+        return Err("APK checksum generation failed".into());
+    }
+    fs::write(artifacts.join("SHA256SUMS"), checksums.stdout)?;
     checked(
         Command::new(cargo)
             .current_dir(root)
@@ -319,4 +409,23 @@ fn licenses(metadata: &serde_json::Value, destination: &Path) -> Result<(), Box<
     }
     fs::write(destination, notices)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_version;
+
+    #[test]
+    fn r038_release_tag_and_openwrt_version_must_match_the_cargo_version() {
+        let version = env!("CARGO_PKG_VERSION");
+        let makefile = format!("PKG_VERSION:={version}\n");
+        assert!(validate_version(Some(&format!("v{version}")), &makefile).is_ok());
+        for tag in [version, "v999.999.999", "v0.1.0\nmalformed"] {
+            assert!(validate_version(Some(tag), &makefile).is_err());
+        }
+        assert!(
+            validate_version(Some(&format!("v{version}")), "PKG_VERSION:=999.999.999\n").is_err()
+        );
+        assert!(validate_version(None, &format!("{makefile}PKG_VERSION:=999.999.999\n")).is_err());
+    }
 }

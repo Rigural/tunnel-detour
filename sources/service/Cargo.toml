@@ -1,10 +1,11 @@
 [package]
 name = "tunnel-detour-service"
-description = "OpenWrt DNS Fake-IP and transparent TCP exception service"
+description = "Tunnel Detour for AdGuard Home: OpenWrt DNS Fake-IP and transparent TCP exception service"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "tunnel-detour"
