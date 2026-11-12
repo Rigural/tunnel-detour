@@ -1,11 +1,11 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=tunnel-detour
-PKG_VERSION:=0.1.0
+PKG_VERSION:=0.2.0
 PKG_RELEASE:=1
 PKG_LICENSE:=GPL-3.0-only
 PKG_LICENSE_FILES:=LICENSE
-PKG_URL:=https://github.com/Rigural/tunnel-detour-adguard-home
+PKG_URL:=https://github.com/Rigural/tunnel-detour
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(PKG_VERSION)
 
 include $(INCLUDE_DIR)/package.mk
@@ -13,12 +13,12 @@ include $(INCLUDE_DIR)/package.mk
 define Package/tunnel-detour
   SECTION:=net
   CATEGORY:=Network
-  TITLE:=Tunnel Detour for AdGuard Home
-  DEPENDS:=+libgcc +procd +rpcd +ubus +uci +ip-full +nftables-json +kmod-nft-nat
+  TITLE:=Tunnel Detour
+  DEPENDS:=+libgcc +procd +rpcd +ubus +uci +ip-full +nftables-json +kmod-nft-nat +conntrack +firewall4 +kmod-inet-diag
 endef
 
 define Package/tunnel-detour/description
-  Tunnel Detour for AdGuard Home provides domain-based VPN exceptions for OpenWrt, managed through LuCI.
+  Domain-based VPN exceptions for OpenWrt and LuCI, using optional AdGuard Home integration or an existing dnsmasq frontend.
 endef
 
 define Package/tunnel-detour/conffiles
@@ -29,7 +29,7 @@ define Package/luci-app-tunnel-detour
   SECTION:=luci
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
-  TITLE:=Tunnel Detour for AdGuard Home - LuCI interface
+  TITLE:=Tunnel Detour - LuCI interface
   DEPENDS:=+luci-base +tunnel-detour
   PKGARCH:=all
 endef
@@ -52,6 +52,7 @@ define Package/tunnel-detour/install
 	$(INSTALL_DIR) $(1)/usr/bin $(1)/etc/init.d $(1)/etc/config $(1)/usr/libexec/rpcd
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/tunnel-detour $(1)/usr/bin/tunnel-detour
 	$(INSTALL_BIN) ./files/tunnel-detour.init $(1)/etc/init.d/tunnel-detour
+	$(INSTALL_BIN) ./files/tunnel-detour-inbound.init $(1)/etc/init.d/tunnel-detour-inbound
 	$(INSTALL_CONF) ./files/tunnel-detour.config $(1)/etc/config/tunnel-detour
 	$(LN) /usr/bin/tunnel-detour $(1)/usr/libexec/rpcd/tunnel-detour
 	$(INSTALL_DIR) $(1)/usr/share/licenses/tunnel-detour
@@ -61,6 +62,7 @@ endef
 define Package/tunnel-detour/postinst
 #!/bin/sh
 if [ -z "$${IPKG_INSTROOT}" ]; then
+	/usr/bin/tunnel-detour --migrate-adguard-credentials || exit 1
 	/etc/init.d/rpcd reload
 fi
 endef
@@ -68,6 +70,8 @@ endef
 define Package/tunnel-detour/prerm
 #!/bin/sh
 if [ -z "$${IPKG_INSTROOT}" ]; then
+	/etc/init.d/tunnel-detour-inbound stop || exit 1
+	/etc/init.d/tunnel-detour stop || exit 1
 	/usr/bin/tunnel-detour --uninstall || exit 1
 fi
 endef
@@ -82,6 +86,7 @@ endef
 define Package/luci-app-tunnel-detour/install
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/tunnel-detour $(1)/usr/share/luci/menu.d $(1)/usr/share/rpcd/acl.d
 	$(INSTALL_DATA) ./luci/overview.js $(1)/www/luci-static/resources/view/tunnel-detour/overview.js
+	$(INSTALL_DATA) ./luci/inbound.js $(1)/www/luci-static/resources/view/tunnel-detour/inbound.js
 	$(INSTALL_DATA) ./luci/overview.css $(1)/www/luci-static/resources/view/tunnel-detour/overview.css
 	$(INSTALL_DATA) ./luci/menu.json $(1)/usr/share/luci/menu.d/luci-app-tunnel-detour.json
 	$(INSTALL_DATA) ./luci/acl.json $(1)/usr/share/rpcd/acl.d/luci-app-tunnel-detour.json

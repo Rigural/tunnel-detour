@@ -28,6 +28,12 @@ impl FromStr for DomainName {
     type Err = DomainError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
+        // Bound work before IDNA processing, including ignored Unicode characters
+        // that could otherwise make an arbitrarily large input normalize to a
+        // small valid hostname. This accommodates the UTF-8 form of DNS labels.
+        if input.len() > 1024 {
+            return Err(DomainError);
+        }
         // IDNA's strict mode also rejects interior hyphen combinations used by ordinary CDN
         // hostnames. Apply IDNA conversion, then validate the DNS hostname's LDH labels here.
         let input = input.strip_suffix('.').unwrap_or(input);
@@ -225,5 +231,20 @@ impl RuleSet {
 
     pub fn rules(&self) -> &[Rule] {
         &self.rules
+    }
+
+    /// Return the most specific enabled matching rule for allocation accounting.
+    pub fn selecting_pattern(&self, name: &DomainName) -> Option<&DomainPattern> {
+        self.rules
+            .iter()
+            .filter(|rule| rule.enabled && rule.pattern.matches(name))
+            .map(|rule| &rule.pattern)
+            .max_by(|left, right| {
+                left.domain
+                    .as_str()
+                    .len()
+                    .cmp(&right.domain.as_str().len())
+                    .then_with(|| right.scope.cmp(&left.scope))
+            })
     }
 }

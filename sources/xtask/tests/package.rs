@@ -40,9 +40,47 @@ fn r032_sdk_apks_have_the_required_architecture_license_owned_hooks_and_public_p
         .canonicalize()?;
     let apk = sdk.join("staging_dir/host/bin/apk");
     let version = format!("{}-r1", env!("CARGO_PKG_VERSION"));
+    let checksums = Command::new("sha256sum")
+        .current_dir(&directory)
+        .args(["--check", "SHA256SUMS"])
+        .output()?;
+    assert!(
+        checksums.status.success(),
+        "release sidecar or APK digest mismatch"
+    );
+    let inventory: Value =
+        serde_json::from_slice(&fs::read(directory.join("SOURCE-SBOM.spdx.json"))?)?;
+    assert_eq!(inventory["spdxVersion"], "SPDX-2.3");
+    let names: BTreeSet<_> = inventory["packages"]
+        .as_array()
+        .ok_or("missing source inventory")?
+        .iter()
+        .map(|package| package["name"].as_str().ok_or("missing crate name"))
+        .collect::<Result<_, _>>()?;
+    assert!(names.contains("tunnel-detour-service") && names.contains("tunnel-detour-core"));
+    assert!(!names.contains("xtask"));
+    let info: Value = serde_json::from_slice(&fs::read(directory.join("build-info.json"))?)?;
+    assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(info["target"], "aarch64-unknown-linux-musl");
+    for file in ["SOURCE-SBOM.spdx.json", "build-info.json"] {
+        let bytes = fs::read_to_string(directory.join(file))?;
+        for forbidden in [
+            "/home/",
+            "/mnt/",
+            ".local/",
+            "adguard_password",
+            "adguard_username",
+        ] {
+            assert!(
+                !bytes.contains(forbidden),
+                "private data in release metadata"
+            );
+        }
+    }
     let service_files = [
         "etc/config/tunnel-detour",
         "etc/init.d/tunnel-detour",
+        "etc/init.d/tunnel-detour-inbound",
         "lib/apk/packages/tunnel-detour.conffiles",
         "lib/apk/packages/tunnel-detour.conffiles_static",
         "lib/apk/packages/tunnel-detour.list",
@@ -53,6 +91,7 @@ fn r032_sdk_apks_have_the_required_architecture_license_owned_hooks_and_public_p
     ];
     let luci_files = [
         "www/luci-static/resources/view/tunnel-detour/overview.js",
+        "www/luci-static/resources/view/tunnel-detour/inbound.js",
         "www/luci-static/resources/view/tunnel-detour/overview.css",
         "usr/share/luci/menu.d/luci-app-tunnel-detour.json",
         "usr/share/rpcd/acl.d/luci-app-tunnel-detour.json",
@@ -88,6 +127,7 @@ fn r032_sdk_apks_have_the_required_architecture_license_owned_hooks_and_public_p
         assert_eq!(metadata["info"]["version"], version);
         assert_eq!(metadata["info"]["arch"], architecture);
         assert_eq!(metadata["info"]["license"], "GPL-3.0-only");
+        assert_eq!(metadata["info"]["url"], env!("CARGO_PKG_REPOSITORY"));
         let mut actual = BTreeSet::new();
         for directory in metadata["paths"].as_array().ok_or("APK paths are absent")? {
             let parent = directory["name"].as_str().unwrap_or("");
@@ -128,6 +168,52 @@ fn r032_sdk_apks_have_the_required_architecture_license_owned_hooks_and_public_p
                 file.as_os_str(),
             ],
         )?;
+        let sources = if name == "tunnel-detour" {
+            &[
+                (
+                    "etc/config/tunnel-detour",
+                    "sources/openwrt/files/tunnel-detour.config",
+                ),
+                (
+                    "etc/init.d/tunnel-detour",
+                    "sources/openwrt/files/tunnel-detour.init",
+                ),
+                (
+                    "etc/init.d/tunnel-detour-inbound",
+                    "sources/openwrt/files/tunnel-detour-inbound.init",
+                ),
+            ][..]
+        } else {
+            &[
+                (
+                    "www/luci-static/resources/view/tunnel-detour/overview.js",
+                    "sources/openwrt/luci/overview.js",
+                ),
+                (
+                    "www/luci-static/resources/view/tunnel-detour/inbound.js",
+                    "sources/openwrt/luci/inbound.js",
+                ),
+                (
+                    "www/luci-static/resources/view/tunnel-detour/overview.css",
+                    "sources/openwrt/luci/overview.css",
+                ),
+                (
+                    "usr/share/luci/menu.d/luci-app-tunnel-detour.json",
+                    "sources/openwrt/luci/menu.json",
+                ),
+                (
+                    "usr/share/rpcd/acl.d/luci-app-tunnel-detour.json",
+                    "sources/openwrt/luci/acl.json",
+                ),
+            ][..]
+        };
+        for (installed, source) in sources {
+            assert_eq!(
+                fs::read(extracted.path().join(installed))?,
+                fs::read(root.join(source))?,
+                "APK payload does not match current source: {installed}"
+            );
+        }
         let mut forbidden = vec![
             root.to_string_lossy().into_owned(),
             sdk.to_string_lossy().into_owned(),
@@ -171,7 +257,10 @@ fn r032_sdk_apks_have_the_required_architecture_license_owned_hooks_and_public_p
             assert_eq!(
                 dependencies,
                 BTreeSet::from([
+                    "conntrack",
+                    "firewall4",
                     "ip-full",
+                    "kmod-inet-diag",
                     "kmod-nft-nat",
                     "libc",
                     "libgcc1",

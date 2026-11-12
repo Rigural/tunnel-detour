@@ -2,3 +2,5 @@
 /CLAUDE.md
 /.local/
 /target/
+/sources/tests/fuzz/artifacts/
+/sources/tests/fuzz/corpus/

@@ -11,8 +11,8 @@ use tunnel_detour_core::{DomainPattern, RuleSet};
 
 use crate::{
     ServiceError,
-    adguard::{AdguardControl, AdguardError, AdguardManager},
-    config::{AdguardSettings, ResourceLimits},
+    adguard::{AdguardControl, AdguardError},
+    config::{AdguardSettings, DnsIntegration, ResourceLimits},
     kernel::Kernel,
     uci,
 };
@@ -21,14 +21,44 @@ const INPUT_LIMIT: u64 = 1_048_576;
 
 /// rpcd executable-plugin signature. No arbitrary commands or file paths are accepted.
 pub fn rpc_methods() -> Value {
-    json!({"status": {}, "validate": {"patterns": ""}, "check": {}, "test_adguard": {"api_url":"", "username":"", "password":""}, "restart": {}})
+    json!({"status": {}, "credentials_status": {}, "set_credentials":{"username":"","password":""}, "validate": {"patterns": ""}, "check": {}, "test_adguard": {"api_url":"", "username":"", "password":"", "use_saved_credentials":false}, "preview_upstream":{"api_url":"","username":"","password":"","real_upstream":"","import_current":false,"use_saved_credentials":false}, "restart": {}, "inbound_status":{}, "inbound_devices":{"network":""}, "inbound_port_usage":{"port":0}, "check_inbound":{}, "restart_inbound":{}})
+}
+
+async fn draft_adguard(request: &Value) -> Result<AdguardSettings, ServiceError> {
+    if request
+        .get("use_saved_credentials")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(ServiceError::Protocol);
+    }
+    let field = |name: &str| request[name].as_str().ok_or(ServiceError::Protocol);
+    let api_url = field("api_url")?.to_owned();
+    let username = field("username")?;
+    let password = field("password")?;
+    let settings = if request["use_saved_credentials"] == true {
+        if !username.is_empty() || !password.is_empty() {
+            return Err(ServiceError::Protocol);
+        }
+        let revision = crate::uci::credential_revision().await?;
+        tokio::task::block_in_place(|| crate::credentials::settings(api_url, revision.as_deref()))?
+    } else {
+        let authenticated = !username.is_empty() || !password.is_empty();
+        AdguardSettings {
+            api_url,
+            username: authenticated.then(|| username.to_owned()),
+            password: authenticated.then(|| password.to_owned()),
+        }
+    };
+    settings.endpoint()?;
+    Ok(settings)
 }
 
 fn read_private(path: &Path) -> Result<Option<Vec<u8>>, ServiceError> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut options = OpenOptions::new();
     options.read(true).custom_flags(
-        i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits()).map_err(|_| ServiceError::Protocol)?,
+        i32::try_from((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits())
+            .map_err(|_| ServiceError::Protocol)?,
     );
     let file = match options.open(path) {
         Ok(file) => file,
@@ -97,12 +127,155 @@ pub async fn rpc_call(method: &str, input: &[u8]) -> Result<Value, ServiceError>
     if object.keys().any(|key| {
         key != "ubus_rpc_session"
             && !(method == "validate" && key == "patterns")
+            && !(method == "inbound_devices" && key == "network")
+            && !(method == "inbound_port_usage" && key == "port")
             && !(method == "test_adguard"
-                && matches!(key.as_str(), "api_url" | "username" | "password"))
+                && matches!(
+                    key.as_str(),
+                    "api_url" | "username" | "password" | "use_saved_credentials"
+                ))
+            && !(method == "set_credentials" && matches!(key.as_str(), "username" | "password"))
+            && !(method == "preview_upstream"
+                && matches!(
+                    key.as_str(),
+                    "api_url"
+                        | "username"
+                        | "password"
+                        | "real_upstream"
+                        | "import_current"
+                        | "use_saved_credentials"
+                ))
     }) {
         return Err(ServiceError::Protocol);
     }
     match method {
+        "credentials_status" => {
+            let revision = crate::uci::credential_revision().await?;
+            Ok(
+                match tokio::task::block_in_place(|| {
+                    crate::credentials::configured(revision.as_deref())
+                }) {
+                    Ok(configured) => json!({"configured":configured}),
+                    Err(error) => json!({"configured":false,"error":error.code()}),
+                },
+            )
+        }
+        "set_credentials" => {
+            let username = request["username"]
+                .as_str()
+                .ok_or(ServiceError::Protocol)?
+                .to_owned();
+            let password = request["password"]
+                .as_str()
+                .ok_or(ServiceError::Protocol)?
+                .to_owned();
+            let applied = crate::uci::credential_revision().await?;
+            let revision = tokio::task::block_in_place(|| {
+                crate::credentials::replace(username, password, applied.as_deref())
+            })?;
+            Ok(json!({"saved":true,"revision":revision}))
+        }
+        "preview_upstream" => {
+            let result = async {
+                let field = |key: &str| request[key].as_str().ok_or(ServiceError::Protocol);
+                let mut config = crate::load_uci(true).await?.ok_or(ServiceError::Protocol)?;
+                let settings = draft_adguard(&request).await?;
+                config.adguard = Some(settings);
+                let endpoint = field("real_upstream")?;
+                let resolver = crate::config::parse_resolver_endpoint(endpoint)?;
+                config.validate_resolver_endpoint(resolver)?;
+                config.real_upstream = resolver;
+                crate::preview_adguard_upstream(
+                    &config,
+                    request["import_current"]
+                        .as_bool()
+                        .ok_or(ServiceError::Protocol)?,
+                )
+                .await
+            }
+            .await;
+            Ok(match result {
+                Ok(mut preview) => {
+                    preview["valid"] = json!(true);
+                    preview
+                }
+                Err(error) => {
+                    json!({"valid":false,"error":error.code(), "recovery_resolvers":match &error {
+                        ServiceError::ResolverRecovery {allowed} => allowed.clone(),
+                        _ => Vec::new(),
+                    }})
+                }
+            })
+        }
+        "inbound_port_usage" => {
+            let port = request["port"]
+                .as_u64()
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port != 0)
+                .ok_or(ServiceError::Protocol)?;
+            Ok(
+                match crate::port_guard::inspect([port].into_iter().collect()).await {
+                    Ok(mut ports) => {
+                        let uses = ports.remove(&port).unwrap_or_default();
+                        json!({"available":uses.iter().all(|usage| usage.tunnel_detour),"uses":uses})
+                    }
+                    Err(error) => json!({"available":false,"error":error.code()}),
+                },
+            )
+        }
+        "inbound_devices" => {
+            let name = request["network"].as_str().ok_or(ServiceError::Protocol)?;
+            Ok(match crate::inbound_uci::device_hints(name).await {
+                Ok(value) => value,
+                Err(error) => json!({"devices":[],"error":error.code()}),
+            })
+        }
+        "inbound_status" => {
+            let services: Value = serde_json::from_slice(
+                &uci::ubus("service", "list", json!({"name":"tunnel-detour-inbound"})).await?,
+            )?;
+            let instance = &services["tunnel-detour-inbound"]["instances"]["inbound"];
+            let pid = (instance["running"] == true)
+                .then(|| instance["pid"].as_u64())
+                .flatten();
+            let bytes = tokio::task::block_in_place(|| {
+                read_private(Path::new(crate::inbound_uci::STATUS))
+            })?;
+            let status: Value = match bytes {
+                Some(bytes) => serde_json::from_slice(&bytes)?,
+                None => Value::Null,
+            };
+            let current = (pid.is_some() && status["process_id"].as_u64() == pid)
+                || (pid.is_none()
+                    && matches!(status["phase"].as_str(), Some("failed" | "stopped")));
+            Ok(
+                json!({"enabled":crate::inbound_uci::is_enabled().await?,"running":pid.is_some(),"status":if current {status} else {Value::Null}}),
+            )
+        }
+        "check_inbound" => {
+            let result = async {
+                let config = crate::load_inbound_uci(true)
+                    .await?
+                    .ok_or(crate::UciError::Options)?;
+                crate::check_inbound_config(&config).await
+            }
+            .await;
+            Ok(match result {
+                Ok(()) => json!({"valid":true}),
+                Err(error) => {
+                    json!({"valid":false,"error":error.code(),"port_conflict":crate::port_guard::diagnostic(&error)})
+                }
+            })
+        }
+        "restart_inbound" => {
+            let output = crate::kernel::command(
+                "/etc/init.d/tunnel-detour-inbound",
+                &["restart".into()],
+                None,
+            )
+            .await?;
+            Ok(json!({"accepted":output.success}))
+        }
         "status" => {
             let services: Value = serde_json::from_slice(
                 &uci::ubus("service", "list", json!({"name": "tunnel-detour"})).await?,
@@ -125,7 +298,7 @@ pub async fn rpc_call(method: &str, input: &[u8]) -> Result<Value, ServiceError>
                 || (pid.is_none()
                     && matches!(status["phase"].as_str(), Some("failed" | "stopped")));
             Ok(
-                json!({"enabled":uci::is_enabled().await?, "running": pid.is_some(), "status": if current { status } else { Value::Null }}),
+                json!({"enabled":uci::is_enabled().await?, "dns_integration":uci::configured_integration().await?, "running": pid.is_some(), "status": if current { status } else { Value::Null }}),
             )
         }
         "validate" => {
@@ -133,29 +306,25 @@ pub async fn rpc_call(method: &str, input: &[u8]) -> Result<Value, ServiceError>
             Ok(validate_patterns(lines))
         }
         "check" => match crate::load_uci(true).await {
-            Ok(Some(_)) => Ok(json!({"valid": true})),
+            Ok(Some(config)) => match crate::frontend::check(&config).await {
+                Ok(()) => Ok(json!({"valid": true})),
+                Err(error) => Ok(json!({"valid":false,"error":error.code()})),
+            },
             Ok(None) => Err(ServiceError::Protocol),
             Err(error) => Ok(json!({"valid": false, "error": error.code()})),
         },
         "test_adguard" => {
+            let draft = ["api_url", "username", "password"]
+                .iter()
+                .any(|key| object.contains_key(*key));
+            if !draft && uci::configured_integration().await? != Some(DnsIntegration::Adguard) {
+                return Ok(json!({"connected":false,"error":"adguard_integration_disabled"}));
+            }
             let result = async {
-                let settings = if ["api_url", "username", "password"]
-                    .iter()
-                    .any(|key| object.contains_key(*key))
-                {
+                let settings = if draft {
                     // Draft credentials are transient: no UCI writes, persistence, or logging.
                     // Partial drafts must never silently fall back to applied credentials.
-                    let field = |key: &str| request[key].as_str().ok_or(ServiceError::Protocol);
-                    let username = field("username")?;
-                    let password = field("password")?;
-                    let authenticated = !username.is_empty() || !password.is_empty();
-                    let settings = AdguardSettings {
-                        api_url: field("api_url")?.to_owned(),
-                        username: authenticated.then(|| username.to_owned()),
-                        password: authenticated.then(|| password.to_owned()),
-                    };
-                    settings.endpoint()?;
-                    settings
+                    draft_adguard(&request).await?
                 } else {
                     uci::cleanup_settings().await?
                 };
@@ -189,7 +358,9 @@ pub async fn rpc_call(method: &str, input: &[u8]) -> Result<Value, ServiceError>
                             "adguard_endpoint_invalid"
                         }
                         ServiceError::Adguard(
-                            AdguardError::Response { .. } | AdguardError::Json(_),
+                            AdguardError::Response { .. }
+                            | AdguardError::Json(_)
+                            | AdguardError::Encoding(_),
                         ) => "adguard_response_invalid",
                         _ => error.code(),
                     };
@@ -242,34 +413,31 @@ pub async fn cleanup_uci(uninstall: bool) -> Result<(), ServiceError> {
             Err(error) => return Err(error),
         }
     };
-    let journal = format!("{}.adguard.json", uci::STATE_FILE);
-    let has_journal = match fs::symlink_metadata(&journal) {
-        Ok(_) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match fs::symlink_metadata(format!("{journal}.lock")) {
-                Ok(_) => return Err(crate::adguard::AdguardError::State.into()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(error) => return Err(error.into()),
-    };
-    if has_journal {
-        let settings = uci::cleanup_settings().await?;
-        let mut manager = tokio::task::block_in_place(|| {
-            AdguardManager::open(settings, Path::new(uci::STATE_FILE), None)
-        })?;
-        manager.reconcile(None).await?;
-    }
     if uninstall {
+        crate::cleanup_inbound_uci().await?;
+    }
+    crate::frontend::cleanup_all(Path::new(uci::STATE_FILE)).await?;
+    if uninstall {
+        crate::ipv6_routing::Ipv6Routing::cleanup(Path::new(uci::STATE_FILE)).await?;
+        crate::cache_guard::remove().await?;
         Kernel::uninstall().await?;
         // Delete only known package-owned files, never recursively remove a directory.
         for path in [
+            crate::credentials::PATH.to_string(),
+            format!("{}.lock", crate::credentials::PATH),
             uci::STATE_FILE.to_string(),
             format!("{}.lock", uci::STATE_FILE),
-            journal.clone(),
-            format!("{journal}.lock"),
+            format!("{}.adguard.json", uci::STATE_FILE),
+            format!("{}.adguard.json.lock", uci::STATE_FILE),
+            format!("{}.adguard-preview.json", uci::STATE_FILE),
+            format!("{}.dnsmasq.json", uci::STATE_FILE),
+            format!("{}.dnsmasq.json.lock", uci::STATE_FILE),
+            format!("{}.ipv6-routing.json", uci::STATE_FILE),
+            format!("{}.ipv6-routing.json.lock", uci::STATE_FILE),
             uci::STATUS_FILE.to_string(),
+            crate::inbound_uci::STATE.to_string(),
+            format!("{}.lock", crate::inbound_uci::STATE),
+            crate::inbound_uci::STATUS.to_string(),
             "/etc/config/tunnel-detour".to_string(),
         ] {
             match fs::remove_file(path) {
@@ -278,7 +446,13 @@ pub async fn cleanup_uci(uninstall: bool) -> Result<(), ServiceError> {
                 Err(error) => return Err(error.into()),
             }
         }
-        for directory in ["/etc/tunnel-detour", "/var/run/tunnel-detour"] {
+        for directory in [
+            "/var/run/tunnel-detour/transport",
+            "/etc/tunnel-detour/inbound",
+            "/var/run/tunnel-detour/inbound",
+            "/etc/tunnel-detour",
+            "/var/run/tunnel-detour",
+        ] {
             match fs::remove_dir(directory) {
                 Ok(()) => {}
                 Err(error)

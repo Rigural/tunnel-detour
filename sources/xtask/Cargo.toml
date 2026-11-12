@@ -1,19 +1,28 @@
 [package]
 name = "xtask"
-description = "Build and test tooling for Tunnel Detour for AdGuard Home"
+description = "Build and test tooling for Tunnel Detour"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
+default-run = "xtask"
 
 [dependencies]
-serde_json.workspace = true
+hickory-proto.workspace = true
+libc.workspace = true
+# Reopening benchmark JSON must retain the original f64 bit pattern, rather
+# than introduce a parser rounding step into resumed paired observations.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 reqwest.workspace = true
 tokio.workspace = true
 tempfile.workspace = true
+socket2.workspace = true
+rustix = { workspace = true, features = ["time"] }
+seccompiler.workspace = true
 tunnel-detour-core.workspace = true
+tunnel-detour-service = { path = "../service" }
 
 [lints]
 workspace = true

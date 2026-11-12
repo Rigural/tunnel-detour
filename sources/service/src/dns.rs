@@ -26,12 +26,22 @@ impl DnsHandler {
     async fn process(&self, request: Vec<u8>) -> Result<Vec<u8>, ServiceError> {
         self.status.dns_query()?;
         let decision = tokio::task::block_in_place(|| {
+            self.resolver.snapshot()?;
             let mut policy = self.policy.lock().map_err(|_| ServiceError::Poisoned)?;
             answer_dns(&mut policy, &request, now()?).map_err(ServiceError::from)
         });
         match decision {
             Ok(DnsWireDecision::Reply(response)) => Ok(response),
             Ok(DnsWireDecision::Forward(query)) => self.resolver.exchange(&query).await,
+            Ok(DnsWireDecision::ServiceBinding(query)) => {
+                let upstream = self.resolver.exchange(query.packet()).await?;
+                tokio::task::block_in_place(|| {
+                    let mut policy = self.policy.lock().map_err(|_| ServiceError::Poisoned)?;
+                    query
+                        .answer(&mut policy, &upstream, now()?)
+                        .map_err(ServiceError::from)
+                })
+            }
             Err(error) if !error.is_critical() => {
                 self.status.failure(&error)?;
                 let query = Message::from_vec(&request).map_err(|_| ServiceError::Protocol)?;

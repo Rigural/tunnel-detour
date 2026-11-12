@@ -7,6 +7,9 @@
 }
 .tunnel-detour .td-banner span { font-size: .9em; }
 .tunnel-detour .td-actions { display: flex; flex-wrap: wrap; gap: .5rem; }
+.tunnel-detour .td-copy-address { display: flex; align-items: end; flex-wrap: wrap; gap: .5rem; margin: .5rem 0; }
+.tunnel-detour .td-copy-address label { flex: 1; min-width: 12rem; }
+.tunnel-detour .td-copy-address input { display: block; width: 100%; box-sizing: border-box; }
 .tunnel-detour .td-settings-group {
 	min-width: 0;
 	margin: 1rem 0 1.5rem;
@@ -36,23 +39,27 @@
 	.tunnel-detour .td-banner { display: block; }
 	.tunnel-detour .td-banner span { display: block; margin-top: .4rem; }
 	.tunnel-detour .td-settings-group { padding: .75rem; }
-	.tunnel-detour #cbi-tunnel-detour-exception table,
-	.tunnel-detour #cbi-tunnel-detour-exception tbody,
-	.tunnel-detour #cbi-tunnel-detour-exception tr,
-	.tunnel-detour #cbi-tunnel-detour-exception td { display: block; width: auto !important; min-width: 0 !important; }
-	.tunnel-detour #cbi-tunnel-detour-exception thead { display: none; }
-	.tunnel-detour #cbi-tunnel-detour-exception tr {
+	.tunnel-detour .cbi-value { display: block; }
+	.tunnel-detour .cbi-value-title { float: none; display: block; width: auto; text-align: left; }
+	.tunnel-detour .cbi-value-field { min-width: 0; margin-left: 0; }
+	.tunnel-detour :is(.cbi-input-text, .cbi-input-select) { max-width: 100%; box-sizing: border-box; }
+	.tunnel-detour .cbi-button { max-width: 100%; white-space: normal; }
+	.tunnel-detour :is(#cbi-tunnel-detour-exception, #cbi-tunnel-detour-inbound_port) table,
+	.tunnel-detour table.td-connections,
+	.tunnel-detour :is(#cbi-tunnel-detour-exception, #cbi-tunnel-detour-inbound_port, .td-connections) :is(tbody, tr, td) { display: block; width: auto !important; min-width: 0 !important; }
+	.tunnel-detour :is(#cbi-tunnel-detour-exception, #cbi-tunnel-detour-inbound_port, .td-connections) :is(thead, .table-titles) { display: none; }
+	.tunnel-detour :is(#cbi-tunnel-detour-exception, #cbi-tunnel-detour-inbound_port, .td-connections) tr {
 		margin: 1rem 0;
 		padding: .75rem;
 		border: 1px solid #8886;
 		border-radius: .35rem;
 	}
-	.tunnel-detour #cbi-tunnel-detour-exception td { padding: .5rem 0; text-align: left; border: 0; }
-	.tunnel-detour #cbi-tunnel-detour-exception td::before { float: none; display: block; width: auto; text-align: left; padding: 0 0 .4rem; font-weight: bold; }
-	.tunnel-detour #cbi-tunnel-detour-exception td[data-title]::before { content: attr(data-title); }
-	.tunnel-detour #cbi-tunnel-detour-exception .cbi-section-actions::before { content: none; }
-	.tunnel-detour #cbi-tunnel-detour-exception .cbi-section-actions > div { display: flex; justify-content: flex-end; }
-	.tunnel-detour #cbi-tunnel-detour-exception .cbi-section-actions button { width: auto !important; flex: 0 0 auto !important; }
+	.tunnel-detour :is(#cbi-tunnel-detour-exception, #cbi-tunnel-detour-inbound_port, .td-connections) td { padding: .5rem 0; text-align: left; border: 0; white-space: normal; overflow-wrap: anywhere; }
+	.tunnel-detour :is(#cbi-tunnel-detour-exception, #cbi-tunnel-detour-inbound_port, .td-connections) td::before { float: none; display: block; width: auto; text-align: left; padding: 0 0 .4rem; font-weight: bold; }
+	.tunnel-detour :is(#cbi-tunnel-detour-exception, #cbi-tunnel-detour-inbound_port, .td-connections) td[data-title]::before { content: attr(data-title); }
+	.tunnel-detour :is(#cbi-tunnel-detour-exception, #cbi-tunnel-detour-inbound_port) .cbi-section-actions::before { content: none; }
+	.tunnel-detour :is(#cbi-tunnel-detour-exception, #cbi-tunnel-detour-inbound_port) .cbi-section-actions > div { display: flex; justify-content: flex-end; }
+	.tunnel-detour :is(#cbi-tunnel-detour-exception, #cbi-tunnel-detour-inbound_port) .cbi-section-actions button { width: auto !important; flex: 0 0 auto !important; }
 	.tunnel-detour #cbi-tunnel-detour-exception input[type="text"],
 	.tunnel-detour #cbi-tunnel-detour-exception select { min-height: 44px; box-sizing: border-box; }
 	.tunnel-detour #cbi-tunnel-detour-exception .cbi-checkbox { min-height: 44px; display: inline-flex; align-items: center; }

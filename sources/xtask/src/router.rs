@@ -14,6 +14,9 @@ use std::{
 use serde_json::{Value, json};
 use tunnel_detour_core::{DomainPattern, MatchScope};
 
+mod ipv6_probe;
+mod path_probe;
+
 const ASKPASS: &str = "TUNNEL_DETOUR_SSH_ASKPASS";
 const ACCESS: &str = "TUNNEL_DETOUR_SSH_ACCESS_FILE";
 
@@ -218,14 +221,33 @@ impl Router {
     }
 
     fn adguard(&self) -> Result<(), Box<dyn Error>> {
-        let username = self
-            .credentials
-            .get("adguard_username")
-            .ok_or("missing AdGuard username")?;
-        let password = self
-            .credentials
-            .get("adguard_password")
-            .ok_or("missing AdGuard password")?;
+        let (username, password) = match (
+            self.credentials.get("adguard_username"),
+            self.credentials.get("adguard_password"),
+        ) {
+            (Some(username), Some(password)) => (username.clone(), password.clone()),
+            (None, None) => {
+                // Inspect protected storage without copying secrets into arguments
+                // or requiring a second manually maintained access-file copy.
+                let configuration: Value = serde_json::from_slice(
+                    &self
+                        .secret_output("ubus -S call uci get '{\"config\":\"tunnel-detour\"}'\n")?,
+                )?;
+                let globals = &configuration["values"]["globals"];
+                let stored = self.applied_credentials(globals)?;
+                (
+                    stored["username"]
+                        .as_str()
+                        .ok_or("missing applied AdGuard username")?
+                        .to_owned(),
+                    stored["password"]
+                        .as_str()
+                        .ok_or("missing applied AdGuard password")?
+                        .to_owned(),
+                )
+            }
+            _ => return Err("provide both AdGuard access fields or neither".into()),
+        };
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let port = listener.local_addr()?.port();
         let stderr = self
@@ -237,7 +259,7 @@ impl Router {
             .mode(0o600)
             .open(stderr)?;
         let mut command = self.ssh()?;
-        let listeners = fs::read_to_string(self.directory.join("listeners.stdout"))?;
+        let listeners = String::from_utf8(self.capture("adguard-listeners", "netstat -lntp\n")?)?;
         let endpoints: Vec<_> = listeners
             .lines()
             .filter(|line| line.starts_with("tcp ") && line.contains("AdGuardHome"))
@@ -285,7 +307,7 @@ impl Router {
         runtime.block_on(async {
             let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).timeout(Duration::from_secs(15)).build()?;
             for endpoint in ["status", "dns_info", "filtering/status", "clients"] {
-                let mut response = client.get(format!("http://127.0.0.1:{port}/control/{endpoint}")).basic_auth(username, Some(password)).send().await.map_err(|_| "AdGuard API request failed over SSH")?;
+                let mut response = client.get(format!("http://127.0.0.1:{port}/control/{endpoint}")).basic_auth(&username, Some(&password)).send().await.map_err(|_| "AdGuard API request failed over SSH")?;
                 if !response.status().is_success() {
                     return Err(format!("AdGuard API {endpoint} returned HTTP {}", response.status()).into());
                 }
@@ -320,6 +342,23 @@ impl Router {
             }
             Ok::<_, Box<dyn Error>>(())
         })
+    }
+
+    fn applied_credentials(&self, globals: &Value) -> Result<Value, Box<dyn Error>> {
+        if globals.get("adguard_username").is_some() || globals.get("adguard_password").is_some() {
+            return Ok(
+                json!({"username":globals["adguard_username"],"password":globals["adguard_password"]}),
+            );
+        }
+        let stored: Value = serde_json::from_slice(&self.secret_output("if test -f /etc/tunnel-detour/adguard-credentials.json; then cat /etc/tunnel-detour/adguard-credentials.json; else printf '%s' '{\"current\":{\"revision\":null,\"value\":{\"username\":\"\",\"password\":\"\"}},\"pending\":null}'; fi\n")?)?;
+        let revision = globals
+            .get("adguard_credentials_revision")
+            .and_then(Value::as_str);
+        let selected = [&stored["current"], &stored["pending"]]
+            .into_iter()
+            .find(|version| version.is_object() && version["revision"].as_str() == revision)
+            .ok_or("applied credentials revision is unavailable")?;
+        Ok(selected["value"].clone())
     }
 
     fn configure_disabled(&self, target: &str) -> Result<(), Box<dyn Error>> {
@@ -471,7 +510,7 @@ impl Router {
             }
         }
         self.capture("backup-package-config", "cat /etc/config/tunnel-detour\n")?;
-        self.capture("apply-disabled-private-config", &format!("set -e\nchmod 600 {}\nmv {} /etc/config/tunnel-detour\n/usr/bin/tunnel-detour --check-uci\n",quote(&format!("{staging}/tunnel-detour")),quote(&format!("{staging}/tunnel-detour"))))?;
+        self.capture("apply-disabled-private-config", &format!("set -e\nchmod 600 {}\nmv {} /etc/config/tunnel-detour\n/usr/bin/tunnel-detour --migrate-adguard-credentials\n/usr/bin/tunnel-detour --check-uci\n",quote(&format!("{staging}/tunnel-detour")),quote(&format!("{staging}/tunnel-detour"))))?;
         self.record("acceptance-plan.json", &serde_json::to_vec(&json!({"url":target.as_str(),"hostname":hostname,"real_upstream":upstream.to_string(),"adguard_url":api_url,"remote_staging":staging}))?)?;
         self.management("configured-disabled")?;
         println!(
@@ -1149,6 +1188,9 @@ impl Router {
 
     fn reinstall_active(&self) -> Result<(), Box<dyn Error>> {
         // This is a same-version acceptance deployment, not a general firmware upgrader.
+        if self.directory.join("reinstall-board.stdout").exists() {
+            return Err("use a fresh validation directory for each reinstallation attempt; prior recovery records must not be reused".into());
+        }
         let board: Value = serde_json::from_slice(
             &self.capture("reinstall-board", "ubus -S call system board\n")?,
         )?;
@@ -1172,11 +1214,63 @@ impl Router {
         }
         let configuration =
             self.capture("reinstall-config-before", "uci export tunnel-detour\n")?;
+        let options: Value = serde_json::from_slice(&self.capture(
+            "reinstall-options-before",
+            "ubus -S call uci get '{\"config\":\"tunnel-detour\"}'\n",
+        )?)?;
+        let globals = &options["values"]["globals"];
+        if globals["ipv6_enabled"] == "1"
+            || globals["manage_adguard_upstream"] == "1"
+            || options["values"]["inbound"]["enabled"] == "1"
+            || globals["dns_integration"]
+                .as_str()
+                .is_some_and(|mode| mode != "adguard")
+        {
+            return Err("this recovery path requires the existing IPv4 AdGuard profile without managed general upstreams or package-owned inbound publications".into());
+        }
+        let field = |name: &str| {
+            globals[name]
+                .as_str()
+                .ok_or("missing applied AdGuard settings")
+        };
+        let stored_credentials = self.applied_credentials(globals)?;
+        let username = stored_credentials
+            .get("username")
+            .map(|value| value.as_str().ok_or("invalid applied AdGuard username"))
+            .transpose()?
+            .filter(|value| !value.is_empty());
+        let password = stored_credentials
+            .get("password")
+            .map(|value| value.as_str().ok_or("invalid applied AdGuard password"))
+            .transpose()?
+            .filter(|value| !value.is_empty());
+        if username.is_some() != password.is_some() {
+            return Err("the applied AdGuard credential pair is incomplete".into());
+        }
+        let control = json!({
+            "api_url":field("adguard_url")?,
+            "username":username,
+            "password":password,
+        });
+        let ownership_bytes = self.capture(
+            "reinstall-ownership-before",
+            "cat /etc/tunnel-detour/leases.json.adguard.json\n",
+        )?;
+        let ownership: Value = serde_json::from_slice(&ownership_bytes)?;
+        validate_recovery_ownership(&ownership, &ownership, &control)?;
+        let table_before: Value = serde_json::from_slice(
+            &self.capture("reinstall-table-before", "nft -j list tables\n")?,
+        )?;
+        recovery_table_present(&table_before)?;
+        let firewall_before = self.capture(
+            "reinstall-owned-firewall-before",
+            "nft -s list table inet tunnel_detour\n",
+        )?;
         let network = self.capture("reinstall-network-before", "uci export network\n")?;
         let firewall = self.capture("reinstall-firewall-before", "uci export firewall\n")?;
         // Keep live lease state out of automatic rollback: cached Fake-IPs must never lose
         // mappings allocated after this backup. Archive only the owned executable/UI payload.
-        let archive = self.capture("reinstall-payload-before.tar.gz", "set -e\nset -- /usr/bin/tunnel-detour /usr/libexec/rpcd/tunnel-detour /etc/init.d/tunnel-detour /etc/config/tunnel-detour /usr/share/luci/menu.d/luci-app-tunnel-detour.json /usr/share/rpcd/acl.d/luci-app-tunnel-detour.json /www/luci-static/resources/view/tunnel-detour/overview.js\nif test -f /www/luci-static/resources/view/tunnel-detour/overview.css; then set -- \"$@\" /www/luci-static/resources/view/tunnel-detour/overview.css; fi\ntar -czf - \"$@\"\n")?;
+        let archive = self.capture("reinstall-payload-before.tar.gz", "set -e\nset -- /usr/bin/tunnel-detour /usr/libexec/rpcd/tunnel-detour /etc/init.d/tunnel-detour /usr/share/luci/menu.d/luci-app-tunnel-detour.json /usr/share/rpcd/acl.d/luci-app-tunnel-detour.json /www/luci-static/resources/view/tunnel-detour/overview.js\nif test -f /www/luci-static/resources/view/tunnel-detour/overview.css; then set -- \"$@\" /www/luci-static/resources/view/tunnel-detour/overview.css; fi\ntar -czf - \"$@\"\n")?;
         if archive.is_empty() {
             return Err("the recoverable installed-payload archive is empty".into());
         }
@@ -1224,6 +1318,27 @@ impl Router {
                 .directory
                 .join("reinstall-payload-before.tar.gz.stdout"),
             &recovery,
+        )?;
+        self.upload(
+            &self.directory.join("reinstall-ownership-before.stdout"),
+            &format!("{remote}/ownership-before.json"),
+        )?;
+        let mut rollback = b"delete table inet tunnel_detour\n".to_vec();
+        rollback.extend(&firewall_before);
+        write_private(
+            &self.directory.join("reinstall-firewall-preflight.nft"),
+            &rollback,
+        )?;
+        self.upload(
+            &self.directory.join("reinstall-firewall-preflight.nft"),
+            &format!("{remote}/firewall-restore.nft"),
+        )?;
+        self.capture(
+            "reinstall-recovery-firewall-check",
+            &format!(
+                "nft -c -f {}\n",
+                quote(&format!("{remote}/firewall-restore.nft"))
+            ),
         )?;
         let result = (|| -> Result<(), Box<dyn Error>> {
             self.capture("reinstall-apk", &format!("set -e\napk add --force-reinstall --allow-untrusted --no-network {files}\n/etc/init.d/tunnel-detour restart\n"))?;
@@ -1290,8 +1405,54 @@ impl Router {
             Ok(())
         })();
         if let Err(error) = result {
-            self.capture("reinstall-recovery", &format!("set -e\n/etc/init.d/tunnel-detour stop\ntar -xzf {} -C /\n/etc/init.d/rpcd reload\n/etc/init.d/tunnel-detour start\n", quote(&recovery)))?;
-            return Err(format!("reinstallation failed ({error}); the previous payload was restored without reverting live lease state; package metadata and private backups need review").into());
+            self.capture(
+                "reinstall-recovery-stop",
+                "/etc/init.d/tunnel-detour stop\n",
+            )?;
+            if self.capture("reinstall-recovery-config", "uci export tunnel-detour\n")?
+                != configuration
+            {
+                return Err("reinstallation failed and UCI changed; recovery preserved the changed settings and requires review".into());
+            }
+            let current: Value = serde_json::from_slice(&self.capture(
+                "reinstall-recovery-ownership",
+                "cat /etc/tunnel-detour/leases.json.adguard.json\n",
+            )?)?;
+            validate_recovery_ownership(&ownership, &current, &control)?;
+            let tables: Value = serde_json::from_slice(
+                &self.capture("reinstall-recovery-tables", "nft -j list tables\n")?,
+            )?;
+            let mut transaction = if recovery_table_present(&tables)? {
+                b"delete table inet tunnel_detour\n".to_vec()
+            } else {
+                Vec::new()
+            };
+            transaction.extend(&firewall_before);
+            write_private(
+                &self.directory.join("reinstall-firewall-restore.nft"),
+                &transaction,
+            )?;
+            self.upload(
+                &self.directory.join("reinstall-firewall-restore.nft"),
+                &format!("{remote}/firewall-restore.nft"),
+            )?;
+            self.capture("reinstall-recovery", &format!("set -e\numask 077\nnft -c -f {firewall}\ntest ! -e /etc/tunnel-detour/leases.json.adguard.json.restore\ntest ! -L /etc/tunnel-detour/leases.json.adguard.json.restore\ncp {journal} /etc/tunnel-detour/leases.json.adguard.json.restore\nchmod 600 /etc/tunnel-detour/leases.json.adguard.json.restore\nsync\nmv /etc/tunnel-detour/leases.json.adguard.json.restore /etc/tunnel-detour/leases.json.adguard.json\nsync\ntar -xzf {payload} -C /\nnft -f {firewall}\n/etc/init.d/rpcd reload\n/etc/init.d/tunnel-detour start\n", firewall=quote(&format!("{remote}/firewall-restore.nft")), journal=quote(&format!("{remote}/ownership-before.json")), payload=quote(&recovery)))?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let status: Value = serde_json::from_slice(&self.capture(
+                    "reinstall-recovery-status",
+                    "ubus -S call tunnel-detour status '{}'\n",
+                )?)?;
+                if status["running"] == true && status["status"]["phase"] == "ready" {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("previous payload restored but readiness needs review".into());
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            self.management("after-recovery")?;
+            return Err(format!("reinstallation failed ({error}); previous runtime, owned firewall and DNS ownership recovered without reverting live leases or UCI; package metadata, new-only guards and private backups remain for review").into());
         }
         println!(
             "Active package reinstallation passed: a new process is ready, configuration is preserved, and SSH, LuCI and DNS remain reachable."
@@ -1402,6 +1563,8 @@ impl Router {
             })
             .collect();
         files.push(quote(&format!("{remote}/payload-before.tar.gz")));
+        files.push(quote(&format!("{remote}/ownership-before.json")));
+        files.push(quote(&format!("{remote}/firewall-restore.nft")));
         self.capture(
             "remove-uploaded-packages",
             &format!(
@@ -1528,6 +1691,73 @@ impl Router {
         Ok(())
     }
 
+    fn inspect_active(&self) -> Result<(), Box<dyn Error>> {
+        self.capture("active-dependencies", "for name in libc libgcc1 procd rpcd ubus uci ip-full nftables-json kmod-nft-nat conntrack firewall4 kmod-inet-diag luci-base; do if apk info -e \"$name\" >/dev/null 2>&1; then printf '%s present\\n' \"$name\"; else printf '%s missing\\n' \"$name\"; fi; done\n")?;
+        for (name, script) in [
+            (
+                "active-package-versions",
+                "apk query --installed --from installed --fields name,version --format json tunnel-detour luci-app-tunnel-detour\n",
+            ),
+            (
+                "active-configuration",
+                "ubus -S call uci get '{\"config\":\"tunnel-detour\"}'\n",
+            ),
+            ("active-runtime", "ubus -S call tunnel-detour status '{}'\n"),
+            ("active-ipv6-addresses", "ip -j -6 address show\n"),
+            (
+                "active-routes",
+                "ip -4 rule show\nip -4 route show table all\nip -6 rule show\nip -6 route show table all\n",
+            ),
+            ("active-uci-pending", "uci changes\n"),
+            ("active-init", "cat /etc/init.d/tunnel-detour\n"),
+            ("active-fw4-include", "fw4 print\n"),
+            ("active-fw4-check", "fw4 check\n"),
+            ("active-payload-hash", "sha256sum /usr/bin/tunnel-detour\n"),
+        ] {
+            self.capture(name, script)?;
+        }
+        self.management("active-preflight")?;
+        println!(
+            "Active package, dependencies, IPv6, pending UCI changes and firewall include inspected; private records retained. No router settings changed."
+        );
+        Ok(())
+    }
+
+    fn inspect_path(&self) -> Result<(), Box<dyn Error>> {
+        for (name, script) in [
+            ("path-kernel", "uname -r\n"),
+            ("path-firewall", "nft --json list ruleset\n"),
+            ("path-links", "ip -details -json -statistics link show\n"),
+            ("path-addresses", "ip -json -6 address show\n"),
+            ("path-routes", "ip -json -6 route show table all\n"),
+            ("path-rules", "ip -json -6 rule show\n"),
+            ("path-neighbors", "ip -json -6 neighbor show\n"),
+            ("path-interfaces", "ubus -S call network.interface dump\n"),
+            ("path-wg-handshake", "wg show all latest-handshakes\n"),
+            ("path-wg-transfer", "wg show all transfer\n"),
+            (
+                "path-tools",
+                "for tool in tcpdump tc nstat ss; do if command -v \"$tool\" >/dev/null 2>&1; then printf '%s available\\n' \"$tool\"; else printf '%s unavailable\\n' \"$tool\"; fi; done\n",
+            ),
+            (
+                "path-tc",
+                "if command -v tc >/dev/null 2>&1; then tc -json qdisc show; for device in /sys/class/net/*; do device=${device##*/}; printf '\\nDEVICE %s\\n' \"$device\"; tc -json filter show dev \"$device\" ingress; done; else printf 'tc unavailable\\n'; fi\n",
+            ),
+            ("path-ipv6-counters", "cat /proc/net/snmp6\n"),
+            ("path-sockets", "netstat -lntp\n"),
+            (
+                "path-runtime",
+                "ubus -S call tunnel-detour inbound_status '{}'\nubus -S call tunnel-detour status '{}'\n",
+            ),
+            ("path-log", "logread -e tunnel-detour -l 40\n"),
+        ] {
+            self.capture(name, script)?;
+        }
+        self.management("path-management")?;
+        println!("Read-only packet-path inventory retained privately; no router settings changed.");
+        Ok(())
+    }
+
     fn inspect(&self) -> Result<(), Box<dyn Error>> {
         let board: Value =
             serde_json::from_slice(&self.capture("board", "ubus -S call system board\n")?)?;
@@ -1621,8 +1851,80 @@ fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn recovery_table_present(listing: &Value) -> Result<bool, Box<dyn Error>> {
+    let objects = listing["nftables"]
+        .as_array()
+        .ok_or("invalid firewall recovery inventory")?;
+    let tables: Vec<_> = objects
+        .iter()
+        .filter_map(|object| object.get("table"))
+        .filter(|table| table["family"] == "inet" && table["name"] == "tunnel_detour")
+        .collect();
+    match tables.as_slice() {
+        [] => Ok(false),
+        [table]
+            if matches!(
+                table["comment"].as_str(),
+                Some("tunnel-detour:v1" | "tunnel-detour:v2")
+            ) =>
+        {
+            Ok(true)
+        }
+        _ => Err("firewall recovery refuses an unrecognized table owner".into()),
+    }
+}
+
+fn validate_recovery_ownership(
+    previous: &Value,
+    current: &Value,
+    control: &Value,
+) -> Result<(), Box<dyn Error>> {
+    for journal in [previous, current] {
+        let object = journal.as_object().ok_or("invalid DNS recovery journal")?;
+        let version = journal["version"]
+            .as_u64()
+            .ok_or("missing DNS journal version")?;
+        let managed = journal["managed"]
+            .as_array()
+            .ok_or("missing DNS ownership list")?;
+        let names = managed
+            .iter()
+            .map(|line| line.as_str().ok_or("invalid DNS ownership entry"))
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        if !matches!(version, 1 | 3)
+            || managed.len() > 4096
+            || names.len() != managed.len()
+            || names
+                .iter()
+                .any(|line| line.is_empty() || line.len() > 4096)
+            || object.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "version" | "managed" | "control" | "upstream" | "last_upstream_approval"
+                )
+            })
+            || (version == 1 && object.len() != 2)
+            || (version == 3 && &journal["control"] != control)
+            || !journal["upstream"].is_null()
+            || !journal["last_upstream_approval"].is_null()
+        {
+            return Err(
+                "DNS recovery requires unchanged domain-only ownership and the original local API"
+                    .into(),
+            );
+        }
+    }
+    if previous["managed"] != current["managed"]
+        || (previous["version"] == 3 && previous != current)
+    {
+        return Err("DNS recovery refuses changed or pending ownership".into());
+    }
+    Ok(())
+}
+
 fn validate_reinstallation_plan(plan: &str) -> Result<(), Box<dyn Error>> {
     let mut packages = std::collections::BTreeSet::new();
+    let version = format!("{}-r1", env!("CARGO_PKG_VERSION"));
     for line in plan
         .lines()
         .map(str::trim_start)
@@ -1632,13 +1934,21 @@ fn validate_reinstallation_plan(plan: &str) -> Result<(), Box<dyn Error>> {
             .split_once(") ")
             .ok_or("invalid APK transaction line")?;
         let (operation, package) = change.split_once(' ').ok_or("invalid APK package change")?;
-        let (name, _) = package
+        let (name, versions) = package
             .split_once(" (")
             .ok_or("invalid APK package version")?;
-        if !matches!(
-            operation,
-            "Installing" | "Reinstalling" | "Upgrading" | "Downgrading"
-        ) || !matches!(name, "tunnel-detour" | "luci-app-tunnel-detour")
+        let versions = versions
+            .strip_suffix(')')
+            .ok_or("invalid APK version boundary")?;
+        let same_version = match operation {
+            "Reinstalling" => versions == version,
+            // apk-tools distinguishes changed content at the same version
+            // from reinstalling the identical package object.
+            "Replacing" => versions == format!("{version} -> {version}"),
+            _ => false,
+        };
+        if !same_version
+            || !matches!(name, "tunnel-detour" | "luci-app-tunnel-detour")
             || !packages.insert(name)
         {
             return Err(
@@ -1665,6 +1975,9 @@ pub(crate) fn run(
     );
     match phase {
         "inspect" => router.inspect(),
+        "inspect-active" => router.inspect_active(),
+        "inspect-path" => router.inspect_path(),
+        "probe-path" => path_probe::run(&router),
         "details" => router.details(),
         "adguard" => router.adguard(),
         "preflight" => router.preflight(),
@@ -1675,6 +1988,7 @@ pub(crate) fn run(
         "stop-test" => router.stop_test(),
         "probe-test" => router.probe_test(),
         "probe-active" => router.probe_active(),
+        "probe-ipv6-windows" => router.probe_ipv6_windows(),
         "windows-dns" => router.windows_dns(),
         "inspect-test" => router.inspect_test(),
         "audit-test" => router.audit_test(),
@@ -1695,19 +2009,83 @@ pub(crate) fn configure(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_reinstallation_plan;
+    use super::{
+        recovery_table_present, validate_recovery_ownership, validate_reinstallation_plan,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn r122_hardware_recovery_accepts_only_unchanged_domain_ownership_and_known_firewall_generations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = json!({"version":1,"managed":["[/selected.example.test/]127.0.0.1:10535"]});
+        let control = json!({"api_url":"http://127.0.0.1:13000","username":null,"password":null});
+        let migrated = json!({"version":3,"managed":original["managed"],"control":control});
+        validate_recovery_ownership(&original, &original, &control)?;
+        validate_recovery_ownership(&original, &migrated, &control)?;
+        validate_recovery_ownership(&migrated, &migrated, &control)?;
+        for (key, value) in [
+            ("managed", json!([])),
+            ("managed", json!(["[/other.example.test/]127.0.0.1:10535"])),
+            (
+                "managed",
+                json!([
+                    "[/selected.example.test/]127.0.0.1:10535",
+                    "[/selected.example.test/]127.0.0.1:10535"
+                ]),
+            ),
+            (
+                "control",
+                json!({"api_url":"http://127.0.0.1:13001","username":null,"password":null}),
+            ),
+            ("upstream", json!({"pending":["tcp://192.0.2.53"]})),
+            ("last_upstream_approval", json!("unreviewed")),
+            ("unknown", json!(true)),
+            ("version", json!(2)),
+        ] {
+            let mut changed = migrated.clone();
+            changed[key] = value;
+            assert!(
+                validate_recovery_ownership(&original, &changed, &control).is_err(),
+                "accepted changed ownership field {key}"
+            );
+        }
+        for owner in ["tunnel-detour:v1", "tunnel-detour:v2"] {
+            assert!(recovery_table_present(
+                &json!({"nftables":[{"table":{"family":"inet","name":"tunnel_detour","comment":owner}}]})
+            )?);
+        }
+        assert!(!recovery_table_present(&json!({"nftables":[]}))?);
+        assert!(recovery_table_present(&json!({"nftables":[{"table":{"family":"inet","name":"tunnel_detour","comment":"foreign"}}]})).is_err());
+        Ok(())
+    }
 
     #[test]
     fn r040_hardware_reinstallation_rejects_foreign_removal_unknown_or_incomplete_apk_transactions()
     {
-        let owned = "(1/2) Reinstalling tunnel-detour (0.1.0-r1)\n(2/2) Reinstalling luci-app-tunnel-detour (0.1.0-r1)\nOK: 81 MiB in 147 packages\n";
-        assert!(validate_reinstallation_plan(owned).is_ok());
+        let version = format!("{}-r1", env!("CARGO_PKG_VERSION"));
+        let owned = format!(
+            "(1/2) Reinstalling tunnel-detour ({version})\n(2/2) Reinstalling luci-app-tunnel-detour ({version})\nOK: 81 MiB in 147 packages\n"
+        );
+        let replacement = format!(
+            "(1/2) Replacing tunnel-detour ({version} -> {version})\n(2/2) Replacing luci-app-tunnel-detour ({version} -> {version})\nOK: 81 MiB in 147 packages\n"
+        );
+        assert!(validate_reinstallation_plan(&owned).is_ok());
+        assert!(validate_reinstallation_plan(&replacement).is_ok());
         for plan in [
             format!("{owned}(3/3) Upgrading firewall4 (1-r1 -> 1-r2)\n"),
             format!("{owned}(3/3) Removing adguardhome (1-r1)\n"),
             owned.replace("Reinstalling tunnel-detour", "Removing tunnel-detour"),
             owned.replace("Reinstalling tunnel-detour", "Unexpected tunnel-detour"),
-            "(1/1) Reinstalling tunnel-detour (0.1.0-r1)\n".into(),
+            owned.replace("Reinstalling tunnel-detour", "Installing tunnel-detour"),
+            replacement.replace(
+                &format!("{version} -> {version}"),
+                &format!("0.0.0-r1 -> {version}"),
+            ),
+            replacement.replace(
+                &format!("{version} -> {version}"),
+                &format!("{version} -> 99.0.0-r1"),
+            ),
+            format!("(1/1) Reinstalling tunnel-detour ({version})\n"),
             "OK: nothing to do\n".into(),
         ] {
             assert!(

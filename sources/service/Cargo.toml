@@ -1,11 +1,14 @@
 [package]
 name = "tunnel-detour-service"
-description = "Tunnel Detour for AdGuard Home: OpenWrt DNS Fake-IP and transparent TCP exception service"
+description = "Tunnel Detour: OpenWrt DNS Fake-IP and transparent TCP exception service"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[features]
+fuzzing = []
 
 [[bin]]
 name = "tunnel-detour"
@@ -14,11 +17,13 @@ path = "src/main.rs"
 [dependencies]
 hickory-proto.workspace = true
 reqwest.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["time"] }
 ipnet.workspace = true
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error.workspace = true
+seccompiler.workspace = true
 socket2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true

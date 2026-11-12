@@ -1,42 +1,235 @@
 //! Each test owns one requirement. Fixtures contain only synthetic domains and local state.
 //! These are library and real-filesystem tests; they do not claim router/network validation.
 
-use std::{error::Error, fs, net::Ipv4Addr, num::NonZeroUsize, path::PathBuf, time::Duration};
+use std::{
+    error::Error,
+    fs,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    num::NonZeroUsize,
+    path::PathBuf,
+    time::Duration,
+};
 
 use hickory_proto::{
     op::{Edns, Message, MessageType, OpCode, Query, ResponseCode},
-    rr::{DNSClass, Name, RData, Record, RecordType, rdata::A},
+    rr::{
+        DNSClass, Name, RData, Record, RecordType,
+        rdata::{
+            A, AAAA, HTTPS, SVCB,
+            svcb::{
+                Alpn, EchConfigList, IpHint, Mandatory, SvcParamKey as Key, SvcParamValue as Value,
+                Unknown,
+            },
+        },
+    },
 };
 use tempfile::TempDir;
 use tunnel_detour_core::{
-    ConnectionError, DnsDecision, DnsQuestionType, DomainName, DomainPattern, ExceptionPolicy,
-    FakeIpError, FakeIpRange, LeaseStore, LeaseTable, MatchScope, Rule, RuleSet, RuleSetError,
-    StoreError, Timestamp,
+    ConnectionError, DnsAddressFamilies, DnsDecision, DnsQuestionType, DomainName, DomainPattern,
+    ExceptionPolicy, FakeIpError, FakeIpRange, LeaseStore, LeaseTable, MatchScope, Rule, RuleSet,
+    RuleSetError, StoreError, Timestamp,
 };
 use tunnel_detour_core::{DnsWireDecision, DnsWireError, answer_dns, validate_upstream_reply};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
 #[test]
+fn r131_rule_budgets_preserve_other_rules_and_permanent_identities_across_restart() -> TestResult {
+    let fixture = StateFixture::new()?;
+    let rules = RuleSet::from_lines(
+        "***.scoped.example.test\nother.example.test\nreserved.scoped.example.test",
+        NonZeroUsize::new(3).ok_or("rule capacity")?,
+    )?;
+    let first: DomainName = "one.scoped.example.test".parse()?;
+    let second: DomainName = "two.scoped.example.test".parse()?;
+    let excess: DomainName = "three.scoped.example.test".parse()?;
+    let mut policy = ExceptionPolicy::new(rules.clone(), fixture.open()?, Duration::from_secs(60))?;
+    policy.set_mapping_limit_per_rule(NonZeroUsize::new(2).ok_or("mapping limit")?);
+    let DnsDecision::Synthetic(original) =
+        policy.decide_dns(&first, DnsQuestionType::A, instant(100))?
+    else {
+        return Err("first hostname was not issued".into());
+    };
+    policy.decide_dns(&second, DnsQuestionType::A, instant(100))?;
+    let before = fs::read(&fixture.path)?;
+    assert!(matches!(
+        policy.decide_dns(&excess, DnsQuestionType::A, instant(100)),
+        Err(StoreError::Lease(FakeIpError::RuleCapacity))
+    ));
+    assert_eq!(fs::read(&fixture.path)?, before);
+    for name in ["other.example.test", "reserved.scoped.example.test"] {
+        assert!(matches!(
+            policy.decide_dns(&name.parse()?, DnsQuestionType::A, instant(100))?,
+            DnsDecision::Synthetic(_)
+        ));
+    }
+    assert_eq!(policy.mapping_usage()?.allocated, 4);
+    drop(policy);
+    let mut restored = ExceptionPolicy::new(rules, fixture.open()?, Duration::from_secs(60))?;
+    restored.set_mapping_limit_per_rule(NonZeroUsize::new(2).ok_or("mapping limit")?);
+    assert!(matches!(
+        restored.decide_dns(&excess, DnsQuestionType::A, instant(200)),
+        Err(StoreError::Lease(FakeIpError::RuleCapacity))
+    ));
+    let DnsDecision::Synthetic(renewed) =
+        restored.decide_dns(&first, DnsQuestionType::A, instant(200))?
+    else {
+        return Err("known hostname did not renew".into());
+    };
+    assert_eq!(renewed.address(), original.address());
+    assert_eq!(renewed.ipv6_address(), original.ipv6_address());
+    assert_eq!(restored.mapping_usage()?.allocated, 4);
+    let saved = fs::read(&fixture.path)?;
+    restored.decide_dns(&first, DnsQuestionType::A, instant(201))?;
+    assert_eq!(
+        fs::read(&fixture.path)?,
+        saved,
+        "warm known identities must not be rewritten"
+    );
+    Ok(())
+}
+
+#[test]
+fn r101_ipv6_identities_derive_from_legacy_leases_without_reassignment_or_new_persistent_fields()
+-> TestResult {
+    let fixture = StateFixture::new()?;
+    // A literal version-1 snapshot represents an already installed IPv4 allocator.
+    // Expected addresses below are independently specified, not encoded by the API.
+    let legacy = br#"{"version":1,"range":"198.18.0.0/28","last_issued_at":100,"entries":[{"domain":"one.example.test","address":"198.18.0.1","issued_at":100,"expires_at":160}]}"#;
+    fs::write(&fixture.path, legacy)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fixture.path, fs::Permissions::from_mode(0o600))?;
+    }
+    let mut store = fixture.open()?;
+    let first: Ipv6Addr = "2001:2::c612:1".parse()?;
+    assert_eq!(
+        store.table()?.range().ipv6_range().to_string(),
+        "2001:2::c612:0/124"
+    );
+    let old = store.table()?.lookup_ipv6(first, instant(120))?;
+    assert_eq!(old.domain().as_str(), "one.example.test");
+    assert_eq!(old.address(), Ipv4Addr::new(198, 18, 0, 1));
+    assert_eq!(old.ipv6_address(), first);
+    assert_eq!(
+        fs::read(&fixture.path)?,
+        legacy,
+        "opening must not rewrite legacy state"
+    );
+    for rejected in [
+        "2001:2::c612:0",     // IPv4 network identity is never allocated.
+        "2001:2::c612:f",     // IPv4 broadcast identity is never allocated.
+        "2001:2::c612:2",     // In range, but not issued yet.
+        "2001:2::c612:10",    // Outside the configured /28.
+        "2001:2::c613:1",     // Another IPv4 benchmark subnet.
+        "2001:2:0:1::c612:1", // Low 32 bits alone are insufficient.
+        "::ffff:198.18.0.1",
+        "::1",
+    ] {
+        assert_eq!(
+            store.table()?.lookup_ipv6(rejected.parse()?, instant(120)),
+            Err(FakeIpError::UnknownAddress),
+            "accepted an unowned IPv6 identity: {rejected}"
+        );
+    }
+    assert_eq!(
+        store.table()?.lookup_ipv6(first, instant(160)),
+        Err(FakeIpError::Expired)
+    );
+    let second = store.issue(
+        &"two.example.test".parse()?,
+        instant(200),
+        Duration::from_secs(60),
+    )?;
+    assert_eq!(second.ipv6_address(), "2001:2::c612:2".parse::<Ipv6Addr>()?);
+    assert_eq!(
+        store.table()?.lookup_ipv6(first, instant(200)),
+        Err(FakeIpError::Expired)
+    );
+    let renewed = store.issue(
+        &"one.example.test".parse()?,
+        instant(200),
+        Duration::from_secs(60),
+    )?;
+    assert_eq!(renewed.ipv6_address(), first);
+    assert_eq!(
+        store.table()?.len(),
+        2,
+        "paired identities must not consume separate slots"
+    );
+    assert_eq!(
+        store.table()?.lookup_ipv6(first, instant(199)),
+        Err(FakeIpError::ClockReversed)
+    );
+    drop(store);
+    let reopened = fixture.open()?;
+    assert_eq!(
+        reopened.table()?.lookup_ipv6(first, instant(220))?,
+        &renewed
+    );
+    assert_eq!(
+        reopened.table()?.lookup(renewed.address(), instant(220))?,
+        &renewed
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&fixture.path)?)?,
+        serde_json::json!({
+            "version": 1, "range": "198.18.0.0/28", "last_issued_at": 200,
+            "entries": [
+                {"domain": "one.example.test", "address": "198.18.0.1", "issued_at": 200, "expires_at": 260},
+                {"domain": "two.example.test", "address": "198.18.0.2", "issued_at": 200, "expires_at": 260}
+            ]
+        }),
+        "IPv6 derivation must preserve the legacy persistent format"
+    );
+    for (ipv4, expected, last) in [
+        ("198.18.0.0/15", "2001:2::c612:0/111", "2001:2::c613:fffe"),
+        (
+            "198.19.255.252/30",
+            "2001:2::c613:fffc/126",
+            "2001:2::c613:fffe",
+        ),
+    ] {
+        let range: FakeIpRange = ipv4.parse()?;
+        assert_eq!(range.ipv6_range().to_string(), expected);
+        assert_eq!(
+            range.ipv4_identity(last.parse()?),
+            Some(Ipv4Addr::new(198, 19, 255, 254))
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn r036_repeated_dns_queries_reuse_a_durable_deadline_to_bound_flash_writes_without_extending_unpersisted_ttls()
 -> TestResult {
     let fixture = StateFixture::new()?;
-    let mut policy = ExceptionPolicy::new(rules(true)?, fixture.open()?, Duration::from_secs(60))?;
+    let mut policy = ExceptionPolicy::with_families(
+        rules(true)?,
+        fixture.open()?,
+        Duration::from_secs(60),
+        DnsAddressFamilies::DualStack,
+    )?;
     let query = dns_query("selected.example.test", RecordType::A)?;
     let first = dns_reply(answer_dns(&mut policy, &query, instant(100))?)?;
     assert_eq!(first.answers[0].ttl, 60);
     let snapshot = fs::read(&fixture.path)?;
     fs::File::open(&fixture.path)?
         .set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))?;
+    let query6 = dns_query("selected.example.test", RecordType::AAAA)?;
+    let first6 = dns_reply(answer_dns(&mut policy, &query6, instant(100))?)?;
     for second in 101..=130 {
-        let response = dns_reply(answer_dns(&mut policy, &query, instant(second))?)?;
-        assert_eq!(response.answers[0].ttl, 160 - u32::try_from(second)?);
-        assert_eq!(response.answers[0].data, first.answers[0].data);
-        assert_eq!(
-            fs::metadata(&fixture.path)?.modified()?,
-            std::time::UNIX_EPOCH,
-            "a cached durable lease was unnecessarily rewritten"
-        );
+        for (query, original) in [(&query, &first), (&query6, &first6)] {
+            let response = dns_reply(answer_dns(&mut policy, query, instant(second))?)?;
+            assert_eq!(response.answers[0].ttl, 160 - u32::try_from(second)?);
+            assert_eq!(response.answers[0].data, original.answers[0].data);
+            assert_eq!(
+                fs::metadata(&fixture.path)?.modified()?,
+                std::time::UNIX_EPOCH,
+                "a cached durable lease was unnecessarily rewritten"
+            );
+        }
     }
     assert_eq!(fs::read(&fixture.path)?, snapshot);
     let renewed = dns_reply(answer_dns(&mut policy, &query, instant(131))?)?;
@@ -103,6 +296,12 @@ impl StateFixture {
 
 #[test]
 fn r001_hostnames_are_normalized_and_invalid_external_values_are_rejected() -> TestResult {
+    assert!(
+        format!("{}example.test", "\u{00ad}".repeat(1024))
+            .parse::<DomainName>()
+            .is_err(),
+        "ignored IDNA characters must not bypass the input resource bound"
+    );
     assert_eq!(
         "WWW.Example.Test.".parse::<DomainName>()?.as_str(),
         "www.example.test"
@@ -475,57 +674,80 @@ fn r011_missing_previously_created_state_never_initializes_a_fresh_allocator() -
 }
 
 #[test]
-fn r012_dns_policy_synthesizes_only_selected_a_records_and_suppresses_bypass_records() -> TestResult
-{
-    let fixture = StateFixture::new()?;
-    let mut policy = ExceptionPolicy::new(rules(true)?, fixture.open()?, Duration::from_secs(60))?;
-    for record_type in [
-        RecordType::A,
-        RecordType::AAAA,
-        RecordType::HTTPS,
-        RecordType::SVCB,
-        RecordType::TXT,
-    ] {
-        let request = dns_query("one.example.test", record_type)?;
-        let response = dns_reply(answer_dns(&mut policy, &request, instant(100))?)?;
-        assert_eq!(response.metadata.id, 321);
-        assert_eq!(response.metadata.message_type, MessageType::Response);
-        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
-        assert!(response.metadata.recursion_desired);
-        assert!(
-            !response.metadata.authentic_data,
-            "synthetic answers are not DNSSEC validated"
-        );
-        assert!(!response.metadata.checking_disabled);
-        assert_eq!(response.queries, Message::from_vec(&request)?.queries);
-        assert!(response.edns.is_some());
-        if record_type == RecordType::A {
-            assert_eq!(response.answers.len(), 1);
-            assert_eq!(
-                &response.answers[0].data,
-                &RData::A(A(Ipv4Addr::new(198, 18, 0, 1)))
-            );
-            assert_eq!(response.answers[0].ttl, 60);
-        } else {
+fn r012_dns_policy_synthesizes_only_enabled_address_families_and_suppresses_bypass_records()
+-> TestResult {
+    for families in [DnsAddressFamilies::Ipv4Only, DnsAddressFamilies::DualStack] {
+        let fixture = StateFixture::new()?;
+        let mut policy = ExceptionPolicy::with_families(
+            rules(true)?,
+            fixture.open()?,
+            Duration::from_secs(60),
+            families,
+        )?;
+        for record_type in [
+            RecordType::A,
+            RecordType::AAAA,
+            RecordType::HTTPS,
+            RecordType::SVCB,
+            RecordType::TXT,
+        ] {
+            let request = dns_query("one.example.test", record_type)?;
+            if record_type == RecordType::HTTPS {
+                let DnsWireDecision::ServiceBinding(binding) =
+                    answer_dns(&mut policy, &request, instant(100))?
+                else {
+                    return Err("selected HTTPS needs the dedicated binding policy".into());
+                };
+                assert_eq!(binding.packet(), request);
+                continue;
+            }
+            let response = dns_reply(answer_dns(&mut policy, &request, instant(100))?)?;
+            assert_eq!(response.metadata.id, 321);
+            assert_eq!(response.metadata.message_type, MessageType::Response);
+            assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+            assert!(response.metadata.recursion_desired);
             assert!(
-                response.answers.is_empty(),
-                "alternate addresses and bindings must be suppressed"
+                !response.metadata.authentic_data,
+                "synthetic answers are not DNSSEC validated"
+            );
+            assert!(!response.metadata.checking_disabled);
+            assert_eq!(response.queries, Message::from_vec(&request)?.queries);
+            assert!(response.edns.is_some());
+            if record_type == RecordType::A {
+                assert_eq!(response.answers.len(), 1);
+                assert_eq!(
+                    &response.answers[0].data,
+                    &RData::A(A(Ipv4Addr::new(198, 18, 0, 1)))
+                );
+                assert_eq!(response.answers[0].ttl, 60);
+            } else if record_type == RecordType::AAAA && families == DnsAddressFamilies::DualStack {
+                assert_eq!(response.answers.len(), 1);
+                assert_eq!(
+                    response.answers[0].data,
+                    RData::AAAA(AAAA("2001:2::c612:1".parse()?))
+                );
+                assert_eq!(response.answers[0].ttl, 60);
+            } else {
+                assert!(
+                    response.answers.is_empty(),
+                    "alternate addresses and bindings must be suppressed"
+                );
+            }
+            assert!(response.additionals.is_empty());
+            assert!(response.authorities.is_empty());
+        }
+        for record_type in [
+            RecordType::A,
+            RecordType::AAAA,
+            RecordType::HTTPS,
+            RecordType::SVCB,
+        ] {
+            let request = dns_query("unrelated.test", record_type)?;
+            assert_eq!(
+                answer_dns(&mut policy, &request, instant(100))?,
+                DnsWireDecision::Forward(request)
             );
         }
-        assert!(response.additionals.is_empty());
-        assert!(response.authorities.is_empty());
-    }
-    for record_type in [
-        RecordType::A,
-        RecordType::AAAA,
-        RecordType::HTTPS,
-        RecordType::SVCB,
-    ] {
-        let request = dns_query("unrelated.test", record_type)?;
-        assert_eq!(
-            answer_dns(&mut policy, &request, instant(100))?,
-            DnsWireDecision::Forward(request)
-        );
     }
     Ok(())
 }
@@ -544,6 +766,9 @@ fn dns_reply(decision: DnsWireDecision) -> Result<Message, Box<dyn Error>> {
     match decision {
         DnsWireDecision::Reply(bytes) => Ok(Message::from_vec(&bytes)?),
         DnsWireDecision::Forward(_) => Err("expected a local DNS response".into()),
+        DnsWireDecision::ServiceBinding(_) => {
+            Err("HTTPS needs a real upstream reply and the binding policy".into())
+        }
     }
 }
 
@@ -554,6 +779,21 @@ fn r014_invalid_dns_envelopes_are_rejected_before_allocating_addresses() -> Test
     for bytes in [vec![], vec![0; 11], vec![0; 65536]] {
         assert!(answer_dns(&mut policy, &bytes, instant(100)).is_err());
     }
+    // A TSIG RR declares only one byte of RDATA, while its algorithm, time,
+    // fudge and MAC length extend beyond that boundary. Reporting this error
+    // used to underflow inside the wire decoder (RUSTSEC-2026-0488).
+    let mut malformed_tsig = vec![0_u8; 12];
+    malformed_tsig[11] = 1; // One additional record.
+    malformed_tsig.extend_from_slice(&[
+        0, // Root owner.
+        0, 250, // TSIG type.
+        0, 255, // ANY class.
+        0, 0, 0, 0, // Zero TTL.
+        0, 1, // Deliberately short RDLENGTH.
+    ]);
+    malformed_tsig.extend_from_slice(b"\x0bhmac-sha256\x00");
+    malformed_tsig.extend_from_slice(&[0; 10]); // Time, fudge, zero MAC length.
+    assert!(answer_dns(&mut policy, &malformed_tsig, instant(100)).is_err());
     let request = Message::from_vec(&dns_query("one.example.test", RecordType::A)?)?;
     let mut bad_class = request.clone();
     bad_class.queries[0].set_query_class(DNSClass::CH);
@@ -597,6 +837,11 @@ fn r015_real_dns_responses_must_match_the_question_and_not_reenter_the_synthetic
         60,
         RData::A(A(Ipv4Addr::new(203, 0, 113, 10))),
     ));
+    response.add_additional(Record::from_rdata(
+        name.clone(),
+        60,
+        RData::AAAA(AAAA("2001:db8::10".parse()?)),
+    ));
     let range = "198.18.0.0/15".parse()?;
     validate_upstream_reply(&query, &response.to_vec()?, range)?;
     let mut wrong_id = response.clone();
@@ -611,15 +856,45 @@ fn r015_real_dns_responses_must_match_the_question_and_not_reenter_the_synthetic
             Err(DnsWireError::UnexpectedUpstream)
         ));
     }
-    response.add_answer(Record::from_rdata(
-        name,
-        60,
+    for address in [
         RData::A(A(Ipv4Addr::new(198, 18, 0, 1))),
-    ));
-    assert!(matches!(
-        validate_upstream_reply(&query, &response.to_vec()?, range),
-        Err(DnsWireError::SyntheticUpstream)
-    ));
+        RData::AAAA(AAAA("2001:2::c612:1".parse()?)),
+        RData::AAAA(AAAA("2001:2::c612:0".parse()?)),
+        RData::AAAA(AAAA("2001:2::c613:ffff".parse()?)),
+        RData::HTTPS(HTTPS(SVCB::new(
+            1,
+            Name::root(),
+            vec![(
+                Key::Ipv4Hint,
+                Value::Ipv4Hint(IpHint(vec![A("198.18.0.1".parse()?)])),
+            )],
+        ))),
+        RData::SVCB(SVCB::new(
+            1,
+            Name::root(),
+            vec![(
+                Key::Ipv6Hint,
+                Value::Ipv6Hint(IpHint(vec![AAAA("2001:2::c612:1".parse()?)])),
+            )],
+        )),
+    ] {
+        for section in 0..3 {
+            let mut invalid = response.clone();
+            let records = match section {
+                0 => &mut invalid.answers,
+                1 => &mut invalid.authorities,
+                _ => &mut invalid.additionals,
+            };
+            records.push(Record::from_rdata(name.clone(), 60, address.clone()));
+            assert!(
+                matches!(
+                    validate_upstream_reply(&query, &invalid.to_vec()?, range),
+                    Err(DnsWireError::SyntheticUpstream)
+                ),
+                "synthetic address escaped validation in section {section}: {address:?}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -629,6 +904,13 @@ fn r016_state_files_reject_symlinks_and_access_by_other_users() -> TestResult {
     use std::os::unix::fs::{PermissionsExt, symlink};
     let fixture = StateFixture::new()?;
     drop(fixture.open()?);
+    let alias = fixture.path.with_extension("alias");
+    fs::hard_link(&fixture.path, &alias)?;
+    assert!(
+        matches!(fixture.open(), Err(StoreError::UnsafeFile)),
+        "aliased persistent state must be refused"
+    );
+    fs::remove_file(alias)?;
     fs::set_permissions(&fixture.path, fs::Permissions::from_mode(0o644))?;
     assert!(matches!(fixture.open(), Err(StoreError::UnsafeFile)));
     fs::set_permissions(&fixture.path, fs::Permissions::from_mode(0o600))?;
@@ -646,46 +928,356 @@ fn r016_state_files_reject_symlinks_and_access_by_other_users() -> TestResult {
 }
 
 #[test]
-fn r013_tcp_admission_revalidates_expiry_ports_current_rules_and_unknown_addresses() -> TestResult {
+fn r118_direct_https_bindings_preserve_tcp_parameters_and_shared_lease_ttl_while_replacing_all_address_hints()
+-> TestResult {
+    for families in [DnsAddressFamilies::Ipv4Only, DnsAddressFamilies::DualStack] {
+        let fixture = StateFixture::new()?;
+        let mut policy = ExceptionPolicy::with_families(
+            rules(true)?,
+            fixture.open()?,
+            Duration::from_secs(60),
+            families,
+        )?;
+        policy.decide_dns(
+            &"one.example.test".parse()?,
+            DnsQuestionType::A,
+            instant(100),
+        )?;
+        let saved = fs::read(&fixture.path)?;
+        let request = dns_query("one.example.test", RecordType::HTTPS)?;
+        let DnsWireDecision::ServiceBinding(query) =
+            answer_dns(&mut policy, &request, instant(120))?
+        else {
+            return Err("missing HTTPS policy dispatch".into());
+        };
+        let owner = Name::from_ascii("one.example.test.")?;
+        let mut real = Message::response(321, OpCode::Query);
+        real.add_queries(Message::from_vec(&request)?.queries);
+        real.metadata.authentic_data = true;
+        for (priority, target, ttl) in [(1, Name::root(), 3600), (2, owner.clone(), 10)] {
+            let params = vec![
+                (
+                    Key::Mandatory,
+                    Value::Mandatory(Mandatory(vec![Key::Alpn, Key::Port, Key::Ipv4Hint])),
+                ),
+                (
+                    Key::Alpn,
+                    Value::Alpn(Alpn(vec!["h3".into(), "h2".into(), "http/1.1".into()])),
+                ),
+                (Key::NoDefaultAlpn, Value::NoDefaultAlpn),
+                (Key::Port, Value::Port(443)),
+                (
+                    Key::Ipv4Hint,
+                    Value::Ipv4Hint(IpHint(vec![A("203.0.113.10".parse()?)])),
+                ),
+                (
+                    Key::Ipv6Hint,
+                    Value::Ipv6Hint(IpHint(vec![AAAA("2001:db8::10".parse()?)])),
+                ),
+            ];
+            real.add_answer(Record::from_rdata(
+                owner.clone(),
+                ttl,
+                RData::HTTPS(HTTPS(SVCB::new(priority, target, params))),
+            ));
+        }
+        real.add_additional(Record::from_rdata(
+            owner.clone(),
+            3600,
+            RData::A(A("203.0.113.10".parse()?)),
+        ));
+        real.add_authority(Record::from_rdata(
+            owner.clone(),
+            3600,
+            RData::AAAA(AAAA("2001:db8::10".parse()?)),
+        ));
+        let response =
+            Message::from_vec(&query.answer(&mut policy, &real.to_vec()?, instant(120))?)?;
+        assert_eq!(response.answers.len(), 2);
+        assert!(!response.metadata.authentic_data && !response.metadata.checking_disabled);
+        assert!(response.authorities.is_empty() && response.additionals.is_empty());
+        assert_eq!(response.queries, Message::from_vec(&request)?.queries);
+        for (index, record) in response.answers.iter().enumerate() {
+            assert_eq!(record.name, owner);
+            assert_eq!(record.ttl, if index == 0 { 40 } else { 10 });
+            let RData::HTTPS(binding) = &record.data else {
+                return Err("missing HTTPS answer".into());
+            };
+            assert_eq!(usize::from(binding.0.svc_priority), index + 1);
+            assert!(binding.0.target_name.is_root());
+            let mut expected = vec![
+                (
+                    Key::Mandatory,
+                    Value::Mandatory(Mandatory(vec![Key::Alpn, Key::Port, Key::Ipv4Hint])),
+                ),
+                (
+                    Key::Alpn,
+                    Value::Alpn(Alpn(vec!["h2".into(), "http/1.1".into()])),
+                ),
+                (Key::NoDefaultAlpn, Value::NoDefaultAlpn),
+                (Key::Port, Value::Port(443)),
+                (
+                    Key::Ipv4Hint,
+                    Value::Ipv4Hint(IpHint(vec![A("198.18.0.1".parse()?)])),
+                ),
+            ];
+            if families == DnsAddressFamilies::DualStack {
+                expected.push((
+                    Key::Ipv6Hint,
+                    Value::Ipv6Hint(IpHint(vec![AAAA("2001:2::c612:1".parse()?)])),
+                ));
+            }
+            assert_eq!(binding.0.svc_params, expected);
+        }
+        assert_eq!(
+            fs::read(&fixture.path)?,
+            saved,
+            "binding queries renewed a still-durable shared lease"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn r119_unsupported_https_endpoints_protocols_ech_and_mandatory_parameters_cannot_publish_hints_or_allocate_leases()
+-> TestResult {
     let fixture = StateFixture::new()?;
     let mut policy = ExceptionPolicy::new(rules(true)?, fixture.open()?, Duration::from_secs(60))?;
+    let packet = dns_query("one.example.test", RecordType::HTTPS)?;
+    let DnsWireDecision::ServiceBinding(query) = answer_dns(&mut policy, &packet, instant(100))?
+    else {
+        return Err("missing binding dispatch".into());
+    };
+    let cases = [
+        (
+            "alias",
+            SVCB::new(0, Name::from_ascii("alternate.test.")?, vec![]),
+        ),
+        ("unavailable alias", SVCB::new(0, Name::root(), vec![])),
+        (
+            "alternate endpoint",
+            SVCB::new(1, Name::from_ascii("alternate.test.")?, vec![]),
+        ),
+        (
+            "different port",
+            SVCB::new(1, Name::root(), vec![(Key::Port, Value::Port(8443))]),
+        ),
+        (
+            "no TCP suite",
+            SVCB::new(
+                1,
+                Name::root(),
+                vec![
+                    (Key::Alpn, Value::Alpn(Alpn(vec!["h3".into()]))),
+                    (Key::NoDefaultAlpn, Value::NoDefaultAlpn),
+                ],
+            ),
+        ),
+        (
+            "no-default without ALPN",
+            SVCB::new(
+                1,
+                Name::root(),
+                vec![(Key::NoDefaultAlpn, Value::NoDefaultAlpn)],
+            ),
+        ),
+        (
+            "ECH",
+            SVCB::new(
+                1,
+                Name::root(),
+                vec![(
+                    Key::EchConfigList,
+                    Value::EchConfigList(EchConfigList(vec![0, 0])),
+                )],
+            ),
+        ),
+        (
+            "unknown optional",
+            SVCB::new(
+                1,
+                Name::root(),
+                vec![(Key::Unknown(65400), Value::Unknown(Unknown(vec![1])))],
+            ),
+        ),
+        (
+            "unknown mandatory",
+            SVCB::new(
+                1,
+                Name::root(),
+                vec![
+                    (
+                        Key::Mandatory,
+                        Value::Mandatory(Mandatory(vec![Key::Unknown(65400)])),
+                    ),
+                    (Key::Unknown(65400), Value::Unknown(Unknown(vec![1]))),
+                ],
+            ),
+        ),
+        (
+            "mandatory missing",
+            SVCB::new(
+                1,
+                Name::root(),
+                vec![(Key::Mandatory, Value::Mandatory(Mandatory(vec![Key::Port])))],
+            ),
+        ),
+        (
+            "mandatory disabled family",
+            SVCB::new(
+                1,
+                Name::root(),
+                vec![
+                    (
+                        Key::Mandatory,
+                        Value::Mandatory(Mandatory(vec![Key::Ipv6Hint])),
+                    ),
+                    (
+                        Key::Ipv6Hint,
+                        Value::Ipv6Hint(IpHint(vec![AAAA("2001:db8::10".parse()?)])),
+                    ),
+                ],
+            ),
+        ),
+    ];
+    for (label, binding) in cases {
+        let mut real = Message::response(321, OpCode::Query);
+        real.add_queries(Message::from_vec(&packet)?.queries);
+        real.add_answer(Record::from_rdata(
+            Name::from_ascii("one.example.test.")?,
+            60,
+            RData::HTTPS(HTTPS(binding)),
+        ));
+        let response =
+            Message::from_vec(&query.answer(&mut policy, &real.to_vec()?, instant(100))?)?;
+        assert!(
+            response.answers.is_empty()
+                && response.additionals.is_empty()
+                && response.authorities.is_empty(),
+            "unsupported {label} published endpoint data"
+        );
+        assert!(
+            policy
+                .authorize_tcp("198.18.0.1".parse::<Ipv4Addr>()?, 443, instant(100))
+                .is_err(),
+            "unsupported {label} allocated a lease"
+        );
+    }
+    // Generic SVCB is not the HTTP mapping (RFC 9460 section 9).
+    assert!(
+        dns_reply(answer_dns(
+            &mut policy,
+            &dns_query("one.example.test", RecordType::SVCB)?,
+            instant(100)
+        )?)?
+        .answers
+        .is_empty()
+    );
+    for (owner, kind) in [
+        ("_443._https.one.example.test", RecordType::HTTPS),
+        ("_80._https.one.example.test", RecordType::HTTPS),
+        ("_8443._https.one.example.test", RecordType::HTTPS),
+        ("_443._tcp.one.example.test", RecordType::SVCB),
+    ] {
+        assert!(
+            dns_reply(answer_dns(
+                &mut policy,
+                &dns_query(owner, kind)?,
+                instant(100)
+            )?)?
+            .answers
+            .is_empty(),
+            "qualified owner escaped suppression: {owner}"
+        );
+    }
+    let unrelated = dns_query("_443._https.unrelated.test", RecordType::HTTPS)?;
+    assert_eq!(
+        answer_dns(&mut policy, &unrelated, instant(100))?,
+        DnsWireDecision::Forward(unrelated)
+    );
+    policy.replace_rules(rules(false)?);
+    let mut real = Message::response(321, OpCode::Query);
+    real.add_queries(Message::from_vec(&packet)?.queries);
+    real.add_answer(Record::from_rdata(
+        Name::from_ascii("one.example.test.")?,
+        60,
+        RData::HTTPS(HTTPS(SVCB::new(1, Name::root(), vec![]))),
+    ));
+    let response = Message::from_vec(&query.answer(&mut policy, &real.to_vec()?, instant(100))?)?;
+    assert_eq!(response.metadata.response_code, ResponseCode::Refused);
+    assert!(response.answers.is_empty());
+    Ok(())
+}
+
+#[test]
+fn r013_tcp_admission_revalidates_expiry_ports_current_rules_and_unknown_addresses() -> TestResult {
+    let fixture = StateFixture::new()?;
+    let mut policy = ExceptionPolicy::with_families(
+        rules(true)?,
+        fixture.open()?,
+        Duration::from_secs(60),
+        DnsAddressFamilies::DualStack,
+    )?;
     let name = "one.example.test".parse()?;
     let DnsDecision::Synthetic(lease) =
         policy.decide_dns(&name, DnsQuestionType::A, instant(100))?
     else {
         return Err("missing lease".into());
     };
-    for port in [80, 443] {
-        assert_eq!(
-            policy.authorize_tcp(lease.address(), port, instant(120))?,
-            &name
-        );
+    for address in [
+        IpAddr::V4(lease.address()),
+        IpAddr::V6(lease.ipv6_address()),
+    ] {
+        policy.replace_rules(rules(true)?);
+        for port in [80, 443] {
+            assert_eq!(policy.authorize_tcp(address, port, instant(120))?, &name);
+        }
+        assert!(matches!(
+            policy.authorize_tcp(address, 22, instant(120)),
+            Err(ConnectionError::UnsupportedPort)
+        ));
+        assert!(matches!(
+            policy.authorize_tcp(address, 443, instant(99)),
+            Err(ConnectionError::Lease(FakeIpError::ClockReversed))
+        ));
+        assert!(matches!(
+            policy.authorize_tcp(address, 443, instant(160)),
+            Err(ConnectionError::Lease(FakeIpError::Expired))
+        ));
+        policy.replace_rules(rules(false)?);
+        assert!(matches!(
+            policy.authorize_tcp(address, 443, instant(120)),
+            Err(ConnectionError::NotExcepted)
+        ));
+        policy.replace_rules(RuleSet::new(vec![], count(16)?)?);
+        assert!(matches!(
+            policy.authorize_tcp(address, 443, instant(120)),
+            Err(ConnectionError::NotExcepted)
+        ));
     }
-    assert!(matches!(
-        policy.authorize_tcp(lease.address(), 22, instant(120)),
-        Err(ConnectionError::UnsupportedPort)
-    ));
-    assert!(matches!(
-        policy.authorize_tcp(Ipv4Addr::new(198, 18, 0, 14), 443, instant(120)),
-        Err(ConnectionError::Lease(FakeIpError::UnknownAddress))
-    ));
-    assert!(matches!(
-        policy.authorize_tcp(lease.address(), 443, instant(99)),
-        Err(ConnectionError::Lease(FakeIpError::ClockReversed))
-    ));
-    assert!(matches!(
-        policy.authorize_tcp(lease.address(), 443, instant(160)),
-        Err(ConnectionError::Lease(FakeIpError::Expired))
-    ));
-    policy.replace_rules(rules(false)?);
-    assert!(matches!(
-        policy.authorize_tcp(lease.address(), 443, instant(120)),
-        Err(ConnectionError::NotExcepted)
-    ));
-    policy.replace_rules(RuleSet::new(vec![], count(16)?)?);
-    assert!(matches!(
-        policy.authorize_tcp(lease.address(), 443, instant(120)),
-        Err(ConnectionError::NotExcepted)
-    ));
+    policy.replace_rules(rules(true)?);
+    for unknown in [
+        IpAddr::V4(Ipv4Addr::new(198, 18, 0, 14)),
+        "2001:2::c612:e".parse()?,
+        "2001:2:0:1::c612:1".parse()?,
+    ] {
+        assert!(matches!(
+            policy.authorize_tcp(unknown, 443, instant(120)),
+            Err(ConnectionError::Lease(FakeIpError::UnknownAddress))
+        ));
+    }
+    drop(policy);
+    let ipv4_only = ExceptionPolicy::new(rules(true)?, fixture.open()?, Duration::from_secs(60))?;
+    assert!(
+        matches!(
+            ipv4_only.authorize_tcp(lease.ipv6_address(), 443, instant(120)),
+            Err(ConnectionError::UnsupportedFamily)
+        ),
+        "a cached IPv6 identity was admitted after IPv6 mode was disabled"
+    );
+    assert_eq!(
+        ipv4_only.authorize_tcp(lease.address(), 443, instant(120))?,
+        &name
+    );
     Ok(())
 }

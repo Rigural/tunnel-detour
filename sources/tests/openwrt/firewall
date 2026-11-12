@@ -23,3 +23,15 @@ config zone
 	option input 'REJECT'
 	option output 'ACCEPT'
 	option forward 'REJECT'
+
+# Native OpenWrt permits the IPv6 neighbor discovery needed to use this WAN.
+config rule
+	option name 'Allow-ICMPv6-ND'
+	option src 'wan'
+	option family 'ipv6'
+	option proto 'icmp'
+	list icmp_type 'router-solicitation'
+	list icmp_type 'router-advertisement'
+	list icmp_type 'neighbour-solicitation'
+	list icmp_type 'neighbour-advertisement'
+	option target 'ACCEPT'

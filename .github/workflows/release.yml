@@ -1,4 +1,4 @@
-name: Release Tunnel Detour for AdGuard Home
+name: Release Tunnel Detour
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag (vX.Y.Z)
+        description: Existing release tag (vX.Y.Z); select the same tag as the workflow ref
         required: true
         type: string
 
@@ -26,14 +26,25 @@ jobs:
     name: Test and build APKs
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      source_commit: ${{ steps.source.outputs.commit }}
     steps:
       - name: Validate the release tag
-        run: '[[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]'
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
       - name: Check out the tagged commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
           persist-credentials: false
+      - name: Record the checked-out source
+        id: source
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Refresh system package metadata
         run: sudo apt-get update
       - name: Install build prerequisites
@@ -42,6 +53,10 @@ jobs:
         run: rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Audit locked dependencies against RustSec
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --deny warnings
       - name: Check lints
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run workspace tests
@@ -52,6 +67,19 @@ jobs:
         run: cargo xtask test-openwrt
       - name: Build and inspect reference-target packages
         run: cargo xtask package --download-sdk "$RUNNER_TEMP/openwrt-sdk" --release-tag "$RELEASE_TAG"
+      - name: Confirm that the packages describe the checked-out source
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: jq --exit-status --arg commit "$SOURCE_COMMIT" '.source_commit == $commit and .source_tree_clean == true' target/packages/mediatek-filogic/build-info.json
+      - name: Attest release asset provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: target/packages/mediatek-filogic/SHA256SUMS
+      - name: Attest the service source dependency inventory
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: target/packages/mediatek-filogic/tunnel-detour-*.apk
+          sbom-path: target/packages/mediatek-filogic/SOURCE-SBOM.spdx.json
       - name: Transfer verified release assets
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -59,6 +87,8 @@ jobs:
           path: |
             target/packages/mediatek-filogic/*.apk
             target/packages/mediatek-filogic/SHA256SUMS
+            target/packages/mediatek-filogic/SOURCE-SBOM.spdx.json
+            target/packages/mediatek-filogic/build-info.json
           if-no-files-found: error
           retention-days: 7
           archive: true
@@ -80,7 +110,18 @@ jobs:
       - name: Verify transferred package checksums
         working-directory: artifacts
         run: sha256sum --check SHA256SUMS
+      - name: Verify source tag and signed build provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
+        run: |
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)" = "$SOURCE_COMMIT"
+          jq --exit-status --arg commit "$SOURCE_COMMIT" '.source_commit == $commit and .source_tree_clean == true' artifacts/build-info.json
+          for asset in artifacts/*.apk artifacts/SOURCE-SBOM.spdx.json artifacts/build-info.json; do
+            gh attestation verify "$asset" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$SOURCE_COMMIT" --source-ref "refs/tags/$RELEASE_TAG" --deny-self-hosted-runners
+          done
+          gh attestation verify artifacts/tunnel-detour-*.apk --repo "$GITHUB_REPOSITORY" --predicate-type https://spdx.dev/Document/v2.3 --source-digest "$SOURCE_COMMIT" --source-ref "refs/tags/$RELEASE_TAG" --deny-self-hosted-runners
       - name: Create release and upload APKs
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$RELEASE_TAG" artifacts/*.apk artifacts/SHA256SUMS --repo "$GITHUB_REPOSITORY" --verify-tag --title "Tunnel Detour for AdGuard Home $RELEASE_TAG" --generate-notes
+        run: gh release create "$RELEASE_TAG" artifacts/*.apk artifacts/SHA256SUMS artifacts/SOURCE-SBOM.spdx.json artifacts/build-info.json --repo "$GITHUB_REPOSITORY" --verify-tag --title "Tunnel Detour $RELEASE_TAG" --generate-notes --target "${{ needs.build.outputs.source_commit }}"

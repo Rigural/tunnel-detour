@@ -1,6 +1,6 @@
 [package]
 name = "tunnel-detour-core"
-description = "Tunnel Detour for AdGuard Home: domain policies and durable Fake-IP mappings"
+description = "Tunnel Detour: domain policies and durable Fake-IP mappings"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

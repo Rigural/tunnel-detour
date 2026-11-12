@@ -1,0 +1,41 @@
+[package]
+name = "tunnel-detour-fuzz"
+description = "Development-only parser and policy fuzz targets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+fuzzing = ["dep:libfuzzer-sys"]
+
+[dependencies]
+libfuzzer-sys = { workspace = true, optional = true }
+serde_json.workspace = true
+tempfile.workspace = true
+tunnel-detour-core.workspace = true
+tunnel-detour-service = { path = "../../service", features = ["fuzzing"] }
+
+[[bin]]
+name = "parsers"
+path = "parsers.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fuzzing"]
+
+[[bin]]
+name = "adguard-api"
+path = "adguard_api.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fuzzing"]
+
+[lints]
+workspace = true

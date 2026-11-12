@@ -1,8 +1,13 @@
 use std::{
-    collections::BTreeMap, fmt, net::Ipv4Addr, num::NonZeroUsize, str::FromStr, time::Duration,
+    collections::BTreeMap,
+    fmt,
+    net::{Ipv4Addr, Ipv6Addr},
+    num::NonZeroUsize,
+    str::FromStr,
+    time::Duration,
 };
 
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -36,22 +41,62 @@ impl Timestamp {
     }
 }
 
-/// An aligned subnet of the benchmark range, with network and broadcast addresses excluded.
+/// An aligned IPv4 benchmark subnet, with network and broadcast addresses excluded.
+///
+/// Each usable address also identifies exactly one IPv6 address: its four octets
+/// occupy the low 32 bits of 2001:2::/96, inside IANA's IPv6 benchmarking allocation
+/// (RFC 5180, corrected by erratum 1752). Both families share one permanent lease;
+/// deriving IPv6 identities requires no second allocator or persistence migration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct FakeIpRange(Ipv4Net);
+pub struct FakeIpRange {
+    ipv4: Ipv4Net,
+    ipv6: Ipv6Net,
+}
+
+fn paired_ipv6(address: Ipv4Addr) -> Ipv6Addr {
+    let [a, b, c, d] = address.octets();
+    Ipv6Addr::new(
+        0x2001,
+        2,
+        0,
+        0,
+        0,
+        0,
+        u16::from_be_bytes([a, b]),
+        u16::from_be_bytes([c, d]),
+    )
+}
 
 impl FakeIpRange {
     pub fn network(self) -> Ipv4Addr {
-        self.0.network()
+        self.ipv4.network()
     }
 
     pub fn contains(self, address: Ipv4Addr) -> bool {
-        self.0.contains(&address)
+        self.ipv4.contains(&address)
+    }
+
+    /// The deterministic IPv6 subnet paired with this IPv4 range. Its first and
+    /// last addresses remain unused, matching IPv4 lease allocation exactly.
+    /// This describes identity space; it does not enable DNS answers or routing.
+    pub fn ipv6_range(self) -> Ipv6Net {
+        self.ipv6
+    }
+
+    /// Recover an allocatable IPv4 identity only within this exact paired subnet.
+    /// The result is not authorization: a current lease and rule are still required.
+    pub fn ipv4_identity(self, address: Ipv6Addr) -> Option<Ipv4Addr> {
+        if !self.ipv6.contains(&address) {
+            return None;
+        }
+        let octets = address.octets();
+        let ipv4 = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+        (ipv4 != self.ipv4.network() && ipv4 != self.ipv4.broadcast()).then_some(ipv4)
     }
 
     pub fn capacity(self) -> u32 {
-        u32::from(self.0.broadcast()) - u32::from(self.0.network()) - 1
+        u32::from(self.ipv4.broadcast()) - u32::from(self.ipv4.network()) - 1
     }
 
     fn address_at(self, offset: usize) -> Result<Ipv4Addr, FakeIpError> {
@@ -59,7 +104,7 @@ impl FakeIpRange {
         if offset >= self.capacity() {
             return Err(FakeIpError::Exhausted);
         }
-        let address = u32::from(self.0.network())
+        let address = u32::from(self.ipv4.network())
             .checked_add(offset)
             .and_then(|value| value.checked_add(1))
             .ok_or(FakeIpError::Exhausted)?;
@@ -81,7 +126,12 @@ impl FromStr for FakeIpRange {
         {
             return Err(FakeIpError::InvalidRange);
         }
-        Ok(Self(network))
+        let ipv6 = Ipv6Net::new(paired_ipv6(network.network()), 96 + network.prefix_len())
+            .map_err(|_| FakeIpError::InvalidRange)?;
+        Ok(Self {
+            ipv4: network,
+            ipv6,
+        })
     }
 }
 
@@ -100,7 +150,7 @@ impl From<FakeIpRange> for String {
 
 impl fmt::Display for FakeIpRange {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+        self.ipv4.fmt(formatter)
     }
 }
 
@@ -120,6 +170,11 @@ impl Lease {
     pub fn address(&self) -> Ipv4Addr {
         self.address
     }
+    /// Permanent IPv6 identity paired with the existing IPv4 lease. Both share
+    /// the same hostname, validity and renewal; this never allocates another lease.
+    pub fn ipv6_address(&self) -> Ipv6Addr {
+        paired_ipv6(self.address)
+    }
     pub fn issued_at(&self) -> Timestamp {
         self.issued_at
     }
@@ -137,6 +192,8 @@ pub enum FakeIpError {
     InvalidRange,
     #[error("the synthetic address space or configured mapping capacity is exhausted")]
     Exhausted,
+    #[error("the selected rule has reached its permanent hostname budget")]
+    RuleCapacity,
     #[error("the lease TTL must be a positive whole number of seconds")]
     InvalidTtl,
     #[error("the lease deadline overflows the supported timestamp")]
@@ -195,6 +252,20 @@ impl LeaseTable {
     }
     pub fn is_empty(&self) -> bool {
         self.by_domain.is_empty()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity.get()
+    }
+
+    /// Include expired identities because their addresses remain permanently reserved.
+    pub fn leases(&self) -> impl Iterator<Item = &Lease> {
+        self.by_domain.values()
+    }
+
+    /// Expired entries still own their identities and may renew above a quota.
+    pub(crate) fn contains_domain(&self, domain: &DomainName) -> bool {
+        self.by_domain.contains_key(domain)
     }
 
     /// Allocate or renew a hostname's permanent address identity.
@@ -263,6 +334,16 @@ impl LeaseTable {
             return Err(FakeIpError::Expired);
         }
         Ok(lease)
+    }
+
+    /// Look up a paired IPv6 identity under the same expiry and clock checks as
+    /// IPv4. Outside, unused and unissued addresses fail closed.
+    pub fn lookup_ipv6(&self, address: Ipv6Addr, now: Timestamp) -> Result<&Lease, FakeIpError> {
+        let ipv4 = self
+            .range
+            .ipv4_identity(address)
+            .ok_or(FakeIpError::UnknownAddress)?;
+        self.lookup(ipv4, now)
     }
 
     pub(crate) fn snapshot(&self) -> Snapshot {

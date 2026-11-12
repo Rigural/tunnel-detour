@@ -186,8 +186,10 @@ pub(crate) fn build(root: &Path, cargo: &OsStr, sdk: &Path) -> Result<(), Box<dy
     for name in [
         "Makefile",
         "files/tunnel-detour.init",
+        "files/tunnel-detour-inbound.init",
         "files/tunnel-detour.config",
         "luci/overview.js",
+        "luci/inbound.js",
         "luci/overview.css",
         "luci/menu.json",
         "luci/acl.json",
@@ -230,9 +232,35 @@ pub(crate) fn build(root: &Path, cargo: &OsStr, sdk: &Path) -> Result<(), Box<dy
         fs::copy(source, artifacts.join(name))?;
         println!("Generated {}", artifacts.join(name).display());
     }
+    let sbom = source_sbom(&metadata)?;
+    fs::write(
+        artifacts.join("SOURCE-SBOM.spdx.json"),
+        serde_json::to_vec_pretty(&sbom)?,
+    )?;
+    let revision = Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()?;
+    let commit = revision
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&revision.stdout).trim().to_owned());
+    let state = Command::new("git")
+        .current_dir(root)
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .output()?;
+    let clean = state.status.success() && state.stdout.is_empty();
+    fs::write(
+        artifacts.join("build-info.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"), "source_commit": commit, "source_tree_clean": clean,
+            "target": TARGET, "sdk": SDK_NAME, "sdk_archive_sha256": SDK_SHA256
+        }))?,
+    )?;
     let checksums = Command::new("sha256sum")
         .current_dir(&artifacts)
         .args(&names)
+        .args(["SOURCE-SBOM.spdx.json", "build-info.json"])
         .output()?;
     if !checksums.status.success() {
         return Err("APK checksum generation failed".into());
@@ -310,8 +338,9 @@ fn find(directory: &Path, name: &str, found: &mut Vec<PathBuf>) -> Result<(), Bo
     Ok(())
 }
 
-fn licenses(metadata: &serde_json::Value, destination: &Path) -> Result<(), Box<dyn Error>> {
-    let mut notices = String::from("Third-party source notices included with this build.\n\n");
+fn production_dependencies(
+    metadata: &serde_json::Value,
+) -> Result<std::collections::BTreeSet<&str>, Box<dyn Error>> {
     let packages = metadata["packages"]
         .as_array()
         .ok_or("missing Cargo packages")?;
@@ -348,6 +377,133 @@ fn licenses(metadata: &serde_json::Value, destination: &Path) -> Result<(), Box<
             }
         }
     }
+    Ok(included)
+}
+
+/// SPDX describes the service's target-specific Cargo source graph, not the router's
+/// firmware, SDK, system libraries or dependencies installed separately by APK.
+fn source_sbom(metadata: &serde_json::Value) -> Result<serde_json::Value, Box<dyn Error>> {
+    let included = production_dependencies(metadata)?;
+    let packages = metadata["packages"]
+        .as_array()
+        .ok_or("missing Cargo packages")?;
+    let ids = packages
+        .iter()
+        .filter(|p| p["id"].as_str().is_some_and(|id| included.contains(id)))
+        .map(|p| {
+            Ok((
+                p["id"].as_str().ok_or("missing crate id")?,
+                format!(
+                    "SPDXRef-{}-{}",
+                    p["name"].as_str().ok_or("missing crate name")?,
+                    p["version"].as_str().ok_or("missing crate version")?
+                ),
+            ))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, Box<dyn Error>>>()?;
+    let mut output = Vec::new();
+    let mut relationships = Vec::new();
+    for package in packages {
+        let id = package["id"].as_str().ok_or("missing crate identifier")?;
+        let Some(spdx) = ids.get(id) else {
+            continue;
+        };
+        let name = package["name"].as_str().ok_or("missing crate name")?;
+        let version = package["version"].as_str().ok_or("missing crate version")?;
+        let (download, checksums) = if package["source"].is_null() {
+            ("NOASSERTION".into(), Vec::new())
+        } else {
+            if package["source"] != "registry+https://github.com/rust-lang/crates.io-index" {
+                return Err("SBOM requires an explicit adapter for this Cargo source".into());
+            }
+            let manifest = Path::new(
+                package["manifest_path"]
+                    .as_str()
+                    .ok_or("missing manifest")?,
+            );
+            let directory = manifest.parent().ok_or("missing crate directory")?;
+            let digest = match fs::read(directory.join(".cargo-checksum.json")) {
+                Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)?["package"]
+                    .as_str()
+                    .ok_or("missing vendored crate checksum")?
+                    .to_owned(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Pinned Cargo's registry extraction retains .cargo-ok; source
+                    // archive checksums come from its actual downloaded .crate.
+                    let index = directory.parent().ok_or("missing registry index")?;
+                    let registry = index
+                        .parent()
+                        .and_then(Path::parent)
+                        .ok_or("missing Cargo registry")?;
+                    let archive = registry
+                        .join("cache")
+                        .join(index.file_name().ok_or("missing index name")?)
+                        .join(format!("{name}-{version}.crate"));
+                    let output = Command::new("sha256sum").arg(archive).output()?;
+                    if !output.status.success() {
+                        return Err("Cargo source archive checksum failed".into());
+                    }
+                    String::from_utf8(output.stdout)?
+                        .split_whitespace()
+                        .next()
+                        .ok_or("missing archive digest")?
+                        .to_owned()
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err("invalid crate archive checksum".into());
+            }
+            (
+                format!("https://crates.io/api/v1/crates/{name}/{version}/download"),
+                vec![serde_json::json!({"algorithm":"SHA256", "checksumValue":digest})],
+            )
+        };
+        output.push(serde_json::json!({"SPDXID":spdx,"name":name,"versionInfo":version,
+            "downloadLocation":download,"checksums":checksums,"filesAnalyzed":false,"licenseDeclared":package["license"].as_str().unwrap_or("NOASSERTION"),
+            "licenseConcluded":"NOASSERTION","copyrightText":"NOASSERTION"}));
+        if name == "tunnel-detour-service" {
+            relationships.push(serde_json::json!({"spdxElementId":"SPDXRef-DOCUMENT","relationshipType":"DESCRIBES","relatedSpdxElement":spdx}));
+        }
+        let node = metadata["resolve"]["nodes"]
+            .as_array()
+            .ok_or("missing nodes")?
+            .iter()
+            .find(|node| node["id"] == id)
+            .ok_or("missing node")?;
+        for dependency in node["deps"].as_array().ok_or("missing edges")? {
+            if dependency["dep_kinds"]
+                .as_array()
+                .ok_or("missing kinds")?
+                .iter()
+                .any(|kind| kind["kind"].is_null() || kind["kind"] == "build")
+            {
+                let target = ids
+                    .get(dependency["pkg"].as_str().ok_or("missing dependency id")?)
+                    .ok_or("missing dependency")?;
+                relationships.push(serde_json::json!({"spdxElementId":spdx,"relationshipType":"DEPENDS_ON","relatedSpdxElement":target}));
+            }
+        }
+    }
+    let timestamp = Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()?;
+    if !timestamp.status.success() {
+        return Err("SBOM timestamp unavailable".into());
+    }
+    let timestamp = String::from_utf8(timestamp.stdout)?.trim().to_owned();
+    Ok(
+        serde_json::json!({"spdxVersion":"SPDX-2.3","dataLicense":"CC0-1.0","SPDXID":"SPDXRef-DOCUMENT",
+        "name":format!("Tunnel Detour {} Rust source dependencies", env!("CARGO_PKG_VERSION")),
+        "documentNamespace":format!("https://spdx.org/spdxdocs/tunnel-detour-{}-{}", env!("CARGO_PKG_VERSION"), timestamp.replace([':', '-'], "")),
+        "creationInfo":{"created":timestamp,"creators":["Tool: tunnel-detour-xtask"],"comment":"Target-specific normal and build Cargo source dependencies. Does not inventory firmware, SDK, system libraries or separately installed APK dependencies."},
+        "packages":output,"relationships":relationships}),
+    )
+}
+
+fn licenses(metadata: &serde_json::Value, destination: &Path) -> Result<(), Box<dyn Error>> {
+    let mut notices = String::from("Third-party source notices included with this build.\n\n");
+    let included = production_dependencies(metadata)?;
     for package in metadata["packages"]
         .as_array()
         .ok_or("missing Cargo packages")?
@@ -413,7 +569,52 @@ fn licenses(metadata: &serde_json::Value, destination: &Path) -> Result<(), Box<
 
 #[cfg(test)]
 mod tests {
-    use super::validate_version;
+    use super::{source_sbom, validate_version};
+
+    #[test]
+    fn r132_source_inventory_includes_production_edges_and_omits_development_and_local_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let metadata = serde_json::json!({"packages":[
+            {"id":"path+file:///private/controller","name":"tunnel-detour-service","version":"0.1.0","source":null,"license":"GPL-3.0-only"},
+            {"id":"path+file:///private/core","name":"tunnel-detour-core","version":"0.1.0","source":null,"license":"GPL-3.0-only"},
+            {"id":"path+file:///private/dev","name":"test-fixture-only","version":"0.1.0","source":null},
+            {"id":"path+file:///private/build","name":"synthetic-build-dependency","version":"0.1.0","source":null}
+        ], "resolve":{"nodes":[
+            {"id":"path+file:///private/controller","deps":[
+                {"pkg":"path+file:///private/core","dep_kinds":[{"kind":null}]},
+                {"pkg":"path+file:///private/build","dep_kinds":[{"kind":"build"}]},
+                {"pkg":"path+file:///private/dev","dep_kinds":[{"kind":"dev"}]}
+            ]}, {"id":"path+file:///private/core","deps":[]}, {"id":"path+file:///private/build","deps":[]}
+        ]}});
+        let sbom = source_sbom(&metadata)?;
+        assert_eq!(sbom["spdxVersion"], "SPDX-2.3");
+        let names: Vec<_> = sbom["packages"]
+            .as_array()
+            .ok_or("missing packages")?
+            .iter()
+            .map(|value| value["name"].as_str().ok_or("missing name"))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(
+            names,
+            [
+                "tunnel-detour-service",
+                "tunnel-detour-core",
+                "synthetic-build-dependency"
+            ]
+        );
+        let serialized = serde_json::to_string(&sbom)?;
+        assert!(!serialized.contains("/private/"));
+        assert!(!serialized.contains("test-fixture-only"));
+        assert_eq!(
+            sbom["relationships"],
+            serde_json::json!([
+                {"spdxElementId":"SPDXRef-DOCUMENT","relationshipType":"DESCRIBES","relatedSpdxElement":"SPDXRef-tunnel-detour-service-0.1.0"},
+                {"spdxElementId":"SPDXRef-tunnel-detour-service-0.1.0","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-tunnel-detour-core-0.1.0"},
+                {"spdxElementId":"SPDXRef-tunnel-detour-service-0.1.0","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-synthetic-build-dependency-0.1.0"}
+            ])
+        );
+        Ok(())
+    }
 
     #[test]
     fn r038_release_tag_and_openwrt_version_must_match_the_cargo_version() {

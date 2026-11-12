@@ -49,7 +49,8 @@ pub struct LeaseStore {
 }
 
 impl LeaseStore {
-    /// The containing directory must exist, be private, and remain on persistent storage.
+    /// The containing directory must exist, be private, belong to the effective
+    /// user, and remain on persistent storage. Snapshot and lock inodes must not be aliased.
     /// A missing snapshot initializes a new table; corrupt existing state is never reset.
     pub fn open(
         path: impl AsRef<Path>,
@@ -103,8 +104,10 @@ impl LeaseStore {
                 {
                     use std::os::unix::fs::OpenOptionsExt;
                     options.custom_flags(
-                        i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits())
-                            .map_err(|_| StoreError::UnsafeFile)?,
+                        i32::try_from(
+                            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits(),
+                        )
+                        .map_err(|_| StoreError::UnsafeFile)?,
                     );
                 }
                 let mut bytes = Vec::new();
@@ -112,10 +115,9 @@ impl LeaseStore {
                     .map_err(|_| StoreError::TooLarge)?
                     .checked_add(1)
                     .ok_or(StoreError::TooLarge)?;
-                options
-                    .open(&path)?
-                    .take(read_limit)
-                    .read_to_end(&mut bytes)?;
+                let file = options.open(&path)?;
+                validate_file(&file.metadata()?, false)?;
+                file.take(read_limit).read_to_end(&mut bytes)?;
                 if bytes.len() > byte_limit {
                     return Err(StoreError::TooLarge);
                 }
@@ -190,8 +192,11 @@ fn validate_file(metadata: &fs::Metadata, directory: bool) -> Result<(), StoreEr
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o077 != 0
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || (!directory && metadata.nlink() != 1)
+        {
             return Err(StoreError::UnsafeFile);
         }
     }

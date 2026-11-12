@@ -5,16 +5,18 @@ STOP=10
 USE_PROCD=1
 
 start_service() {
-	local enabled
+	local enabled revision
+	/usr/bin/tunnel-detour --migrate-adguard-credentials || return $?
 	config_load tunnel-detour
 	config_get_bool enabled globals enabled 0
 	if [ "$enabled" -eq 0 ]; then
-		/usr/bin/tunnel-detour --cleanup-disabled
-		return $?
+		return 0
 	fi
+	revision=$(/usr/bin/tunnel-detour --dns-revision) || return $?
 	procd_open_instance main
 	procd_set_param command /usr/bin/tunnel-detour --uci
-	procd_set_param file /etc/config/tunnel-detour
+	procd_set_param env "TUNNEL_DETOUR_DNS_REVISION=$revision"
+	procd_set_param file /usr/bin/tunnel-detour
 	procd_set_param respawn 3600 5 5
 	procd_set_param term_timeout 90
 	procd_set_param limits core="0" nofile="1024 1024"
@@ -24,15 +26,30 @@ start_service() {
 }
 
 reload_service() {
-	restart
+	if procd_running tunnel-detour main; then
+		procd_send_signal tunnel-detour main HUP || return $?
+	fi
+	start
+}
+
+service_started() {
+	local enabled
+	config_load tunnel-detour
+	config_get_bool enabled globals enabled 0
+	[ "$enabled" -ne 0 ] || /usr/bin/tunnel-detour --cleanup-disabled
 }
 
 service_triggers() {
-	local lan wan
+	local lan wan ipv6 wan6
 	config_load tunnel-detour
 	config_get lan globals lan_network lan
 	config_get wan globals wan_network wan
 	procd_add_reload_trigger tunnel-detour
 	procd_add_interface_trigger "interface.*" "$lan" /etc/init.d/tunnel-detour reload
 	procd_add_interface_trigger "interface.*" "$wan" /etc/init.d/tunnel-detour reload
+	config_get_bool ipv6 globals ipv6_enabled 0
+	if [ "$ipv6" -ne 0 ]; then
+		config_get wan6 globals wan6_network
+		[ -z "$wan6" ] || procd_add_interface_trigger "interface.*" "$wan6" /etc/init.d/tunnel-detour reload
+	fi
 }

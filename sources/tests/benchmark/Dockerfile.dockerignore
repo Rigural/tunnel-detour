@@ -1,0 +1,2 @@
+# This image uses only pinned remote inputs. Never send workspace files to its builder.
+**

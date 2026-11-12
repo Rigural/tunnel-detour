@@ -1,7 +1,10 @@
 use hickory_proto::{
     ProtoError,
     op::{Edns, Message, MessageType, OpCode, ResponseCode},
-    rr::{DNSClass, RData, Record, RecordType, rdata::A},
+    rr::{
+        DNSClass, RData, Record, RecordType,
+        rdata::{A, AAAA},
+    },
     serialize::binary::DecodeError,
 };
 use thiserror::Error;
@@ -15,6 +18,9 @@ pub enum DnsWireDecision {
     Reply(Vec<u8>),
     /// Forward these unmodified bytes to the dedicated real resolver, never to AdGuard.
     Forward(Vec<u8>),
+    /// Resolve through the dedicated real endpoint, then apply the owning
+    /// policy before returning any service-binding data to the client.
+    ServiceBinding(crate::HttpsBindingQuery),
 }
 
 #[derive(Debug, Error)]
@@ -31,6 +37,8 @@ pub enum DnsWireError {
     Store(#[from] StoreError),
     #[error("DNS response TTL is outside the supported range")]
     Ttl,
+    #[error("DNS policy selected an unsupported synthetic record type")]
+    UnsupportedSynthesis,
     #[error("real DNS upstream response does not match the request")]
     UnexpectedUpstream,
     #[error("real DNS upstream returned a synthetic address; resolver loop or range conflict")]
@@ -76,7 +84,18 @@ pub fn answer_dns(
         Ok(name) => name,
         // Non-hostname questions, including root and DNS-SD labels, still need ordinary DNS.
         // They cannot match the validated hostname-only exception list.
-        Err(_) => return Ok(DnsWireDecision::Forward(packet.to_vec())),
+        Err(_) => {
+            // Qualified service-binding owners still refer to the selected
+            // hostname. Suppress their unsupported port/protocol mapping rather
+            // than forwarding real address hints merely because '_' is not a
+            // hostname label. Ordinary DNS-SD and unrelated hosts stay intact.
+            if let Some(host) = qualified_binding_host(query.query_type(), &query.name().to_ascii())
+                && policy.decide_dns(&host, DnsQuestionType::Other, now)? == DnsDecision::Empty
+            {
+                return reply(&request, ResponseCode::NoError);
+            }
+            return Ok(DnsWireDecision::Forward(packet.to_vec()));
+        }
     };
     let kind = match query.query_type() {
         RecordType::A => DnsQuestionType::A,
@@ -88,6 +107,11 @@ pub fn answer_dns(
     let mut response = response_for(&request, ResponseCode::NoError);
     match policy.decide_dns(&name, kind, now)? {
         DnsDecision::Forward => return Ok(DnsWireDecision::Forward(packet.to_vec())),
+        DnsDecision::Empty if kind == DnsQuestionType::Https => {
+            return Ok(DnsWireDecision::ServiceBinding(
+                crate::HttpsBindingQuery::new(packet.to_vec(), name),
+            ));
+        }
         DnsDecision::Empty => {}
         DnsDecision::Synthetic(lease) => {
             let ttl = lease
@@ -96,17 +120,34 @@ pub fn answer_dns(
                 .checked_sub(now.unix_seconds())
                 .and_then(|ttl| u32::try_from(ttl).ok())
                 .ok_or(DnsWireError::Ttl)?;
-            response.add_answer(Record::from_rdata(
-                query.name().clone(),
-                ttl,
-                RData::A(A(lease.address())),
-            ));
+            let address = match query.query_type() {
+                RecordType::A => RData::A(A(lease.address())),
+                RecordType::AAAA => RData::AAAA(AAAA(lease.ipv6_address())),
+                _ => return Err(DnsWireError::UnsupportedSynthesis),
+            };
+            response.add_answer(Record::from_rdata(query.name().clone(), ttl, address));
         }
     }
     Ok(DnsWireDecision::Reply(response.to_vec()?))
 }
 
-fn response_for(request: &Message, code: ResponseCode) -> Message {
+fn qualified_binding_host(kind: RecordType, owner: &str) -> Option<DomainName> {
+    if !matches!(kind, RecordType::HTTPS | RecordType::SVCB) {
+        return None;
+    }
+    let mut parts = owner.splitn(3, '.');
+    parts.next()?.strip_prefix('_')?.parse::<u16>().ok()?;
+    let protocol = parts.next()?;
+    if !protocol.eq_ignore_ascii_case("_https")
+        && !(kind == RecordType::SVCB
+            && (protocol.eq_ignore_ascii_case("_tcp") || protocol.eq_ignore_ascii_case("_udp")))
+    {
+        return None;
+    }
+    parts.next()?.parse().ok()
+}
+
+pub(crate) fn response_for(request: &Message, code: ResponseCode) -> Message {
     let mut response = Message::response(request.metadata.id, request.metadata.op_code);
     response.metadata.response_code = code;
     response.metadata.recursion_desired = request.metadata.recursion_desired;
@@ -156,11 +197,28 @@ pub fn validate_upstream_reply(
         .chain(&response.authorities)
         .chain(&response.additionals)
     {
-        if let RData::A(A(address)) = &record.data
-            && synthetic.contains(*address)
-        {
+        let synthetic_address = match &record.data {
+            RData::A(address) => synthetic.contains(address.0),
+            RData::AAAA(address) => synthetic.ipv6_range().contains(&address.0),
+            RData::HTTPS(binding) => synthetic_hints(&binding.0, synthetic),
+            RData::SVCB(binding) => synthetic_hints(binding, synthetic),
+            _ => false,
+        };
+        if synthetic_address {
             return Err(DnsWireError::SyntheticUpstream);
         }
     }
     Ok(())
+}
+
+fn synthetic_hints(binding: &hickory_proto::rr::rdata::SVCB, range: FakeIpRange) -> bool {
+    use hickory_proto::rr::rdata::svcb::SvcParamValue;
+    binding.svc_params.iter().any(|(_, value)| match value {
+        SvcParamValue::Ipv4Hint(hints) => hints.0.iter().any(|address| range.contains(address.0)),
+        SvcParamValue::Ipv6Hint(hints) => hints
+            .0
+            .iter()
+            .any(|address| range.ipv6_range().contains(&address.0)),
+        _ => false,
+    })
 }
