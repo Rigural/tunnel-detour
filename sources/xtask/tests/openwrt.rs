@@ -1198,7 +1198,7 @@ impl Lab {
         })
     }
 
-    fn configure_dnsmasq(&self) -> TestResult {
+    fn dnsmasq_ready(&self) -> TestResult {
         let mut lookup_error = String::new();
         wait(|| {
             let reply = self.raw(
@@ -1217,7 +1217,8 @@ impl Lab {
                 String::from_utf8_lossy(&reply.stdout),
                 String::from_utf8_lossy(&reply.stderr)
             );
-            Ok(reply.status.success())
+            Ok(reply.status.success()
+                && String::from_utf8_lossy(&reply.stdout).contains("Address: 203.0.113.2"))
         })
         .map_err(|error| {
             format!(
@@ -1228,7 +1229,12 @@ impl Lab {
                         .unwrap_or_default()
                 )
             )
-        })?;
+            .into()
+        })
+    }
+
+    fn configure_dnsmasq(&self) -> TestResult {
+        self.dnsmasq_ready()?;
         self.prepare_dnsmasq()?;
         self.exec(&["/etc/init.d/tunnel-detour", "start"], None)?;
         Ok(())
@@ -1443,6 +1449,9 @@ fn r079_relay_target_changes_disable_and_reenable_retire_both_tcp_sides_while_na
 -> TestResult {
     let lab = Lab::create(true)?;
     lab.inbound_endpoints()?;
+    // Management readiness does not imply that the asynchronous DNS startup is complete.
+    // Establish the baseline before claiming that publication changes preserve it.
+    lab.dnsmasq_ready()?;
     lab.inbound_wireguard()?;
     lab.inbound_ipv4_wireguard()?;
     if lab.vm.is_some() {
@@ -1880,6 +1889,8 @@ fn r068_foreign_router_ports_are_reserved_across_families_and_protocols_while_ve
     })?;
     // Docker shares the host kernel; older hosts do not expose TCP_BOUND_INACTIVE.
     // The pinned-kernel run owns that additional bound-before-listen assertion.
+    // Port 53 is reserved by the real DNS frontend only once it is serving queries.
+    lab.dnsmasq_ready()?;
     let mut ports = vec![53_u16, 18080, 18081];
     if lab.vm.is_some() {
         ports.push(18082);
