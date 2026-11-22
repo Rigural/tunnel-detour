@@ -34,6 +34,12 @@ impl ManagedUpstream {
     fn matches(&self, observed: &[String]) -> bool {
         self.applied == observed || self.pending.as_deref() == Some(observed)
     }
+
+    pub(super) fn applied_matches(&self, observed: &[String], resolver: SocketAddr) -> bool {
+        self.pending.is_none()
+            && self.applied == observed
+            && observed == [format!("tcp://{resolver}")]
+    }
 }
 
 /// An administrator explicitly approves a preview of one complete DNS snapshot.

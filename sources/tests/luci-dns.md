@@ -33,3 +33,27 @@ them. An accepted review may be saved; do not save a change to another frontend.
 Create the same path with extension `.continue` to resume the fixture before its
 ten-minute deadline. The test then checks real connections, conflicts and cleanup.
 Record manual observations separately; the pause alone is not UI acceptance.
+
+## R153d DNS traffic diagnostics
+
+Run `TUNNEL_DETOUR_LUCI_DNS_DIAGNOSTICS_REVIEW=/absolute/path/dns-review.json cargo xtask test-openwrt r153_dns`
+with a fresh manifest path. The fixture pauses for four minutes with a real observed exception
+connection and DNS diagnostics enabled. Use its temporary LuCI URL in Chrome.
+
+1. Open **Status** and verify the live hostname, client, destination and counters. Open
+   **Settings** and clear **Enable DNS traffic diagnostics**. **Save** stages the draft and
+   leaves the existing row visible in **Status**.
+2. Suspend only the fixture DNS daemon. Use **Save & Apply** and check that the status displays
+   **Revocation pending** with no diagnostic rows or totals. Resume the same PID and wait for
+   **Traffic diagnostics are off**. Check that both independent consent controls are unchecked.
+3. Enable DNS diagnostic consent and apply. Confirm via the fixture UCI that a different
+   consent epoch was saved. **Status** shows an empty connection list and no totals from the
+   previous period. If validation rejects a candidate while consent is on, check that
+   diagnostics are paused while the previous configuration is active.
+4. Verify readable status at 390 CSS pixels and restore the viewport. Restore a valid saved
+   configuration with DNS diagnostics enabled. Create the `.continue` file so R153 can
+   finish and verify both original connections.
+
+R153 owns transport continuity, withdrawal, rollback and the private snapshot checks. When
+the applied status is unavailable, verify LuCI reports that state separately from a stopped
+daemon and keeps form edits. R159a owns publication failure and automatic recovery.

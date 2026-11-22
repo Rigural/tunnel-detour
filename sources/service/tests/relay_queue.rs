@@ -70,6 +70,7 @@ async fn r088_queued_ingress_keeps_identity_and_bytes_and_dials_only_after_the_p
             Duration::from_secs(1),
             Duration::from_secs(3),
         )?);
+        sessions.set_observability(true);
         let (mut first, incoming) = ingress(&listener).await?;
         let id = sessions.enqueue(incoming, admission(&target, "first")?)?;
         let (mut first_target, _) = target.accept().await?;
@@ -86,10 +87,16 @@ async fn r088_queued_ingress_keeps_identity_and_bytes_and_dials_only_after_the_p
         assert_no_backend(&target);
         let engine = async {
             let completed = sessions.next_completion().await?;
-            assert_eq!(completed.connection.id, id);
+            assert_eq!(
+                completed.connection.map(|connection| connection.id),
+                Some(id)
+            );
             assert_eq!(completed.outcome, RelayOutcome::Complete);
             let completed = sessions.next_completion().await?;
-            assert_eq!(completed.connection.id, queued);
+            assert_eq!(
+                completed.connection.map(|connection| connection.id),
+                Some(queued)
+            );
             assert_eq!(
                 completed.outcome,
                 RelayOutcome::Complete,
@@ -145,6 +152,7 @@ async fn r089_a_full_pending_fifo_refuses_excess_and_expired_ingress_never_reach
             Duration::from_secs(1),
             Duration::from_secs(3),
         )?);
+        sessions.set_observability(true);
         let (_active, incoming) = ingress(&listener).await?;
         sessions.enqueue(incoming, admission(&target, "active")?)?;
         let (_backend, _) = target.accept().await?;
@@ -173,7 +181,9 @@ async fn r089_a_full_pending_fifo_refuses_excess_and_expired_ingress_never_reach
         for _ in 0..RELAY_PENDING_LIMIT {
             let result = sessions.next_completion().await?;
             assert!(
-                pending_ids.remove(&result.connection.id),
+                result
+                    .connection
+                    .is_some_and(|connection| pending_ids.remove(&connection.id)),
                 "an expiry must complete its own queued identity exactly once"
             );
             assert_eq!(result.outcome, RelayOutcome::AdmissionTimeout);
@@ -206,6 +216,7 @@ async fn r090_retirement_closes_waiting_generations_while_retained_streams_conti
             Duration::from_secs(1),
             Duration::from_secs(3),
         )?);
+        sessions.set_observability(true);
         let (mut active, incoming) = ingress(&listener).await?;
         sessions.enqueue(incoming, admission(&target, "retained")?)?;
         let (mut backend, _) = target.accept().await?;

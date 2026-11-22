@@ -763,6 +763,10 @@ async fn prepare(
         exec(&node, &["/etc/init.d/dnsmasq", "restart"])?;
     }
     exec(&node, &["uci", "set", "tunnel-detour.globals.enabled=1"])?;
+    exec(
+        &node,
+        &["uci", "set", "tunnel-detour.globals.observability=1"],
+    )?;
     exec(&node, &["uci", "commit", "tunnel-detour"])?;
     let activation = Instant::now();
     exec(&node, &["/etc/init.d/tunnel-detour", "start"])?;

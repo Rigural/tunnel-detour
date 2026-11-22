@@ -212,7 +212,7 @@ impl InboundTarget {
 }
 
 /// A complete, validated publication. Its destination and ports cannot be changed independently.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct InboundRule {
     id: InboundId,
     name: String,

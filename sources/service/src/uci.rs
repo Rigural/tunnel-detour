@@ -13,6 +13,7 @@ use crate::{
     ServiceConfig, ServiceError,
     config::{AdguardSettings, DnsIntegration, ResourceLimits},
     kernel,
+    observability::{Consent, ConsentToken},
 };
 
 pub(crate) const STATE_FILE: &str = "/etc/tunnel-detour/leases.json";
@@ -58,6 +59,10 @@ pub(crate) struct Section {
 struct GlobalOptions {
     #[serde(rename = "enabled")]
     _enabled: String,
+    #[serde(default)]
+    observability: Option<String>,
+    #[serde(default)]
+    observability_epoch: Option<String>,
     lan_network: String,
     wan_network: String,
     #[serde(default)]
@@ -168,6 +173,15 @@ pub(crate) fn enabled(value: &str) -> Result<bool, UciError> {
     }
 }
 
+/// Accept the same service enable values as OpenWrt's `config_get_bool`.
+pub(crate) fn service_enabled(value: &str) -> Result<bool, UciError> {
+    match value {
+        "0" | "off" | "false" | "no" | "disabled" => Ok(false),
+        "1" | "on" | "true" | "yes" | "enabled" => Ok(true),
+        _ => Err(UciError::Options),
+    }
+}
+
 pub(crate) fn section_options(mut section: Section) -> Result<Value, ServiceError> {
     // Dot-prefixed keys are ubus's UCI section metadata, not user configuration options.
     section.options.retain(|name, _| !name.starts_with('.'));
@@ -223,7 +237,13 @@ async fn ipv6_settings(
 /// Load committed UCI through the real rpcd service. Disabled configurations do not inspect
 /// network state or start listeners. `validate_disabled` is for an explicit configuration check.
 pub async fn load_uci(validate_disabled: bool) -> Result<Option<ServiceConfig>, ServiceError> {
-    let mut response = read_sections().await?;
+    load_dns_sections(read_sections().await?, validate_disabled).await
+}
+
+pub(crate) async fn load_dns_sections(
+    mut response: UciResponse,
+    validate_disabled: bool,
+) -> Result<Option<ServiceConfig>, ServiceError> {
     let globals = take_globals(&mut response)?;
     if !enabled_option(&globals)? && !validate_disabled {
         return Ok(None);
@@ -244,6 +264,48 @@ pub async fn load_uci(validate_disabled: bool) -> Result<Option<ServiceConfig>, 
         }
     }
     build(globals, rules).await.map(Some)
+}
+
+impl UciResponse {
+    pub(crate) fn consent(&self, section: &str) -> Consent {
+        let Some(entry) = self.values.get(section).filter(|entry| {
+            entry.kind == section
+                && entry
+                    .options
+                    .get("enabled")
+                    .and_then(Value::as_str)
+                    .is_some_and(|flag| matches!(service_enabled(flag), Ok(true)))
+        }) else {
+            return Consent::Off;
+        };
+        if entry
+            .options
+            .get("observability_epoch")
+            .is_some_and(|value| !value.is_string())
+        {
+            return Consent::Off;
+        }
+        parse_consent(
+            entry.options.get("observability").and_then(Value::as_str),
+            entry
+                .options
+                .get("observability_epoch")
+                .and_then(Value::as_str),
+        )
+        .unwrap_or_default()
+    }
+}
+
+pub(crate) fn parse_consent(flag: Option<&str>, epoch: Option<&str>) -> Result<Consent, UciError> {
+    if !enabled(flag.unwrap_or("0"))? {
+        return Ok(Consent::Off);
+    }
+    match epoch {
+        Some(value) => ConsentToken::parse(value)
+            .map(|token| Consent::On(Some(token)))
+            .ok_or(UciError::Options),
+        None => Ok(Consent::On(None)),
+    }
 }
 
 pub(crate) async fn read_sections() -> Result<UciResponse, ServiceError> {
@@ -275,7 +337,7 @@ fn take_globals(response: &mut UciResponse) -> Result<Section, UciError> {
 }
 
 fn enabled_option(globals: &Section) -> Result<bool, UciError> {
-    enabled(
+    service_enabled(
         globals
             .options
             .get("enabled")
@@ -324,6 +386,8 @@ pub async fn dns_revision() -> Result<String, ServiceError> {
                     "real_upstream",
                     "manage_adguard_upstream",
                     "adguard_upstream_approval",
+                    "observability",
+                    "observability_epoch",
                 ] {
                     fields.remove(key);
                 }
@@ -334,7 +398,11 @@ pub async fn dns_revision() -> Result<String, ServiceError> {
     let mut live = BTreeMap::new();
     let mut ipv6 = Value::Null;
     let globals = owned.get("globals").ok_or(UciError::Sections)?;
-    if globals["options"]["enabled"] == "1" {
+    if service_enabled(
+        globals["options"]["enabled"]
+            .as_str()
+            .ok_or(UciError::Options)?,
+    )? {
         for key in ["lan_network", "wan_network"] {
             let name = globals["options"][key].as_str().ok_or(UciError::Options)?;
             live.insert(
@@ -417,6 +485,10 @@ fn settings(
 }
 
 async fn build(globals: GlobalOptions, rules: Vec<Rule>) -> Result<ServiceConfig, ServiceError> {
+    let consent = parse_consent(
+        globals.observability.as_deref(),
+        globals.observability_epoch.as_deref(),
+    )?;
     // Configurations from 0.1.0 had no selector and always used AdGuard. New installs
     // use a nonempty sentinel because libuci discards options with empty strings.
     let dns_integration = match globals.dns_integration.as_deref() {
@@ -503,6 +575,7 @@ async fn build(globals: GlobalOptions, rules: Vec<Rule>) -> Result<ServiceConfig
     });
     let mut result = ServiceConfig::from_json(&serde_json::to_vec(&config)?)?;
     result.from_uci = true;
+    result.observability = consent;
     Ok(result)
 }
 

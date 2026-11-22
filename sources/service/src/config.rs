@@ -1,7 +1,10 @@
 use std::{
+    fs::OpenOptions,
+    io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     num::NonZeroUsize,
-    path::PathBuf,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -110,6 +113,8 @@ struct RawConfig {
     real_upstream: SocketAddr,
     state_file: PathBuf,
     status_file: PathBuf,
+    #[serde(default)]
+    observability: bool,
     fake_range: FakeIpRange,
     lan_device: String,
     lan_networks: Vec<Ipv4Net>,
@@ -152,6 +157,7 @@ pub struct ServiceConfig {
     pub(crate) real_upstream: SocketAddr,
     pub(crate) state_file: PathBuf,
     pub(crate) status_file: PathBuf,
+    pub(crate) observability: crate::observability::Consent,
     pub(crate) fake_range: FakeIpRange,
     pub(crate) lan_device: String,
     pub(crate) lan_networks: Vec<Ipv4Net>,
@@ -217,7 +223,32 @@ impl AdguardSettings {
     }
 }
 
+pub(crate) fn read_config_file(path: &Path) -> Result<Vec<u8>, crate::ServiceError> {
+    let nonblocking =
+        i32::try_from(rustix::fs::OFlags::NONBLOCK.bits()).map_err(|_| ConfigError::Paths)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nonblocking)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(ConfigError::Paths.into());
+    }
+    let mut bytes = Vec::new();
+    file.take(1_048_577).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 impl ServiceConfig {
+    /// Read one bounded JSON file. Reload refuses special files without waiting for input.
+    pub fn load_file(path: &Path) -> Result<Self, crate::ServiceError> {
+        Ok(Self::from_json(&read_config_file(path)?)?)
+    }
+
+    /// Whether the operator explicitly enabled local diagnostics.
+    pub fn observability_enabled(&self) -> bool {
+        self.observability.enabled()
+    }
+
     /// Resolver management can be reconciled without retiring authorized TCP streams.
     /// Every other setting still requires the normal procd instance replacement.
     pub(crate) fn same_runtime(&self, candidate: &Self) -> bool {
@@ -235,6 +266,12 @@ impl ServiceConfig {
             && self.limits == candidate.limits
             && self.adguard == candidate.adguard
             && self.dns_integration == candidate.dns_integration
+    }
+
+    pub(crate) fn same_resolver_settings(&self, candidate: &Self) -> bool {
+        self.real_upstream == candidate.real_upstream
+            && self.manage_adguard_upstream == candidate.manage_adguard_upstream
+            && self.adguard_upstream_approval == candidate.adguard_upstream_approval
     }
 
     pub fn from_json(bytes: &[u8]) -> Result<Self, ConfigError> {
@@ -392,6 +429,7 @@ impl ServiceConfig {
             real_upstream: raw.real_upstream,
             state_file: raw.state_file,
             status_file: raw.status_file,
+            observability: crate::observability::Consent::from_flag(raw.observability),
             fake_range: raw.fake_range,
             lan_device: raw.lan_device,
             lan_networks: raw.lan_networks,

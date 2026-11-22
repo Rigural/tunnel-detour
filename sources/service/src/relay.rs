@@ -6,7 +6,7 @@ use std::{
     net::{SocketAddrV4, SocketAddrV6},
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -149,7 +149,8 @@ pub enum RelayOutcome {
 
 #[derive(Debug)]
 pub struct RelayCompletion {
-    pub connection: RelayConnection,
+    /// The session details are present only for uninterrupted diagnostic consent.
+    pub connection: Option<RelayConnection>,
     pub outcome: RelayOutcome,
     /// Counts are available only after a successful complete transfer.
     pub bytes: Option<(u64, u64)>,
@@ -171,12 +172,21 @@ pub struct RelayCapture {
 }
 
 struct Control {
-    connection: RelayConnection,
-    started: Instant,
-    connected: Arc<AtomicBool>,
+    publication: InboundId,
+    generation: u16,
+    queued: bool,
+    observation: Option<RelayDetails>,
     cancellation: CancellationToken,
     abort: AbortHandle,
     waiting_sender: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+struct RelayDetails {
+    id: u64,
+    client: SocketAddrV6,
+    target: SocketAddrV4,
+    started: Instant,
+    connected: Arc<AtomicBool>,
 }
 
 struct AdmissionWait {
@@ -185,11 +195,18 @@ struct AdmissionWait {
 }
 
 impl Control {
-    fn snapshot(&self) -> RelayConnection {
-        let mut value = self.connection.clone();
-        value.connected = self.connected.load(Ordering::Acquire);
-        value.age_seconds = self.started.elapsed().as_secs();
-        value
+    fn snapshot(&self) -> Option<RelayConnection> {
+        let details = self.observation.as_ref()?;
+        Some(RelayConnection {
+            id: details.id,
+            publication: self.publication.clone(),
+            generation: self.generation,
+            client: details.client,
+            target: details.target,
+            connected: details.connected.load(Ordering::Acquire),
+            queued: self.queued,
+            age_seconds: details.started.elapsed().as_secs(),
+        })
     }
 }
 
@@ -199,6 +216,7 @@ pub struct RelaySessions {
     transport: Option<crate::transport_worker::TransportWorker>,
     limits: RelayLimits,
     next_id: u64,
+    next_observation_id: Option<u64>,
     stopped: bool,
     controls: BTreeMap<u64, Control>,
     jobs: JoinSet<SessionResult>,
@@ -222,6 +240,7 @@ impl RelaySessions {
             transport: None,
             limits,
             next_id: 1,
+            next_observation_id: None,
             stopped: false,
             controls: BTreeMap::new(),
             jobs: JoinSet::new(),
@@ -235,6 +254,20 @@ impl RelaySessions {
     ) -> Self {
         self.transport = Some(transport);
         self
+    }
+
+    pub(crate) fn reopen_transport(&self) -> io::Result<crate::transport_worker::TransportWorker> {
+        use crate::transport_worker::TransportWorker;
+        self.transport
+            .as_ref()
+            .map_or_else(TransportWorker::new, TransportWorker::reopen)
+    }
+
+    pub(crate) fn transport_initialization_failed(&self) -> io::Result<bool> {
+        use crate::transport_worker::TransportWorker;
+        self.transport
+            .as_ref()
+            .map_or(Ok(false), TransportWorker::initialization_failed)
     }
 
     /// Admit an already-authorized IPv6 connection. Exhaustion drops it without spawning
@@ -333,13 +366,13 @@ impl RelaySessions {
         let active = self
             .controls
             .values()
-            .filter(|control| !control.connection.queued)
+            .filter(|control| !control.queued)
             .count();
         let waiting = active >= self.limits.connections || !self.pending.is_empty();
         let queued = self
             .controls
             .values()
-            .filter(|control| control.connection.queued)
+            .filter(|control| control.queued)
             .count();
         if waiting && (!allow_queue || queued >= RELAY_PENDING_LIMIT) {
             return Err(RelayError::Capacity);
@@ -359,23 +392,31 @@ impl RelaySessions {
         } else {
             (None, None)
         };
-        let connected = Arc::new(AtomicBool::new(false));
         let cancellation = CancellationToken::new();
-        let connection = RelayConnection {
-            id,
-            publication: admission.publication.clone(),
-            generation: admission.generation,
-            client,
-            target: admission.target,
-            connected: false,
-            queued: waiting,
-            age_seconds: 0,
+        let observation = if let Some(next) = &mut self.next_observation_id {
+            let details = RelayDetails {
+                id: *next,
+                client,
+                target: admission.target,
+                started,
+                connected: Arc::new(AtomicBool::new(false)),
+            };
+            *next = next.checked_add(1).ok_or(RelayError::Identifiers)?;
+            Some(details)
+        } else {
+            None
         };
+        let connected = observation
+            .as_ref()
+            .map(|details| Arc::downgrade(&details.connected))
+            .unwrap_or_default();
+        let publication = admission.publication.clone();
+        let generation = admission.generation;
         let abort = self.jobs.spawn(session(
             incoming,
             admission,
             (self.limits, self.transport.clone()),
-            connected.clone(),
+            connected,
             cancellation.clone(),
             capture,
             wait,
@@ -383,9 +424,10 @@ impl RelaySessions {
         self.controls.insert(
             id,
             Control {
-                connection,
-                started,
-                connected,
+                publication,
+                generation,
+                queued: waiting,
+                observation,
                 cancellation,
                 abort,
                 waiting_sender,
@@ -397,8 +439,24 @@ impl RelaySessions {
         Ok(id)
     }
 
+    /// Start diagnostics for newly admitted sessions, or clear all diagnostic details.
+    /// Sessions already admitted retain their traffic policy and sockets.
+    pub fn set_observability(&mut self, enabled: bool) {
+        if !enabled {
+            self.next_observation_id = None;
+            for control in self.controls.values_mut() {
+                control.observation = None;
+            }
+        } else if self.next_observation_id.is_none() {
+            self.next_observation_id = Some(1);
+        }
+    }
+
     pub fn connections(&self) -> Vec<RelayConnection> {
-        self.controls.values().map(Control::snapshot).collect()
+        self.controls
+            .values()
+            .filter_map(Control::snapshot)
+            .collect()
     }
 
     fn observe(
@@ -425,10 +483,11 @@ impl RelaySessions {
             },
             Err(error) => return Err(RelayError::Task(error)),
         };
+        let connection = control.snapshot();
         Ok(RelayCompletion {
-            connection: control.snapshot(),
+            bytes: connection.as_ref().and(result.bytes),
+            connection,
             outcome: result.outcome,
-            bytes: result.bytes,
             error: result.error,
         })
     }
@@ -449,7 +508,7 @@ impl RelaySessions {
         let mut active = self
             .controls
             .values()
-            .filter(|control| !control.connection.queued)
+            .filter(|control| !control.queued)
             .count();
         while active < self.limits.connections {
             let Some(id) = self.pending.pop_front() else {
@@ -464,7 +523,7 @@ impl RelaySessions {
             // Expired jobs have already closed their socket, even while the controller
             // was busy. A failed send does not consume a backend slot.
             if sender.send(()).is_ok() {
-                control.connection.queued = false;
+                control.queued = false;
                 active += 1;
             }
         }
@@ -478,9 +537,7 @@ impl RelaySessions {
             .controls
             .iter()
             .filter_map(|(id, control)| {
-                (retained.get(&control.connection.publication)
-                    != Some(&control.connection.generation))
-                .then_some(*id)
+                (retained.get(&control.publication) != Some(&control.generation)).then_some(*id)
             })
             .collect();
         for id in &retired {
@@ -654,7 +711,7 @@ async fn session(
         RelayLimits,
         Option<crate::transport_worker::TransportWorker>,
     ),
-    connected: Arc<AtomicBool>,
+    connected: Weak<AtomicBool>,
     cancellation: CancellationToken,
     capture: Option<RelayCapture>,
     wait: Option<AdmissionWait>,
@@ -714,7 +771,9 @@ async fn session(
             Err(_) => return SessionResult { outcome: RelayOutcome::ConnectTimeout, bytes: None, error: None },
         }
     };
-    connected.store(true, Ordering::Release);
+    if let Some(connected) = connected.upgrade() {
+        connected.store(true, Ordering::Release);
+    }
     if let Some(transport) = transport {
         return match transport
             .transfer(
@@ -726,9 +785,9 @@ async fn session(
             )
             .await
         {
-            Ok(crate::transport_worker::Outcome::Complete(bytes)) => SessionResult {
+            Ok(crate::transport_worker::Outcome::Complete) => SessionResult {
                 outcome: RelayOutcome::Complete,
-                bytes: Some(bytes),
+                bytes: None,
                 error: None,
             },
             Ok(crate::transport_worker::Outcome::Idle) => SessionResult {
@@ -776,10 +835,10 @@ pub(crate) async fn transfer_with_idle(
     )
 }
 
-pub(crate) struct Copied {
-    pub bytes: (u64, u64),
+struct Copied {
+    bytes: (u64, u64),
     /// CLOCK_MONOTONIC deadline, shared by the worker and its controller.
-    pub idle_deadline: u64,
+    idle_deadline: u64,
 }
 
 #[derive(Eq, PartialEq)]
@@ -793,8 +852,12 @@ pub(crate) async fn copy_with_idle(
     incoming: TcpStream,
     outgoing: TcpStream,
     idle_timeout: Duration,
-) -> io::Result<Option<Copied>> {
-    transfer_with_completion(incoming, outgoing, idle_timeout, Finish::Copy).await
+) -> io::Result<Option<u64>> {
+    Ok(
+        transfer_with_completion(incoming, outgoing, idle_timeout, Finish::Copy)
+            .await?
+            .map(|completed| completed.idle_deadline),
+    )
 }
 
 async fn transfer_with_completion(

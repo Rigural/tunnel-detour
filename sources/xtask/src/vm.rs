@@ -12,7 +12,6 @@ use std::{
 use tempfile::TempDir;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
-const DRIVER: &str = "tunnel-detour-openwrt-vm-driver:local";
 const KERNEL: &str = "https://downloads.openwrt.org/releases/25.12.6/targets/x86/64/openwrt-25.12.6-x86-64-generic-kernel.bin";
 const KERNEL_SHA256: &str = "8f70595f3a6eec3112e007450a1a600153904deffa52ab368712342583cb387c";
 
@@ -48,30 +47,16 @@ impl Drop for OwnedContainer {
     }
 }
 
-pub const DHCPV6_WAN_IMAGE: &str = "tunnel-detour-openwrt-dhcpv6-wan-lab:local";
-
 /// Build the disposable guest disk from the same native fixture as Docker acceptance.
 /// The downloaded kernel is pinned independently; no production configuration is an input.
 pub fn prepare(
-    root: &Path,
     target: &Path,
     binary: &Path,
     fixture: &Path,
+    fixture_image: &str,
+    driver: &str,
     wan_dhcpv6: bool,
 ) -> Result<(PathBuf, PathBuf)> {
-    let fixture_image = if wan_dhcpv6 {
-        DHCPV6_WAN_IMAGE
-    } else {
-        "tunnel-detour-openwrt-dnsmasq-lab:local"
-    };
-    checked(docker(&[
-        "build",
-        "--tag",
-        DRIVER,
-        "--file",
-        "sources/tests/vm/Dockerfile",
-        root.to_str().ok_or("invalid repository path")?,
-    ]))?;
     let directory = target.join("openwrt-vm");
     fs::create_dir_all(&directory)?;
     let kernel = directory.join("kernel.bin");
@@ -113,17 +98,15 @@ pub fn prepare(
     }
     let mut executable_digest = Command::new("sha256sum");
     executable_digest.args([binary, fixture]);
-    let inputs = format!(
-        "guest-v2:{}:{}",
-        String::from_utf8(checked(docker(&[
-            "image",
-            "inspect",
-            fixture_image,
-            "--format",
-            "{{.Id}}"
-        ]))?)?,
-        String::from_utf8(checked(executable_digest)?)?
-    );
+    let digest = String::from_utf8(checked(executable_digest)?)?;
+    let hashes: Vec<_> = digest
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    let [binary_digest, fixture_digest] = hashes.as_slice() else {
+        return Err("missing OpenWrt guest executable digests".into());
+    };
+    let inputs = format!("guest-v4:{fixture_image}:{driver}:{binary_digest}:{fixture_digest}");
     let marker = directory.join(if wan_dhcpv6 {
         "inputs-dhcpv6-wan"
     } else {
@@ -145,6 +128,8 @@ pub fn prepare(
         &export_name,
         "--network",
         "none",
+        "--pull",
+        "never",
         fixture_image,
     ]))?;
     let export = OwnedContainer(export_name);
@@ -163,9 +148,11 @@ pub fn prepare(
         &builder_name,
         "--network",
         "none",
+        "--pull",
+        "never",
         "--mount",
         &format!("type=bind,src={},dst=/outputs", directory.display()),
-        DRIVER,
+        driver,
         "sleep",
         "infinity",
     ]))?;
@@ -248,9 +235,36 @@ pub struct VmTransport {
     created: bool,
 }
 
+// The guest SSH process can leave an ambient pipe open across exec. Start
+// laboratory commands with only the SSH standard streams. The
+// worker must still refuse unexpected descriptors if given any directly.
+const GUEST_EXEC: &str = r#"
+for path in /proc/$$/fd/*; do
+    fd=${path##*/}
+    case "$fd" in
+        0|1|2) ;;
+        ''|*[!0-9]*) exit 125 ;;
+        *) eval "exec $fd<&-" || exit 125 ;;
+    esac
+done
+exec "$@"
+"#;
+
+fn shell_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn guest_exec(arguments: &str) -> String {
+    format!(
+        "exec /bin/sh -c {} tunnel-detour-vm {arguments}",
+        shell_argument(GUEST_EXEC)
+    )
+}
+
 impl VmTransport {
     /// Prepare a fresh SSH identity and guest disk, then start an isolated emulator.
     pub fn start(name: String) -> Result<Self> {
+        let driver = std::env::var("TUNNEL_DETOUR_VM_DRIVER")?;
         let directory = tempfile::Builder::new()
             .prefix("tunnel-detour-vm-")
             .tempdir()?;
@@ -291,9 +305,11 @@ impl VmTransport {
             "--rm",
             "--network",
             "none",
+            "--pull",
+            "never",
             "--mount",
             &mount,
-            DRIVER,
+            &driver,
             "debugfs",
             "-w",
             "-R",
@@ -306,9 +322,11 @@ impl VmTransport {
             "--rm",
             "--network",
             "none",
+            "--pull",
+            "never",
             "--mount",
             &mount,
-            DRIVER,
+            &driver,
             "debugfs",
             "-w",
             "-R",
@@ -320,9 +338,11 @@ impl VmTransport {
             "--rm",
             "--network",
             "none",
+            "--pull",
+            "never",
             "--mount",
             &mount,
-            DRIVER,
+            &driver,
             "debugfs",
             "-w",
             "-R",
@@ -334,9 +354,11 @@ impl VmTransport {
             "--rm",
             "--network",
             "none",
+            "--pull",
+            "never",
             "--mount",
             &mount,
-            DRIVER,
+            &driver,
             "debugfs",
             "-R",
             "cat /etc/dropbear/authorized_keys",
@@ -354,13 +376,15 @@ impl VmTransport {
             "tunnel-detour.task=local-validation",
             "--network",
             "none",
+            "--pull",
+            "never",
             "--dns",
             "127.0.0.1",
             "--mount",
             &mount,
             "--mount",
             &format!("type=bind,src={},dst=/kernel,readonly", kernel.display()),
-            DRIVER,
+            &driver,
         ]);
         create.args(Self::emulator());
         checked(create)?;
@@ -407,10 +431,14 @@ impl VmTransport {
     /// Docker arguments for a bounded guest command. Every argument is quoted for the
     /// remote shell, and no production credentials or SSH trust settings are consulted.
     pub fn arguments(&self, args: &[&str]) -> Result<Vec<String>> {
+        self.arguments_with_deadline(args, "180")
+    }
+
+    fn arguments_with_deadline(&self, args: &[&str], deadline: &str) -> Result<Vec<String>> {
         if args.is_empty() || args.iter().any(|value| value.contains('\0')) {
             return Err("invalid VM command".into());
         }
-        let remote = args
+        let arguments = args
             .iter()
             .enumerate()
             .map(|(index, value)| {
@@ -419,17 +447,18 @@ impl VmTransport {
                 } else {
                     value
                 };
-                format!("'{}'", value.replace('\'', "'\"'\"'"))
+                shell_argument(value)
             })
             .collect::<Vec<_>>()
             .join(" ");
+        let remote = guest_exec(&arguments);
         Ok([
             "exec",
             "-i",
             &self.name,
             "timeout",
             "--kill-after=2",
-            "180",
+            deadline,
             "ssh",
             "-F",
             "/dev/null",
@@ -476,8 +505,10 @@ impl VmTransport {
     /// Construct the same owned command transport for supervised background fixtures.
     pub fn command(&self, args: &[&str]) -> Result<Command> {
         let mut command = docker(&[]);
+        // Background endpoints have a five-minute guest deadline. The transport
+        // must remain alive long enough for the guest to report its result.
         command
-            .args(self.arguments(args)?)
+            .args(self.arguments_with_deadline(args, "360")?)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -499,5 +530,45 @@ impl Drop for VmTransport {
         if let Err(error) = self.stop() {
             eprintln!("VM cleanup failed: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn r161_guest_launch_drops_ambient_pipe_but_preserves_standard_streams_and_arguments()
+    -> Result<()> {
+        let command = format!(
+            "/bin/sh -ec {} fixture {}",
+            shell_argument(
+                "test ! -e /proc/$$/fd/8; read -r line; printf '%s\\n' \"$line\" \"$1\"; printf 'guest stderr\\n' >&2"
+            ),
+            shell_argument("an argument with 'quotes'")
+        );
+        // Duplicate the input pipe into a non-close-on-exec descriptor.
+        let mut child = Command::new("/bin/sh")
+            .arg("-ec")
+            .arg(format!("exec 8<&0\n{}", guest_exec(&command)))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .ok_or("missing input pipe")?
+            .write_all(b"guest stdin\n")?;
+        let output = child.wait_with_output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"guest stdin\nan argument with 'quotes'\n");
+        assert_eq!(output.stderr, b"guest stderr\n");
+        Ok(())
     }
 }

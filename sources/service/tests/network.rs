@@ -9,13 +9,17 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket},
     os::unix::fs::PermissionsExt,
     process::{Child, Command, Output, Stdio},
+    sync::atomic::{AtomicBool, AtomicU16, Ordering},
     thread,
     time::{Duration, Instant},
 };
 
 use hickory_proto::{
-    op::{Message, Query},
-    rr::{Name, RData, RecordType},
+    op::{Message, Query, ResponseCode},
+    rr::{
+        Name, RData, Record, RecordType,
+        rdata::{A, NS, SOA},
+    },
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -96,7 +100,7 @@ impl Lab {
         let config = json!({
             "dns_listen":"127.0.0.1:10535", "proxy_listen":"0.0.0.0:10536",
             "real_upstream":"10.254.0.2:5353", "state_file":path.join("state/leases.json"),
-            "status_file":path.join("run/status.json"), "fake_range":"198.18.0.0/28",
+            "status_file":path.join("run/status.json"), "observability":true, "fake_range":"198.18.0.0/28",
             "lan_device":"lan0", "lan_networks":["192.0.2.0/24"],
             "wan":{"device":"wan0","gateway":null,"route_table":41872,"mark":21572,"rule_priority":11000},
             "rules":[{"pattern":"selected.example.test","enabled":true}]
@@ -1370,6 +1374,7 @@ fn cleanup(program: &str, args: &[&str]) {
 fn r112_adguard_ipv6_disable_is_preserved_at_startup_and_blocks_cached_identities_before_any_wan_dial()
 -> TestResult {
     let mut lab = Lab::new()?;
+    lab.config["observability"] = json!(false);
     lab.prepare_ipv6_wan()?;
     lab.start_adguard()?;
     let baseline = lab.api("dns_info", None)?;
@@ -1420,7 +1425,8 @@ fn r112_adguard_ipv6_disable_is_preserved_at_startup_and_blocks_cached_identitie
         true,
         "the package silently changed AdGuard"
     );
-    wait_until(|| Ok(lab.status()?["last_error"] == "adguard_ipv6_disabled"))?;
+    wait_until(|| Ok(lab.status()?["degraded"] == json!(["adguard_ipv6_disabled"])))?;
+    assert!(lab.status()?.get("last_request_error").is_none());
     lab.api("dns_config", Some(json!({"disable_ipv6":false})))?;
     assert_eq!(
         lab.http_from("selected.example.test", cached, "fd00:1234::2")?
@@ -1428,6 +1434,7 @@ fn r112_adguard_ipv6_disable_is_preserved_at_startup_and_blocks_cached_identitie
         b"wan"
     );
     assert!(lab.exception_wan_syns()? > before);
+    wait_until(|| Ok(lab.status()?["degraded"] == json!([])))?;
     lab.stop()?;
     Ok(())
 }
@@ -1505,7 +1512,7 @@ fn r113_adguard_ipv6_client_alias_and_address_filters_prevent_wan_dials_and_pers
             before,
             "a filtered client reached WAN: {rule}"
         );
-        wait_until(|| Ok(lab.status()?["last_error"] == "filtered_destination"))?;
+        wait_until(|| Ok(lab.status()?["last_request_error"] == "filtered_destination"))?;
         assert_eq!(
             lab.http_from(name, cached, "2001:db8:1::2")?.stdout,
             b"wan6",
@@ -1608,7 +1615,17 @@ fn r111_ipv4_and_ipv6_clients_reach_ipv4_only_ipv6_only_and_dual_stack_origins_t
             .ok_or("invalid resolver PID")?;
         rustix::process::kill_process(resolver, rustix::process::Signal::HUP)?;
         wait_until(|| {
-            Ok(Lab::query_at("10.254.0.2:5353", "ipv6-only.example.test", RecordType::AAAA, true)?.answers.iter().any(|record| matches!(&record.data, RData::AAAA(address) if address.0.to_string()=="2001:db8:2::2")))
+            Ok(Lab::query_at(
+                "10.254.0.2:5353",
+                "ipv6-only.example.test",
+                RecordType::AAAA,
+                true,
+            )
+            .is_ok_and(|reply| {
+                reply.answers.iter().any(|record| {
+                    matches!(&record.data, RData::AAAA(address) if address.0.to_string() == "2001:db8:2::2")
+                })
+            }))
         })?;
         if resolver_ipv6 {
             lab.use_ipv6_resolver()?;
@@ -2121,6 +2138,555 @@ fn r120_real_https_dns_hints_keep_hostname_identity_and_origin_tls_over_wan_whil
 
 #[test]
 #[ignore = "requires the isolated Docker network laboratory"]
+fn r157_one_family_dns_failure_prevents_wan_even_when_the_other_family_has_an_address() -> TestResult
+{
+    const REFERRAL: u16 = u16::MAX;
+    const NEGATIVE_WITH_SOA: u16 = REFERRAL - 1;
+    const CHILD_REFERRAL_WITH_PARENT_SOA: u16 = REFERRAL - 2;
+    let mut lab = Lab::new()?;
+    lab.prepare_ipv6_wan()?;
+    let resolver = std::net::TcpListener::bind("127.0.0.1:0")?;
+    resolver.set_nonblocking(true)?;
+    lab.config["real_upstream"] = json!(resolver.local_addr()?);
+    let stop = AtomicBool::new(false);
+    let aaaa_code = AtomicU16::new(u16::from(ResponseCode::NoError));
+    command("nft", &["-f", "-"], Some(b"table inet upstream_failure_probe {\n counter wan_syn {}\n chain observe { type filter hook output priority -10; policy accept;\n oifname \"wan0\" ip daddr 203.0.113.2 tcp dport 80 tcp flags & (syn|ack) == syn counter name wan_syn\n }\n}\n"))?;
+    let wan_syns = || -> Result<u64, Box<dyn Error>> {
+        let listing: Value = serde_json::from_slice(&command(
+            "nft",
+            &[
+                "-j",
+                "list",
+                "counter",
+                "inet",
+                "upstream_failure_probe",
+                "wan_syn",
+            ],
+            None,
+        )?)?;
+        listing["nftables"][1]["counter"]["packets"]
+            .as_u64()
+            .ok_or_else(|| "missing WAN SYN probe".into())
+    };
+    thread::scope(|scope| {
+        let server = scope.spawn(|| -> Result<(), String> {
+            let serve = || -> TestResult {
+                while !stop.load(Ordering::Acquire) {
+                    let (mut socket, _) = match resolver.accept() {
+                        Ok(pair) => pair,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+                    socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+                    let mut length = [0_u8; 2];
+                    socket.read_exact(&mut length)?;
+                    let mut bytes = vec![0; usize::from(u16::from_be_bytes(length))];
+                    socket.read_exact(&mut bytes)?;
+                    let request = Message::from_vec(&bytes)?;
+                    let [question] = request.queries.as_slice() else {
+                        return Err("expected a single DNS question".into());
+                    };
+                    let mut response =
+                        Message::response(request.metadata.id, request.metadata.op_code);
+                    response.add_query(question.clone());
+                    match question.query_type() {
+                        RecordType::A => {
+                            response.add_answer(Record::from_rdata(
+                                question.name().clone(),
+                                60,
+                                RData::A(A(Ipv4Addr::new(203, 0, 113, 2))),
+                            ));
+                        }
+                        RecordType::AAAA => {
+                            let code = aaaa_code.load(Ordering::Acquire);
+                            if matches!(
+                                code,
+                                REFERRAL | NEGATIVE_WITH_SOA | CHILD_REFERRAL_WITH_PARENT_SOA
+                            ) {
+                                response.add_authority(Record::from_rdata(
+                                    if code == CHILD_REFERRAL_WITH_PARENT_SOA {
+                                        question.name().clone()
+                                    } else {
+                                        Name::from_ascii("example.test.")?
+                                    },
+                                    60,
+                                    RData::NS(NS(Name::from_ascii("ns.example.test.")?)),
+                                ));
+                                if code != REFERRAL {
+                                    response.add_authority(Record::from_rdata(
+                                        Name::from_ascii("example.test.")?,
+                                        60,
+                                        RData::SOA(SOA::new(
+                                            Name::from_ascii("ns.example.test.")?,
+                                            Name::from_ascii("hostmaster.example.test.")?,
+                                            1,
+                                            60,
+                                            60,
+                                            3600,
+                                            60,
+                                        )),
+                                    ));
+                                }
+                            } else {
+                                response.metadata.response_code =
+                                    <ResponseCode as From<u16>>::from(code);
+                            }
+                        }
+                        _ => return Err("expected an address-family query".into()),
+                    }
+                    let bytes = response.to_vec()?;
+                    let mut reply = u16::try_from(bytes.len())?.to_be_bytes().to_vec();
+                    reply.extend_from_slice(&bytes);
+                    if let Err(error) = socket.write_all(&reply)
+                        && !matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        )
+                    {
+                        return Err(error.into());
+                    }
+                }
+                Ok(())
+            };
+            serve().map_err(|error| error.to_string())
+        });
+        let acceptance = (|| -> TestResult {
+            lab.start()?;
+            let name = "selected.example.test";
+            let address = lab.address(name)?;
+            assert_eq!(lab.http(name, address, 80)?.stdout, b"wan");
+            let packets = wan_syns()?;
+            assert!(packets > 0, "the independent WAN probe missed the control");
+            for code in [
+                ResponseCode::ServFail,
+                ResponseCode::Refused,
+                ResponseCode::NXDomain,
+            ] {
+                aaaa_code.store(u16::from(code), Ordering::Release);
+                assert!(
+                    !lab.http(name, address, 80)?.status.success(),
+                    "unexpected fallback for {code}"
+                );
+                assert_eq!(wan_syns()?, packets, "{code} attempted a WAN dial");
+            }
+            for code in [REFERRAL, CHILD_REFERRAL_WITH_PARENT_SOA] {
+                aaaa_code.store(code, Ordering::Release);
+                assert!(
+                    !lab.http(name, address, 80)?.status.success(),
+                    "an unresolved referral permitted fallback"
+                );
+                assert_eq!(wan_syns()?, packets, "a referral attempted a WAN dial");
+            }
+            aaaa_code.store(NEGATIVE_WITH_SOA, Ordering::Release);
+            assert_eq!(lab.http(name, address, 80)?.stdout, b"wan");
+            assert!(
+                wan_syns()? > packets,
+                "confirmed negative response blocked the valid family"
+            );
+            lab.stop()
+        })();
+        stop.store(true, Ordering::Release);
+        let served = server.join().map_err(|_| "the fixture resolver panicked")?;
+        acceptance?;
+        served.map_err(Into::into)
+    })
+}
+
+#[test]
+#[ignore = "requires the isolated Docker network laboratory"]
+fn r155c_json_dns_hup_applies_only_diagnostics_and_revokes_on_invalid_settings() -> TestResult {
+    let mut lab = Lab::new()?;
+    lab.start()?;
+    let child = lab.service.as_ref().ok_or("service is absent")?;
+    let pid =
+        rustix::process::Pid::from_raw(i32::try_from(child.id())?).ok_or("invalid service PID")?;
+    let path = lab.directory.path().join("config.json");
+    let name = "selected.example.test";
+    let address = lab.address(name)?;
+    wait_until(|| {
+        Ok(lab.status()?["dns_queries"]
+            .as_u64()
+            .is_some_and(|count| count > 0))
+    })?;
+    let reload = |candidate: &Value| -> TestResult {
+        fs::write(&path, serde_json::to_vec(candidate)?)?;
+        rustix::process::kill_process(pid, rustix::process::Signal::HUP)?;
+        Ok(())
+    };
+    let mut edited = lab.config.clone();
+    edited["observability"] = json!(false);
+    edited["real_upstream"] = json!("invalid");
+    reload(&edited)?;
+    wait_until(|| {
+        let status = lab.status()?;
+        Ok(status["observability"] == false && status["configuration_applied"] == false)
+    })?;
+    assert!(lab.status()?.get("dns_queries").is_none());
+    assert_eq!(lab.http(name, address, 80)?.stdout, b"wan");
+    edited["observability"] = json!(true);
+    edited["real_upstream"] = json!("127.0.0.1:9");
+    reload(&edited)?;
+    wait_until(|| {
+        let status = lab.status()?;
+        Ok(status["observability"] == true
+            && status["restart_required"] == true
+            && status["configuration_applied"] == false)
+    })?;
+    assert_eq!(
+        lab.status()?["applied_resolver"],
+        lab.config["real_upstream"]
+    );
+    assert_eq!(lab.http(name, address, 80)?.stdout, b"wan");
+    assert_eq!(lab.status()?["process_id"], pid.as_raw_pid());
+    reload(&lab.config)?;
+    wait_until(|| {
+        let status = lab.status()?;
+        Ok(status["restart_required"] == false && status["configuration_applied"] == true)
+    })?;
+    lab.stop()
+}
+
+#[test]
+#[ignore = "requires the isolated Docker network laboratory"]
+fn r159a_dns_revocation_purges_an_unwritable_snapshot_without_interrupting_traffic() -> TestResult {
+    const PROBE: &str = "TUNNEL_DETOUR_STATUS_PUBLICATION_PROBE";
+    if let Ok(destination) = env::var(PROBE) {
+        if env::var("TUNNEL_DETOUR_NETWORK_LAB").as_deref() != Ok("1") {
+            return Err("probe requires the isolated network laboratory".into());
+        }
+        let mut stream = TcpStream::connect_timeout(&destination.parse()?, Duration::from_secs(2))?;
+        stream.set_read_timeout(Some(Duration::from_secs(8)))?;
+        stream.write_all(b"GET /route.txt HTTP/1.0\r\nHost: selected.example.test\r\n")?;
+        std::io::stdin().read_exact(&mut [0; 1])?;
+        stream.write_all(b"\r\n")?;
+        let mut reply = Vec::new();
+        stream.take(4096).read_to_end(&mut reply)?;
+        assert!(
+            reply.ends_with(b"wan"),
+            "the held stream lost its WAN origin"
+        );
+        return Ok(());
+    }
+    let mut lab = Lab::new()?;
+    let directory = lab.directory.path().join("run");
+    fs::create_dir(&directory)?;
+    let mount = directory.to_str().ok_or("non-UTF-8 laboratory path")?;
+    command(
+        "mount",
+        &["-t", "tmpfs", "-o", "mode=0700,nr_inodes=4", "tmpfs", mount],
+        None,
+    )?;
+    let exercised = (|| -> TestResult {
+        lab.start()?;
+        let process_id = lab.service.as_ref().ok_or("service is absent")?.id();
+        let pid = rustix::process::Pid::from_raw(i32::try_from(process_id)?)
+            .ok_or("invalid service PID")?;
+        let name = "selected.example.test";
+        let address = lab.address(name)?;
+        let index = lab.children.len();
+        lab.children.push(
+            Command::new("ip")
+                .args(["netns", "exec", "td-client"])
+                .arg(env::current_exe()?)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "r159a_dns_revocation_purges_an_unwritable_snapshot_without_interrupting_traffic",
+                ])
+                .env(PROBE, SocketAddr::from((address, 80)).to_string())
+                .stdin(Stdio::piped())
+                .spawn()?,
+        );
+        wait_until(|| {
+            Ok(lab.status()?["connections"]
+                .as_object()
+                .is_some_and(|connections| connections.len() == 1))
+        })?;
+
+        let path = directory.join("status.json");
+        let filler = directory.join("filler");
+        rustix::process::kill_process(pid, rustix::process::Signal::STOP)?;
+        let prepared = (|| -> Result<Vec<File>, Box<dyn Error>> {
+            wait_until(|| {
+                Ok(fs::read_to_string(format!("/proc/{process_id}/status"))?
+                    .lines()
+                    .any(|line| line.starts_with("State:\tT")))
+            })?;
+            // The directory and its writer lock consume two slots. Pin the
+            // current snapshot and any interrupted replacement in the other two.
+            // An unlinked inode remains charged until its last descriptor closes.
+            let held = fs::read_dir(&directory)?
+                .map(|entry| File::open(entry?.path()))
+                .collect::<Result<Vec<_>, _>>()?;
+            if held.len() == 2 {
+                File::create_new(&filler)?;
+            }
+            assert!(
+                File::create_new(directory.join("probe"))
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::StorageFull),
+                "snapshot replacement must actually run out of inodes"
+            );
+            let mut candidate = lab.config.clone();
+            candidate["observability"] = json!(false);
+            fs::write(
+                lab.directory.path().join("config.json"),
+                serde_json::to_vec(&candidate)?,
+            )?;
+            rustix::process::kill_process(pid, rustix::process::Signal::HUP)?;
+            Ok(held)
+        })();
+        let resumed = rustix::process::kill_process(pid, rustix::process::Signal::CONT);
+        let held = prepared?;
+        resumed?;
+
+        let log_path = lab.directory.path().join("service.log");
+        let unpublished = || {
+            path.metadata()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        };
+        wait_until(|| {
+            Ok(unpublished()
+                && fs::read_to_string(&log_path)?.contains("status_publication_failed"))
+        })?;
+        assert_eq!(lab.address(name)?, address);
+        assert_eq!(lab.http(name, address, 80)?.stdout, b"wan");
+        let client = &mut lab.children[index];
+        client
+            .stdin
+            .as_mut()
+            .ok_or("missing held WAN probe input")?
+            .write_all(b"1")?;
+        wait_until(|| Ok(client.try_wait()?.is_some()))?;
+        assert!(
+            client.wait()?.success(),
+            "the held WAN stream did not finish"
+        );
+        assert!(
+            unpublished(),
+            "the snapshot reappeared before the fault was removed"
+        );
+        assert_eq!(
+            fs::read_to_string(&log_path)?
+                .matches("status_publication_failed")
+                .count(),
+            1,
+            "repeated failed publications must share one health warning"
+        );
+
+        if filler.try_exists()? {
+            fs::remove_file(filler)?;
+        }
+        drop(held);
+        wait_until(|| {
+            Ok(lab.status().is_ok_and(|status| {
+                status["process_id"] == process_id
+                    && status["phase"] == "ready"
+                    && status["observability"] == false
+                    && status.get("dns_queries").is_none()
+                    && status.get("connections").is_none()
+            }))
+        })
+    })();
+    let stopped = lab.stop();
+    let unmounted = command("umount", &[mount], None);
+    exercised?;
+    stopped?;
+    unmounted?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the isolated Docker network laboratory"]
+fn r155d_json_restart_scrubs_an_old_snapshot_on_startup_failure() -> TestResult {
+    let mut lab = Lab::new()?;
+    lab.start()?;
+    let name = "selected.example.test";
+    let address = lab.address(name)?;
+    wait_until(|| {
+        Ok(lab.status()?["dns_queries"]
+            .as_u64()
+            .is_some_and(|count| count > 0))
+    })?;
+    lab.stop()?;
+    let status_file = lab.config["status_file"]
+        .as_str()
+        .ok_or("missing status path")?
+        .to_owned();
+    let prior = fs::read(&status_file)?;
+    let existing: Value = serde_json::from_slice(&prior)?;
+    assert!(
+        existing["dns_queries"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert!(
+        existing["status_owner"]
+            .as_array()
+            .is_some_and(|identity| identity.len() == 2),
+        "the original opted-in snapshot must identify its owner"
+    );
+    let state_file = lab.config["state_file"]
+        .as_str()
+        .ok_or("missing lease path")?
+        .to_owned();
+    let lease = fs::read(&state_file)?;
+    lab.config["observability"] = json!(false);
+    let refused = |lab: &mut Lab, code: &str| -> TestResult {
+        let error = lab.start().err().ok_or("invalid startup was accepted")?;
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("daemon exited: {code}")),
+            "unexpected startup failure: {error}"
+        );
+        assert!(
+            !lab.service
+                .take()
+                .ok_or("missing refused service")?
+                .wait()?
+                .success()
+        );
+        Ok(())
+    };
+    let assert_clean = |lab: &Lab| -> TestResult {
+        let snapshot = lab.status()?;
+        assert_eq!(snapshot["observability"], false);
+        assert!(snapshot.get("dns_queries").is_none());
+        assert!(snapshot.get("observability_owner").is_none());
+        assert_eq!(snapshot["status_owner"], existing["status_owner"]);
+        Ok(())
+    };
+
+    let corrupt = br#"{"leases":"#;
+    let foreign_state = lab.directory.path().join("state/foreign.json");
+    fs::write(&foreign_state, corrupt)?;
+    fs::set_permissions(&foreign_state, fs::Permissions::from_mode(0o600))?;
+    lab.config["state_file"] = json!(foreign_state);
+    refused(&mut lab, "lease_storage_error")?;
+    assert_eq!(fs::read(&status_file)?, prior);
+    assert_eq!(fs::read(&foreign_state)?, corrupt);
+
+    // The other lock cannot claim this snapshot even when its lease is readable.
+    fs::write(&foreign_state, &lease)?;
+    refused(&mut lab, "invalid_configuration")?;
+    assert_eq!(fs::read(&status_file)?, prior);
+    assert_eq!(fs::read(&foreign_state)?, lease);
+
+    lab.config["state_file"] = json!(state_file);
+    fs::write(&state_file, corrupt)?;
+    refused(&mut lab, "lease_storage_error")?;
+    assert_clean(&lab)?;
+    assert_eq!(fs::read(&state_file)?, corrupt);
+
+    // Replay the same observed snapshot to exercise the separate listener failure.
+    fs::write(&state_file, &lease)?;
+    fs::write(&status_file, &prior)?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:10535")?;
+    refused(&mut lab, "io_error")?;
+    assert_clean(&lab)?;
+    assert_eq!(fs::read(&state_file)?, lease);
+
+    // A legacy snapshot is adoptable on a valid restart. During a failed
+    // startup, no available evidence can tie the unstamped file to this lock.
+    let mut legacy = existing.clone();
+    legacy
+        .as_object_mut()
+        .ok_or("missing legacy status object")?
+        .remove("status_owner");
+    let legacy = serde_json::to_vec(&legacy)?;
+    fs::write(&status_file, &legacy)?;
+    refused(&mut lab, "io_error")?;
+    assert_eq!(fs::read(&status_file)?, legacy);
+    drop(listener);
+    lab.start()?;
+    assert_clean(&lab)?;
+    assert_eq!(lab.address(name)?, address);
+    assert_eq!(lab.http(name, address, 80)?.stdout, b"wan");
+    lab.stop()
+}
+
+#[test]
+#[ignore = "requires the isolated Docker network laboratory"]
+fn r155f_ipv6_preflight_preserves_the_startup_error_and_a_held_snapshot() -> TestResult {
+    let mut lab = Lab::new()?;
+    lab.prepare_ipv6_wan()?;
+    lab.config["ipv6"]["wan"]["source"] = json!("2001:db8:2::99");
+    lab.config["observability"] = json!(false);
+    let state_dir = lab.directory.path().join("state");
+    let run_dir = lab.directory.path().join("run");
+    for directory in [&state_dir, &run_dir] {
+        fs::create_dir(directory)?;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    }
+    let snapshot = run_dir.join("status.json");
+    let prior = br#"{"observability":true,"dns_queries":17}"#;
+    fs::write(&snapshot, prior)?;
+    fs::set_permissions(&snapshot, fs::Permissions::from_mode(0o600))?;
+    for lock_path in [
+        state_dir.join("leases.json.lock"),
+        run_dir.join("status.json.writer.lock"),
+    ] {
+        let lock = File::create_new(&lock_path)?;
+        lock.try_lock()?;
+        for permissions in [0o600, 0o644] {
+            fs::set_permissions(&lock_path, fs::Permissions::from_mode(permissions))?;
+            let failure = lab
+                .start()
+                .err()
+                .ok_or("unassigned WAN source was accepted")?;
+            assert!(
+                failure.to_string().contains("ipv6_path_unavailable"),
+                "unexpected startup failure with {} at {permissions:o}: {failure}",
+                lock_path.display()
+            );
+            assert!(
+                !lab.service
+                    .take()
+                    .ok_or("missing refused service")?
+                    .wait()?
+                    .success()
+            );
+            assert_eq!(fs::read(&snapshot)?, prior);
+            assert!(!state_dir.join("leases.json").exists());
+        }
+        drop(lock);
+        fs::remove_file(lock_path)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the isolated Docker network laboratory"]
+fn r158_pool_exhaustion_is_visible_without_collecting_dns_requests() -> TestResult {
+    let mut lab = Lab::new()?;
+    lab.config["observability"] = json!(false);
+    lab.config["limits"] = json!({"max_mappings":1,"max_mappings_per_rule":1});
+    lab.config["rules"] = json!([
+        {"pattern":"selected.example.test","enabled":true},
+        {"pattern":"other.example.test","enabled":true}
+    ]);
+    lab.start()?;
+    let name = "selected.example.test";
+    let address = lab.address(name)?;
+    let refused = lab.query("other.example.test", RecordType::A, false)?;
+    assert_eq!(refused.metadata.response_code, ResponseCode::ServFail);
+    wait_until(|| Ok(lab.status()?["degraded"] == json!(["mapping_pool_exhausted"])))?;
+    let state = lab.status()?;
+    assert_eq!(state["observability"], false);
+    assert!(state.get("dns_queries").is_none());
+    assert!(state.get("last_request_error").is_none());
+    assert_eq!(lab.address(name)?, address);
+    assert_eq!(lab.http(name, address, 80)?.stdout, b"wan");
+    assert_eq!(lab.status()?["degraded"], json!(["mapping_pool_exhausted"]));
+    lab.stop()
+}
+
+#[test]
+#[ignore = "requires the isolated Docker network laboratory"]
 fn r114_dual_stack_blackholes_fall_back_with_bounded_owned_dials_and_shutdown_cancels_pending_sockets()
 -> TestResult {
     let mut lab = Lab::new()?;
@@ -2133,14 +2699,13 @@ fn r114_dual_stack_blackholes_fall_back_with_bounded_owned_dials_and_shutdown_ca
         rustix::process::Signal::HUP,
     )?;
     wait_until(|| {
-        Ok(!Lab::query_at(
+        Ok(Lab::query_at(
             "10.254.0.2:5353",
             "fallback.example.test",
             RecordType::AAAA,
             true,
-        )?
-        .answers
-        .is_empty())
+        )
+        .is_ok_and(|reply| !reply.answers.is_empty()))
     })?;
     lab.config["rules"] = json!([{"pattern":"fallback.example.test","enabled":true}]);
     lab.config["limits"]["connect_timeout_seconds"] = json!(2);
@@ -2334,14 +2899,13 @@ fn r109_ipv6_preflight_requires_actual_lan_and_preferred_wan_assignments_and_fen
         rustix::process::Signal::HUP,
     )?;
     wait_until(|| {
-        Ok(!Lab::query_at(
+        Ok(Lab::query_at(
             "10.254.0.2:5353",
             "context6.example.test",
             RecordType::AAAA,
             true,
-        )?
-        .answers
-        .is_empty())
+        )
+        .is_ok_and(|reply| !reply.answers.is_empty()))
     })?;
     lab.config["rules"]
         .as_array_mut()
@@ -2364,9 +2928,7 @@ fn r109_ipv6_preflight_requires_actual_lan_and_preferred_wan_assignments_and_fen
             .err()
             .ok_or("an unassigned IPv6 context was accepted")?;
         assert!(
-            error
-                .to_string()
-                .contains("selected IPv6 LAN or preferred WAN source is unavailable"),
+            error.to_string().contains("ipv6_path_unavailable"),
             "unexpected startup failure: {error}"
         );
         let mut child = lab
@@ -2822,7 +3384,7 @@ fn r022_private_and_router_local_destinations_cannot_pivot_through_the_exception
             .status
             .success()
     );
-    wait_until(|| Ok(lab.status()?["last_error"] == "forbidden_destination"))?;
+    wait_until(|| Ok(lab.status()?["last_request_error"] == "forbidden_destination"))?;
     let root = lab.directory.path().join("router-wan");
     fs::create_dir(&root)?;
     fs::write(root.join("route.txt"), "router-wan")?;
@@ -2857,7 +3419,7 @@ fn r022_private_and_router_local_destinations_cannot_pivot_through_the_exception
         {
             return Err("a public router-local address was reachable through the WAN proxy".into());
         }
-        Ok(lab.status()?["last_error"] != "forbidden_destination")
+        Ok(lab.status()?["last_request_error"] != "forbidden_destination")
     })?;
     command("nft", &["-f", "-"], Some(b"table inet lab_ipv6_filter {\n counter forbidden_syns {}\n chain observe {\n type filter hook output priority 300; policy accept;\n meta mark 21572 tcp dport 80 tcp flags & (syn | ack) == syn counter name forbidden_syns;\n }\n}\n"))?;
     for (index, denied) in denied6.iter().enumerate() {
@@ -2875,7 +3437,7 @@ fn r022_private_and_router_local_destinations_cannot_pivot_through_the_exception
         );
         wait_until(|| {
             let status = lab.status()?;
-            Ok(status["last_error"] == "forbidden_destination"
+            Ok(status["last_request_error"] == "forbidden_destination"
                 && status["failures"]
                     .as_u64()
                     .is_some_and(|current| current > failures))
@@ -3152,11 +3714,7 @@ fn r025_adguard_reconciliation_adds_and_removes_only_owned_upstreams_preserving_
         .start()
         .err()
         .ok_or("an API hosted on another LAN machine was accepted")?;
-    assert!(
-        failure
-            .to_string()
-            .contains("AdGuard control endpoint must belong to this router")
-    );
+    assert!(failure.to_string().contains("adguard_endpoint_not_local"));
     assert_eq!(lab.api("dns_info", None)?["upstream_dns"], baseline);
     Ok(())
 }
@@ -4252,7 +4810,7 @@ fn r034_connection_limits_and_descriptor_failure_preserve_isolation_recovery_and
             "an additional relay exceeded the shared IPv4/IPv6 connection bound"
         );
     }
-    wait_until(|| Ok(lab.status()?["last_error"] == "capacity_exhausted"))?;
+    wait_until(|| Ok(lab.status()?["last_request_error"] == "capacity_exhausted"))?;
     assert_eq!(
         lab.address("selected.example.test")?,
         address,
@@ -4643,6 +5201,7 @@ fn r075_redirected_tcp_identity_uses_the_exact_kernel_generation_even_when_a_new
         assert_eq!(tunnel_detour_service::inspect_relay_ingress(&streams[0]).await?.mark, 0x54440001, "the pending old socket must not acquire the new publication generation");
         assert_eq!(tunnel_detour_service::inspect_relay_ingress(&streams[1]).await?.mark, 0x54440002);
         let mut sessions = RelaySessions::new(RelayLimits::new(1, Duration::from_secs(2), Duration::from_secs(5))?);
+        sessions.set_observability(true);
         for stream in streams {
             // Both pending sockets are offered the current policy. The old socket
             // must be rejected before a single SYN reaches the selected backend.
@@ -4653,11 +5212,11 @@ fn r075_redirected_tcp_identity_uses_the_exact_kernel_generation_even_when_a_new
         }
         assert!(sessions.connections().iter().any(|connection|connection.client.port()==42002 && connection.queued),"the current socket must exercise queued kernel verification");
         let stale=timeout(Duration::from_secs(3),sessions.next_completion()).await??;
-        assert_eq!(stale.connection.client.port(),42001);
+        assert_eq!(stale.connection.map(|connection| connection.client.port()), Some(42001));
         assert_eq!(stale.outcome,RelayOutcome::IdentityRejected);
         let current=async {
             let completion=timeout(Duration::from_secs(3),sessions.next_completion()).await??;
-            assert_eq!(completion.connection.client.port(),42002);
+            assert_eq!(completion.connection.map(|connection| connection.client.port()), Some(42002));
             assert_eq!(completion.outcome,RelayOutcome::Complete);
             Ok::<(),Box<dyn Error>>(())
         };

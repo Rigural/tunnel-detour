@@ -18,6 +18,7 @@ mod ipv6_routing;
 mod kernel;
 mod kernel_netlink;
 mod management;
+mod observability;
 mod port_guard;
 mod proxy;
 mod relay;
@@ -37,7 +38,10 @@ pub use credentials::migrate_adguard_credentials;
 pub use inbound::{BoundInbound, InboundRuntimeError, check_inbound_config, cleanup_inbound_uci};
 pub use inbound_config::{InboundConfig, InboundConfigError};
 pub use inbound_uci::load_inbound_uci;
-pub use management::{cleanup_uci, rpc_call, rpc_methods, validate_patterns};
+pub use management::{
+    cleanup_uci, clear_uci_observations, rpc_call, rpc_methods, validate_patterns,
+};
+pub use observability::{ObservabilityLog, queue_uci_revocation};
 pub use port_guard::{PortGuardError, PortUse};
 pub use relay::{
     RELAY_ADMISSION_WAIT, RELAY_LISTEN_BACKLOG, RELAY_PENDING_LIMIT, RelayAdmission, RelayCapture,

@@ -20,6 +20,18 @@ use std::{
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 static NEXT_LAB: AtomicU64 = AtomicU64::new(0);
+const MANAGEMENT_ASSET: &str = "/luci-static/resources/view/tunnel-detour/overview.js";
+
+#[derive(Debug)]
+struct PublishedHttpUnavailable(String);
+
+impl std::fmt::Display for PublishedHttpUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Error for PublishedHttpUnavailable {}
 
 fn output(program: &str, arguments: &[&str], input: Option<&[u8]>) -> TestResult<Output> {
     let mut command = Command::new(program);
@@ -110,12 +122,38 @@ impl Lab {
             return Self::create_vm();
         }
         let binary = env::var("TUNNEL_DETOUR_OPENWRT_BINARY")?;
+        let image = env::var(if transition {
+            "TUNNEL_DETOUR_OPENWRT_TRANSITION_IMAGE"
+        } else if dnsmasq {
+            "TUNNEL_DETOUR_OPENWRT_DNSMASQ_IMAGE"
+        } else {
+            "TUNNEL_DETOUR_OPENWRT_ADGUARD_IMAGE"
+        })?;
+        match Self::create_native(&binary, &image, dnsmasq, transition) {
+            Err(error) if error.is::<PublishedHttpUnavailable>() => {
+                eprintln!("native laboratory startup retry after published HTTP failure: {error}");
+                Self::create_native(&binary, &image, dnsmasq, transition)
+            }
+            result => result,
+        }
+    }
+
+    fn create_native(
+        binary: &str,
+        image: &str,
+        dnsmasq: bool,
+        transition: bool,
+    ) -> TestResult<Self> {
         let sequence = NEXT_LAB.fetch_add(1, Ordering::Relaxed);
         let mut lab = Self {
             vm: None,
             background: RefCell::new(Vec::new()),
             name: format!("tunnel-detour-openwrt-{}-{sequence}", std::process::id()),
-            network: format!("tunnel-detour-management-{}-{sequence}", std::process::id()),
+            network: format!(
+                "{}{}-{sequence}",
+                xtask::native_openwrt::NETWORK_PREFIX,
+                std::process::id()
+            ),
             container_created: false,
             network_created: false,
             http: String::new(),
@@ -127,11 +165,11 @@ impl Lab {
                 "network",
                 "create",
                 "--subnet",
-                "10.203.0.0/24",
+                xtask::native_openwrt::SUBNET,
                 "--opt",
                 "com.docker.network.bridge.enable_ip_masquerade=false",
                 "--label",
-                "tunnel-detour.task=local-validation",
+                xtask::native_openwrt::TASK_LABEL,
                 &lab.network,
             ],
             None,
@@ -143,6 +181,8 @@ impl Lab {
                 "run",
                 "--detach",
                 "--rm",
+                "--pull",
+                "never",
                 "--name",
                 &lab.name,
                 "--label",
@@ -176,13 +216,7 @@ impl Lab {
                     "type=bind,src={},dst=/usr/libexec/tunnel-detour-test-fixture,readonly",
                     env::current_exe()?.display()
                 ),
-                if transition {
-                    "tunnel-detour-openwrt-transition-lab:local"
-                } else if dnsmasq {
-                    "tunnel-detour-openwrt-dnsmasq-lab:local"
-                } else {
-                    "tunnel-detour-openwrt-lab:local"
-                },
+                image,
             ],
             None,
         )?;
@@ -190,9 +224,10 @@ impl Lab {
         let port = String::from_utf8(checked("docker", &["port", &lab.name, "80/tcp"], None)?)?;
         lab.http = format!("http://{}", port.trim());
         let mut diagnostic = String::new();
+        let mut published_connection_failed = false;
         wait(|| {
             let plugin = lab.exec(&["ubus", "list", "tunnel-detour"], None);
-            let http = checked(
+            let http = output(
                 "curl",
                 &[
                     "--silent",
@@ -200,28 +235,29 @@ impl Lab {
                     "--fail",
                     "--max-time",
                     "2",
-                    &format!(
-                        "{}/luci-static/resources/view/tunnel-detour/overview.js",
-                        lab.http
-                    ),
+                    &format!("{}{MANAGEMENT_ASSET}", lab.http),
                 ],
                 None,
             );
+            published_connection_failed = plugin.is_ok()
+                && http
+                    .as_ref()
+                    .is_ok_and(|reply| reply.status.code() == Some(7));
+            let detail = match &http {
+                Ok(reply) => String::from_utf8_lossy(&reply.stderr).into_owned(),
+                Err(error) => error.to_string(),
+            };
             diagnostic = format!(
-                "plugin: {}; HTTP: {}",
+                "plugin: {}; HTTP: {detail}",
                 plugin
                     .as_ref()
                     .err()
                     .map(ToString::to_string)
-                    .unwrap_or_default(),
-                http.as_ref()
-                    .err()
-                    .map(ToString::to_string)
                     .unwrap_or_default()
             );
-            Ok(plugin.is_ok() && http.is_ok())
+            Ok(plugin.is_ok() && http.is_ok_and(|reply| reply.status.success()))
         })
-        .map_err(|error| {
+        .map_err(|error| -> Box<dyn Error> {
             // Preserve startup evidence before Drop removes the disposable container.
             // Do not restart uhttpd here: healing the fixture would hide its failure.
             for arguments in [
@@ -238,7 +274,31 @@ impl Lab {
                     Err(error) => eprintln!("laboratory startup diagnostic failed: {error}"),
                 }
             }
-            format!("management startup: {error}; {diagnostic}")
+            let message = format!("management startup: {error}; {diagnostic}");
+            // Retry only when the management asset actually works inside this
+            // guest and the host still cannot connect to the published port.
+            // A fresh fixture must pass the original HTTP and RPC checks.
+            if published_connection_failed
+                && lab
+                    .raw(
+                        &[
+                            "curl",
+                            "--silent",
+                            "--fail",
+                            "--max-time",
+                            "2",
+                            "--output",
+                            "/dev/null",
+                            &format!("http://127.0.0.1{MANAGEMENT_ASSET}"),
+                        ],
+                        None,
+                    )
+                    .is_ok_and(|reply| reply.status.success())
+            {
+                PublishedHttpUnavailable(message).into()
+            } else {
+                message.into()
+            }
         })?;
         assert_eq!(
             lab.raw(&["apk", "info", "--exists", "dnsmasq"], None)?
@@ -354,6 +414,39 @@ impl Lab {
             .into());
         }
         Ok(result.stdout)
+    }
+
+    fn with_command_fault<T>(
+        &self,
+        program: &str,
+        label: &str,
+        script: &str,
+        run: impl FnOnce() -> TestResult<T>,
+    ) -> TestResult<T> {
+        let path = String::from_utf8(self.exec(
+            &[
+                "sh",
+                "-c",
+                "readlink -f \"$(command -v \"$1\")\"",
+                "lab",
+                program,
+            ],
+            None,
+        )?)?;
+        let path = path.trim();
+        let real = format!("/usr/libexec/{label}-real");
+        let wrapper = format!("/usr/libexec/{label}-wrapper");
+        self.exec(&["cp", path, &real], None)?;
+        let body = format!("#!/bin/sh\nREAL='{real}'\n{script}\nexec \"$REAL\" \"$@\"\n");
+        self.exec(&["tee", &wrapper], Some(body.as_bytes()))?;
+        self.exec(&["chmod", "755", &wrapper], None)?;
+        self.exec(&["mount", "--bind", &wrapper, path], None)?;
+        let result = run();
+        let unmounted = self.exec(&["umount", path], None);
+        result.and_then(|value| {
+            unmounted?;
+            Ok(value)
+        })
     }
 
     fn ubus(&self, object: &str, method: &str, payload: Value) -> TestResult<Value> {
@@ -1146,35 +1239,35 @@ impl Lab {
         } else {
             "td-in-wan"
         };
-        let child = self
-            .background_command(&[
-                "env",
-                &format!("TUNNEL_DETOUR_INBOUND_PROBE={role}"),
-                &format!(
-                    "TUNNEL_DETOUR_LUCI_REVIEW={}",
-                    if env::var_os("TUNNEL_DETOUR_LUCI_IPV6_REVIEW").is_some() {
-                        "2"
-                    } else if env::var_os("TUNNEL_DETOUR_LUCI_RELAY_REVIEW").is_some() {
-                        "1"
-                    } else {
-                        "0"
-                    }
-                ),
-                &format!(
-                    "TUNNEL_DETOUR_EXPECT_OFFLOAD={}",
-                    if self.vm.is_some() { "1" } else { "0" }
-                ),
-                "/sbin/ip",
-                "netns",
-                "exec",
-                namespace,
-                "/usr/libexec/tunnel-detour-test-fixture",
-                "--ignored",
-                "--exact",
-                "r052_native_tcp_udp_publications_preserve_client_identity_and_return_through_wan",
-                "--nocapture",
-            ])?
-            .spawn()?;
+        let probe = format!("TUNNEL_DETOUR_INBOUND_PROBE={role}");
+        let review = format!(
+            "TUNNEL_DETOUR_LUCI_REVIEW={}",
+            if env::var_os("TUNNEL_DETOUR_LUCI_IPV6_REVIEW").is_some() {
+                "2"
+            } else if env::var_os("TUNNEL_DETOUR_LUCI_RELAY_REVIEW").is_some()
+                || env::var_os("TUNNEL_DETOUR_LUCI_DNS_DIAGNOSTICS_REVIEW").is_some()
+            {
+                "1"
+            } else {
+                "0"
+            }
+        );
+        let offload = format!(
+            "TUNNEL_DETOUR_EXPECT_OFFLOAD={}",
+            if self.vm.is_some() { "1" } else { "0" }
+        );
+        let mut args = vec!["env", &probe, &review, &offload];
+        if role != "unmarked_router_server" {
+            args.extend(["/sbin/ip", "netns", "exec", namespace]);
+        }
+        args.extend([
+            "/usr/libexec/tunnel-detour-test-fixture",
+            "--ignored",
+            "--exact",
+            "r052_native_tcp_udp_publications_preserve_client_identity_and_return_through_wan",
+            "--nocapture",
+        ]);
+        let child = self.background_command(&args)?.spawn()?;
         self.background.borrow_mut().push(child);
         Ok(())
     }
@@ -1308,7 +1401,7 @@ fn r082_uci_relay_capacity_refuses_excess_before_lan_dial_and_remains_manageable
                 .success())
         })?;
     }
-    lab.change("set tunnel-detour.sample.protocol='tcp'\nset tunnel-detour.sample.destination_address='192.0.2.2'\nset tunnel-detour.inbound.relay_connections='2'\nset tunnel-detour.inbound.enabled='1'")?;
+    lab.change("set tunnel-detour.sample.protocol='tcp'\nset tunnel-detour.sample.destination_address='192.0.2.2'\nset tunnel-detour.inbound.relay_connections='2'\nset tunnel-detour.inbound.observability='1'\nset tunnel-detour.inbound.enabled='1'")?;
     wait(|| {
         Ok(lab.ubus("tunnel-detour", "inbound_status", json!({}))?["status"]["applied"] == true)
     })?;
@@ -1523,6 +1616,7 @@ fn r079_relay_target_changes_disable_and_reenable_retire_both_tcp_sides_while_na
     }
     let mut config = lab.inbound_configuration();
     config["lan_networks"] = json!(["2001:db8:1::/64", "192.0.2.0/24"]);
+    config["observability"] = json!(false);
     let mut stable = config["rules"][0].clone();
     stable["id"] = json!("stable");
     stable["name"] = json!("Unchanged native publication");
@@ -1533,7 +1627,35 @@ fn r079_relay_target_changes_disable_and_reenable_retire_both_tcp_sides_while_na
         .as_array_mut()
         .ok_or("missing rules")?
         .push(stable);
-    lab.start_inbound(&config)?;
+    let controller_index = lab.background.borrow().len();
+    let inject_first_probe = env::var("TUNNEL_DETOUR_R079_FAIL_FIRST_PROBE").as_deref() == Ok("1");
+    let start = || {
+        lab.start_inbound(&config)?;
+        wait_r079_baseline(&lab, &config, inject_first_probe)
+    };
+    let initial_status = if inject_first_probe {
+        // This read occurs after the committed journal and admitted rules,
+        // but before status publication. Release only after observing absence.
+        lab.with_command_fault(
+            "nft",
+            "r079-status-delay",
+            r#"if [ "$*" = '--stateless --handle list table inet tunnel_detour_inbound' ] &&
+   [ ! -e /tmp/r079-release-status ]; then
+  touch /tmp/r079-status-held
+  for attempt in 1 2 3 4 5 6 7 8; do
+    if [ -e /tmp/r079-release-status ]; then
+      touch /tmp/r079-status-unblocked
+      exec "$REAL" "$@"
+    fi
+    sleep 1 || exit 1
+  done
+  exit 1
+fi"#,
+            start,
+        )?
+    } else {
+        start()?
+    };
     let state = || -> TestResult<Value> {
         Ok(serde_json::from_slice(
             &lab.exec(&["cat", "/tmp/inbound-test/state.json"], None)?,
@@ -1549,8 +1671,55 @@ fn r079_relay_target_changes_disable_and_reenable_retire_both_tcp_sides_while_na
                 .success())
         })
     };
-    lab.spawn_inbound_probe("relay_lifecycle")?;
-    marker("relay-lifecycle-ready")?;
+    if lab.vm.is_some() {
+        observe_inbound_forward(&lab)?;
+    }
+    let first_probe = lab.background.borrow().len();
+    let first_role = if inject_first_probe {
+        "relay_lifecycle_fixture_failure"
+    } else {
+        "relay_lifecycle"
+    };
+    lab.spawn_inbound_probe(first_role)?;
+    if let Err(error) = wait_r079_initial_probe(&lab, first_probe) {
+        let snapshot = lab.raw_with_deadline(
+            &[
+                "cat",
+                "/tmp/inbound-test/status.json",
+                "/tmp/inbound-test/relay-server-active",
+                "/tmp/inbound-test/relay-other-server-active",
+            ],
+            None,
+            "5",
+        );
+        let degraded = r079_status(&lab).and_then(|status| r079_worker_degraded(&status));
+        let recovery =
+            verify_r079_recovery(&lab, "relay_client", &initial_status, inject_first_probe)
+                .map(|()| "backend and echo verified, unchanged PID, revision and publications");
+        let controller = lab
+            .stop_inbound()
+            .and_then(|()| collect_r079_controller(&lab, controller_index));
+        let diagnostic = match snapshot {
+            Ok(snapshot) => format!(
+                "relay lifecycle readiness: {error}; local status and backend counts:\n{}\n{}",
+                String::from_utf8_lossy(&snapshot.stdout),
+                String::from_utf8_lossy(&snapshot.stderr)
+            ),
+            Err(diagnostic) => {
+                format!("relay lifecycle readiness: {error}; local state unavailable: {diagnostic}")
+            }
+        };
+        let worker = controller.map(|output| {
+            (
+                output.status,
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        });
+        return Err(format!(
+            "{diagnostic}; worker degraded before recovery: {degraded:?}; same-controller recovery: {recovery:?}; worker: {worker:?}"
+        )
+        .into());
+    }
     if lab.vm.is_some() {
         wait(|| {
             for protocol in ["tcp", "udp"] {
@@ -1576,6 +1745,10 @@ fn r079_relay_target_changes_disable_and_reenable_retire_both_tcp_sides_while_na
             Ok(true)
         })?;
         let packets = inbound_forwarded_packets(&lab)?;
+        assert!(
+            packets > 0,
+            "the forward probe missed the initial native traffic"
+        );
         lab.inbound_marker("td-in-wan", "touch", "check-relay-fastpath")?;
         marker("relay-fastpath-checked")?;
         assert_eq!(
@@ -1624,12 +1797,311 @@ fn r079_relay_target_changes_disable_and_reenable_retire_both_tcp_sides_while_na
         let after = lab.inbound_vpn_plaintext()?;
         assert!(after[0] > before[0] && after[1] > before[1]);
     }
+    let before_refusal = r079_status(&lab)?;
+    assert_eq!(before_refusal["observability"], false);
+    let worker_root = "/var/run/tunnel-detour/transport/r079-block-worker";
+    lab.exec(&["touch", worker_root], None)?;
+    let failed = lab.inbound_probe("transport_start_refused");
+    let wait_for_degradation = failed.and_then(|probe| {
+        assert!(
+            probe.status.success(),
+            "the worker refusal must close only the fresh connection: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        wait_for(Duration::from_secs(6), || {
+            let status = r079_status(&lab)?;
+            same_r079_controller(&before_refusal, &status)?;
+            r079_worker_degraded(&status)
+        })
+    });
+    let restored_root = lab.exec(&["rm", worker_root], None);
+    wait_for_degradation?;
+    restored_root?;
+    verify_r079_recovery(&lab, "relay_recovery_client", &before_refusal, false)?;
     lab.stop_inbound()?;
+    let controller = collect_r079_controller(&lab, controller_index)?;
+    assert!(controller.status.success());
+    let stderr = String::from_utf8(controller.stderr)?;
+    assert!(
+        stderr.contains("code=\"transport_worker_failed\"")
+            && stderr.contains("stage=\"worker_root\""),
+        "worker root failure must be identifiable without traffic diagnostics: {stderr}"
+    );
     lab.inbound_marker("td-in-wan", "touch", "check-relay-stopped")?;
     marker("relay-lifecycle-complete")?;
     wait(|| Ok(active("relay-other-server-active")? == "0"))?;
     assert!(lab.lookup("ordinary.example.net")?.contains("203.0.113.2"));
     Ok(())
+}
+
+fn r079_status(lab: &Lab) -> TestResult<Value> {
+    Ok(serde_json::from_slice(
+        &lab.exec(&["cat", "/tmp/inbound-test/status.json"], None)?,
+    )?)
+}
+
+fn wait_r079_baseline(lab: &Lab, config: &Value, delayed: bool) -> TestResult<Value> {
+    let mut released = false;
+    let mut baseline = None;
+    let consent = config["observability"]
+        .as_bool()
+        .ok_or("R079 fixture requires an explicit observability setting")?;
+    wait_for(Duration::from_secs(15), || {
+        let reply = lab.raw_with_deadline(
+            &["sh", "-c", "test -e /tmp/inbound-test/status.json || exit 3; cat /tmp/inbound-test/status.json"],
+            None,
+            "4",
+        )?;
+        if reply.status.code() == Some(3) {
+            if delayed
+                && !released
+                && lab
+                    .raw(&["test", "-e", "/tmp/r079-status-held"], None)?
+                    .status
+                    .success()
+            {
+                verify_r079_held_publication(lab, config)?;
+                lab.exec(&["touch", "/tmp/r079-release-status"], None)?;
+                released = true;
+                eprintln!("R079 held publication after committed journal and applied guard");
+            }
+            return Ok(false);
+        }
+        if !reply.status.success() {
+            return Err("R079 could not read its initial status".into());
+        }
+        let status: Value = serde_json::from_slice(&reply.stdout)?;
+        if status["applied"] != true
+            || status["phase"] != "ready"
+            || status["process_id"].as_u64().is_none_or(|pid| pid == 0)
+            || status["revision"]
+                .as_u64()
+                .is_none_or(|revision| revision == 0)
+            || status["publications"] != config["rules"]
+            || status["observability"] != consent
+        {
+            return Ok(false);
+        }
+        r079_worker_degraded(&status)?;
+        if status["degraded"] != json!([]) {
+            return Err("R079 initial status was already degraded".into());
+        }
+        if delayed
+            && (!released
+                || !lab
+                    .raw(&["test", "-e", "/tmp/r079-status-unblocked"], None)?
+                    .status
+                    .success())
+        {
+            return Err("R079 did not observe the delayed publication".into());
+        }
+        baseline = Some(status);
+        Ok(true)
+    })?;
+    baseline.ok_or_else(|| "R079 has no applied baseline snapshot".into())
+}
+
+fn verify_r079_held_publication(lab: &Lab, config: &Value) -> TestResult {
+    let journal: Value =
+        serde_json::from_slice(&lab.exec(&["cat", "/tmp/inbound-test/state.json"], None)?)?;
+    let admissions = journal["admissions"]
+        .as_object()
+        .ok_or("R079 journal lacks committed admissions")?;
+    let expected = config["rules"]
+        .as_array()
+        .ok_or("R079 fixture lacks publications")?;
+    if journal.get("pending") != Some(&Value::Null) || admissions.len() != expected.len() {
+        return Err("R079 journal is not committed for the expected publications".into());
+    }
+    let ruleset: Value = serde_json::from_slice(&lab.exec(
+        &[
+            "nft",
+            "-j",
+            "-s",
+            "list",
+            "table",
+            "inet",
+            "tunnel_detour_inbound",
+        ],
+        None,
+    )?)?;
+    let objects = ruleset["nftables"]
+        .as_array()
+        .ok_or("R079 could not inspect its guard")?;
+    if !objects.iter().any(|entry| {
+        entry["table"]["name"] == "tunnel_detour_inbound"
+            && entry["table"]["comment"] == "tunnel-detour:inbound:v1"
+    }) {
+        return Err("R079 guard has no package ownership marker".into());
+    }
+    let prefix = config["wan"]["mark_prefix"]
+        .as_u64()
+        .ok_or("R079 fixture lacks a mark prefix")?;
+    for publication in expected {
+        let id = publication["id"]
+            .as_str()
+            .ok_or("R079 publication has no ID")?;
+        let generation = admissions
+            .get(id)
+            .and_then(Value::as_u64)
+            .filter(|generation| (1..=u64::from(u16::MAX)).contains(generation))
+            .ok_or("R079 journal is missing an expected admission")?;
+        let port = publication["public_port"]
+            .as_u64()
+            .ok_or("R079 publication has no numeric port")?;
+        for protocol in match publication["protocol"].as_str() {
+            Some("tcp") => &["tcp"][..],
+            Some("tcp_udp") => &["tcp", "udp"][..],
+            _ => return Err("unexpected R079 fixture protocol".into()),
+        } {
+            verify_r079_admission_rule(objects, protocol, port, prefix | generation)?;
+        }
+    }
+    // Check again after inspecting both live components, before releasing.
+    lab.exec(&["test", "!", "-e", "/tmp/inbound-test/status.json"], None)?;
+    Ok(())
+}
+
+fn verify_r079_admission_rule(
+    objects: &[Value],
+    protocol: &str,
+    port: u64,
+    mark: u64,
+) -> TestResult {
+    let selector = json!({
+        "op":"==", "left":{"payload":{"protocol":protocol,"field":"dport"}}, "right":port
+    });
+    if objects.iter().any(|entry| {
+        let rule = &entry["rule"];
+        rule["chain"] == "tag"
+            && rule["expr"].as_array().is_some_and(|expr| {
+                expr.iter().any(|item| item["match"] == selector)
+                    && expr.iter().any(|item| {
+                        item["mangle"]["key"]["ct"]["key"] == "mark"
+                            && item["mangle"]["value"] == mark
+                    })
+            })
+    }) {
+        Ok(())
+    } else {
+        Err("R079 guard does not admit an expected publication".into())
+    }
+}
+
+#[test]
+fn r079c_comparator_rejects_a_rule_that_excludes_the_published_port() -> TestResult {
+    let mark = 1_413_742_594_u64;
+    let matching = [json!({"rule":{"chain":"tag", "expr":[
+        {"match":{"op":"==","left":{"payload":{"protocol":"udp","field":"dport"}},"right":18081}},
+        {"mangle":{"key":{"ct":{"key":"mark"}},"value":mark}}
+    ]}})];
+    verify_r079_admission_rule(&matching, "udp", 18081, mark)?;
+
+    let mut excluding = matching.clone();
+    excluding[0]["rule"]["expr"][0]["match"]["op"] = json!("!=");
+    assert!(
+        verify_r079_admission_rule(&excluding, "udp", 18081, mark).is_err(),
+        "a rule excluding the published UDP port must not release the R079c barrier"
+    );
+    Ok(())
+}
+
+fn r079_worker_degraded(status: &Value) -> TestResult<bool> {
+    let flags = status["degraded"]
+        .as_array()
+        .filter(|flags| {
+            flags
+                .iter()
+                .all(|flag| flag.as_str().is_some_and(|code| !code.is_empty()))
+        })
+        .ok_or("R079 status requires a valid degraded list")?;
+    Ok(flags.iter().any(|flag| flag == "transport_worker_failed"))
+}
+
+fn wait_r079_initial_probe(lab: &Lab, index: usize) -> TestResult {
+    wait(|| {
+        if lab
+            .inbound_marker("td-in-wan", "test", "relay-lifecycle-ready")?
+            .status
+            .success()
+        {
+            return Ok(true);
+        }
+        let mut jobs = lab.background.borrow_mut();
+        let probe = jobs.get_mut(index).ok_or("missing initial relay probe")?;
+        if let Some(status) = probe.try_wait()? {
+            let mut stderr = String::new();
+            if let Some(output) = probe.stderr.take() {
+                output.take(4096).read_to_string(&mut stderr)?;
+            }
+            return Err(format!("initial relay probe exited {status}: {}", stderr.trim()).into());
+        }
+        Ok(false)
+    })
+}
+
+fn same_r079_controller(before: &Value, after: &Value) -> TestResult {
+    for field in ["process_id", "revision", "publications", "observability"] {
+        if before.get(field).is_none() || before[field] != after[field] {
+            return Err(format!("relay controller changed {field}").into());
+        }
+    }
+    Ok(())
+}
+
+fn r079_recovery_ready(before: &Value, after: &Value) -> TestResult<bool> {
+    same_r079_controller(before, after)?;
+    Ok(!r079_worker_degraded(after)?)
+}
+
+fn verify_r079_recovery(lab: &Lab, role: &str, before: &Value, check_invalid: bool) -> TestResult {
+    // An active worker can die without a startup warning. Always exercise a
+    // fresh connection; the controlled startup test asserts its warning separately.
+    let recovered = lab.inbound_probe(role)?;
+    if !recovered.status.success() {
+        return Err(format!(
+            "fresh relay failed: {}",
+            String::from_utf8_lossy(&recovered.stderr)
+        )
+        .into());
+    }
+    wait_for(Duration::from_secs(10), || {
+        let after = r079_status(lab)?;
+        if !r079_recovery_ready(before, &after)? {
+            return Ok(false);
+        }
+        if check_invalid {
+            let mut invalid = after.clone();
+            invalid
+                .as_object_mut()
+                .ok_or("expected an R079 status object")?
+                .remove("degraded");
+            if r079_recovery_ready(before, &invalid).is_ok() {
+                return Err("R079 accepted a missing degraded list after a successful echo".into());
+            }
+            invalid["degraded"] = Value::Null;
+            if r079_recovery_ready(before, &invalid).is_ok() {
+                return Err("R079 accepted a null degraded list after a successful echo".into());
+            }
+            eprintln!("R079 rejected missing and null health fields after the fresh echo");
+        }
+        Ok(true)
+    })
+}
+
+fn collect_r079_controller(lab: &Lab, controller_index: usize) -> TestResult<Output> {
+    wait_for(Duration::from_secs(10), || {
+        let mut jobs = lab.background.borrow_mut();
+        let controller = jobs
+            .get_mut(controller_index)
+            .ok_or("missing relay controller")?;
+        Ok(controller.try_wait()?.is_some())
+    })?;
+    Ok(lab
+        .background
+        .borrow_mut()
+        .remove(controller_index)
+        .wait_with_output()?)
 }
 
 #[test]
@@ -1736,7 +2208,7 @@ fn r077_ipv6_tcp_publication_reaches_a_fixed_ipv4_lan_target_without_dns_and_pre
             .success())
     })?;
     lab.prepare_inbound_uci()?;
-    lab.change("set tunnel-detour.sample.protocol='tcp'\nset tunnel-detour.sample.destination_address='192.0.2.2'\nset tunnel-detour.inbound.enabled='1'")?;
+    lab.change("set tunnel-detour.sample.protocol='tcp'\nset tunnel-detour.sample.destination_address='192.0.2.2'\nset tunnel-detour.inbound.observability='1'\nset tunnel-detour.inbound.enabled='1'")?;
     wait(|| {
         Ok(lab.ubus("tunnel-detour", "inbound_status", json!({}))?["status"]["applied"] == true)
     })
@@ -1784,20 +2256,10 @@ fn r077_ipv6_tcp_publication_reaches_a_fixed_ipv4_lan_target_without_dns_and_pre
                 })
             }))
     })?;
-    if let Some(path) = env::var_os("TUNNEL_DETOUR_LUCI_RELAY_REVIEW") {
-        use std::io::Write;
-        let path = std::path::PathBuf::from(path);
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)?;
-        file.write_all(&serde_json::to_vec(
-            &json!({"url":lab.http,"client":client,"container":lab.name}),
-        )?)?;
-        wait_for(Duration::from_secs(240), || {
-            Ok(path.with_extension("continue").exists())
-        })?;
-    }
+    pause_for_luci_review(
+        "TUNNEL_DETOUR_LUCI_RELAY_REVIEW",
+        json!({"url":lab.http,"client":client,"container":lab.name}),
+    )?;
     lab.inbound_marker("td-in-wan", "touch", "relay-client-release")?;
     wait(|| {
         Ok(lab
@@ -1985,7 +2447,8 @@ fn r068_foreign_router_ports_are_reserved_across_families_and_protocols_while_ve
     let traffic = lab.inbound_probe("owned_port_client")?;
     assert!(
         traffic.status.success(),
-        "a refused internal port disrupted the previous publication"
+        "a refused internal port disrupted the previous publication: {}",
+        String::from_utf8_lossy(&traffic.stderr)
     );
     assert!(lab.lookup("selected.example.net")?.contains("198.18.0.1"));
     assert!(
@@ -2040,6 +2503,9 @@ fn r067_optional_lan_public_address_access_routes_tcp_udp_locally_and_mode_chang
             String::from_utf8_lossy(&traffic.stderr)
         );
     }
+    if lab.vm.is_some() {
+        observe_inbound_forward(&lab)?;
+    }
     lab.spawn_inbound_probe("lan_public_holding")?;
     wait(|| {
         Ok(lab
@@ -2074,6 +2540,10 @@ fn r067_optional_lan_public_address_access_routes_tcp_udp_locally_and_mode_chang
             Ok(true)
         })?;
         let before = inbound_forwarded_packets(&lab)?;
+        assert!(
+            before > 0,
+            "the forward probe missed the initial native traffic"
+        );
         lab.inbound_marker("td-in-lan", "touch", "check-lan-public-fastpath")?;
         wait(|| {
             Ok(lab
@@ -2142,7 +2612,7 @@ fn r067_optional_lan_public_address_access_routes_tcp_udp_locally_and_mode_chang
 #[ignore = "requires the isolated OpenWrt management laboratory"]
 fn r065_invalid_saved_publications_keep_previous_flows_and_report_that_changes_were_not_applied()
 -> TestResult {
-    // PF-01d/PF-09c: rejection must preserve policy and accurately identify what is active.
+    // PF-01d/PF-09c: rejection preserves policy and reports what is still active.
     let lab = Lab::create(true)?;
     lab.inbound_endpoints()?;
     lab.prepare_inbound_uci()?;
@@ -2152,6 +2622,7 @@ fn r065_invalid_saved_publications_keep_previous_flows_and_report_that_changes_w
         initial = lab.ubus("tunnel-detour", "inbound_status", json!({}))?;
         Ok(initial["running"] == true && initial["status"]["applied"] == true)
     })?;
+    assert_eq!(initial["status"]["observability"], false);
     lab.spawn_inbound_probe("independent")?;
     wait(|| {
         Ok(lab
@@ -2161,7 +2632,7 @@ fn r065_invalid_saved_publications_keep_previous_flows_and_report_that_changes_w
     })?;
     for (candidate, error) in [
         (
-            "set tunnel-detour.sample.destination_address='invalid'",
+            "set tunnel-detour.sample.destination_address='rejected-destination.example.test'",
             "inbound_configuration_failed",
         ),
         (
@@ -2178,6 +2649,23 @@ fn r065_invalid_saved_publications_keep_previous_flows_and_report_that_changes_w
         .map_err(|failure| {
             format!("expected rejection {error}: {failure}; actual status: {rejected}")
         })?;
+        assert_eq!(rejected["status"]["observability"], false);
+        wait(|| {
+            let logs = String::from_utf8(lab.exec(&["logread"], None)?)?;
+            let health_code = format!("code=\"{error}\"");
+            let mut reported = false;
+            for line in logs.lines().filter(|line| line.contains(&health_code)) {
+                reported = true;
+                for private in ["example.test", "2001:db8:", "192.0.2.", "198.51.100."] {
+                    assert!(
+                        !line.contains(private),
+                        "health log exposed an input: {line}"
+                    );
+                }
+            }
+            Ok(reported)
+        })
+        .map_err(|failure| format!("expected operational log code {error}: {failure}"))?;
         assert_eq!(rejected["running"], true);
         assert_eq!(rejected["status"]["phase"], "ready");
         assert_eq!(
@@ -2280,7 +2768,27 @@ fn r064_offline_uninstall_cleans_dns_and_inbound_owners_together_and_preserves_a
     };
     let v4_before = foreign_routes("-4")?;
     let v6_before = foreign_routes("-6")?;
+    // A crashed controller can leave a snapshot that cannot be opened safely.
+    // Use a symlink so cleanup must discard the link and preserve its target.
+    let inbound = lab.ubus("service", "list", json!({"name":"tunnel-detour-inbound"}))?;
+    let inbound_pid = inbound["tunnel-detour-inbound"]["instances"]["inbound"]["pid"]
+        .as_u64()
+        .filter(|pid| *pid > 1)
+        .ok_or("missing isolated inbound controller")?;
+    let sentinel = "/tmp/uninstall-status-sentinel";
+    lab.exec(&["tee", sentinel], Some(b"untouched"))?;
+    lab.exec(&["kill", "-STOP", &inbound_pid.to_string()], None)?;
+    lab.exec(
+        &[
+            "ln",
+            "-sf",
+            sentinel,
+            "/var/run/tunnel-detour/inbound/status.json",
+        ],
+        None,
+    )?;
     lab.exec(&["ifdown", "wan"], None)?;
+    lab.exec(&["kill", "-KILL", &inbound_pid.to_string()], None)?;
     for command in [
         vec!["/etc/init.d/tunnel-detour-inbound", "stop"],
         vec!["/etc/init.d/tunnel-detour", "stop"],
@@ -2296,6 +2804,7 @@ fn r064_offline_uninstall_cleans_dns_and_inbound_owners_together_and_preserves_a
             "uninstall retained the owned table {table}"
         );
     }
+    assert_eq!(lab.exec(&["cat", sentinel], None)?, b"untouched");
     lab.exec(
         &["test", "!", "-e", "/var/run/tunnel-detour/transport"],
         None,
@@ -3043,12 +3552,114 @@ fn inbound_recovery(relay: bool) -> TestResult {
     Ok(())
 }
 
+fn restrict_wan_dispatch(lab: &Lab, predicate: &str) -> TestResult {
+    let dstnat: Value = serde_json::from_slice(&lab.exec(
+        &[
+            "nft", "-j", "-s", "-a", "list", "chain", "inet", "fw4", "dstnat",
+        ],
+        None,
+    )?)?;
+    let wan_dispatch: Vec<_> = dstnat["nftables"]
+        .as_array()
+        .ok_or("missing native dstnat base chain")?
+        .iter()
+        .filter_map(|object| object.get("rule"))
+        .filter(|rule| {
+            rule["expr"].as_array().is_some_and(|expr| {
+                expr.last()
+                    .is_some_and(|verdict| verdict["jump"]["target"] == "dstnat_wan")
+            })
+        })
+        .filter_map(|rule| rule["handle"].as_u64())
+        .collect();
+    let [handle] = wan_dispatch.as_slice() else {
+        return Err("expected exactly one native WAN NAT dispatch".into());
+    };
+    let restriction = format!(
+        "replace rule inet fw4 dstnat handle {handle} iifname \"tdwan0\" {predicate} jump dstnat_wan comment \"lab WAN dispatch policy\"\n"
+    );
+    lab.exec(&["nft", "-f", "-"], Some(restriction.as_bytes()))?;
+    Ok(())
+}
+
+fn shadow_wan_tcp(lab: &Lab, chain: &str, port: u16) -> TestResult {
+    let restriction = format!(
+        "insert rule inet fw4 {chain} iifname \"tdwan0\" ip6 saddr 2001:db8:3::2 ip6 daddr 2001:db8:2::1 tcp dport {port} return comment \"lab WAN TCP policy\"\n"
+    );
+    lab.exec(&["nft", "-f", "-"], Some(restriction.as_bytes()))?;
+    Ok(())
+}
+
+fn enable_software_flow_offload(lab: &Lab) -> TestResult {
+    lab.exec(&["uci", "batch"], Some(b"set firewall.@defaults[0].flow_offloading='1'\nset firewall.@defaults[0].flow_offloading_hw='0'\ncommit firewall\n"))?;
+    lab.exec(&["fw4", "reload"], None)?;
+    lab.exec(&["nft", "list", "flowtable", "inet", "fw4", "ft"], None)?;
+    Ok(())
+}
+
+fn large_foreign_set(lab: &Lab) -> TestResult<String> {
+    use std::fmt::Write as _;
+
+    lab.exec(
+        &["nft", "-f", "-"],
+        Some(b"add set inet fw4 lab_large_foreign { type ipv6_addr; }\n"),
+    )?;
+    let comment = "fixture".repeat(16);
+    for start in (0..36_000).step_by(1000) {
+        let mut batch = String::from("add element inet fw4 lab_large_foreign { ");
+        for item in start..start + 1000 {
+            if item != start {
+                batch.push_str(", ");
+            }
+            write!(batch, "2001:db8:ff::{item:x} comment \"{comment}\"")?;
+        }
+        batch.push_str(" }\n");
+        lab.exec(&["nft", "-f", "-"], Some(batch.as_bytes()))?;
+    }
+    let size = String::from_utf8(lab.exec(
+        &[
+            "sh",
+            "-c",
+            "set -o pipefail; nft -j -s -a list table inet fw4 | wc -c",
+        ],
+        None,
+    )?)?;
+    assert!(
+        size.trim().parse::<usize>()? > 4 * 1024 * 1024,
+        "the real fw4 listing must exceed the old capture limit"
+    );
+    foreign_set_fingerprint(lab)
+}
+
+fn foreign_set_fingerprint(lab: &Lab) -> TestResult<String> {
+    let digest = lab.exec(
+        &[
+            "sh",
+            "-c",
+            "set -o pipefail; nft -j -s -a list set inet fw4 lab_large_foreign | sha256sum",
+        ],
+        None,
+    )?;
+    Ok(String::from_utf8(digest)?)
+}
+
 #[test]
 #[ignore = "requires the isolated OpenWrt management laboratory"]
 fn r057_inbound_recovers_partial_native_firewall_commits_without_reusing_retired_generations_or_changing_foreign_rules()
 -> TestResult {
     let lab = Lab::create(true)?;
     lab.inbound_endpoints()?;
+    let accelerated = lab.vm.is_some();
+    if accelerated {
+        enable_software_flow_offload(&lab)?;
+    }
+    let flowtable = || {
+        lab.exec(
+            &["nft", "-s", "list", "flowtable", "inet", "fw4", "ft"],
+            None,
+        )
+    };
+    let initial_flowtable = accelerated.then(flowtable).transpose()?;
     lab.exec(&["uci", "batch"], Some(b"set firewall.preserved=rule\nset firewall.preserved.name='Administrator rule'\nset firewall.preserved.src='wan'\nset firewall.preserved.proto='tcp'\nset firewall.preserved.dest_port='3022'\nset firewall.preserved.target='ACCEPT'\ncommit firewall\n"))?;
     lab.exec(
         &["nft", "--file", "-"],
@@ -3071,6 +3682,7 @@ fn r057_inbound_recovers_partial_native_firewall_commits_without_reusing_retired
     let dns = lab.exec(&["uci", "export", "dhcp"], None)?;
     let mut config = lab.inbound_configuration();
     lab.start_inbound(&config)?;
+    assert!(lab.inbound_probe("client")?.status.success());
     let active: Value =
         serde_json::from_slice(&lab.exec(&["cat", "/tmp/inbound-test/status.json"], None)?)?;
     lab.exec(
@@ -3093,8 +3705,68 @@ fn r057_inbound_recovers_partial_native_firewall_commits_without_reusing_retired
         !crashed.wait()?.success(),
         "the recovery fixture must exercise a hard crash"
     );
-    let mut state: Value =
-        serde_json::from_slice(&lab.exec(&["cat", "/tmp/inbound-test/state.json"], None)?)?;
+    let journal = lab.exec(&["cat", "/tmp/inbound-test/state.json"], None)?;
+    let fw4_policy = || -> TestResult<Value> {
+        let mut value: Value = serde_json::from_slice(&lab.exec(
+            &["nft", "-j", "-s", "-a", "list", "table", "inet", "fw4"],
+            None,
+        )?)?;
+        let objects = value["nftables"]
+            .as_array_mut()
+            .ok_or("missing fw4 objects")?;
+        // Cache replacement may change the flowtable and offload rule handles.
+        // Every other object, including the live NAT rule, must keep its handle.
+        objects.retain(|object| {
+            object["flowtable"]["name"] != "ft"
+                && !object["rule"]["expr"].as_array().is_some_and(|expr| {
+                    expr.iter().any(|entry| entry["flow"]["flowtable"] == "@ft")
+                })
+        });
+        Ok(value)
+    };
+    let verify_flowtable = || -> TestResult {
+        if let Some(expected) = &initial_flowtable {
+            assert_eq!(&flowtable()?, expected);
+        }
+        Ok(())
+    };
+    for chain in [None, Some("dstnat"), Some("dstnat_wan")] {
+        let probe = if let Some(chain) = chain {
+            shadow_wan_tcp(&lab, chain, 18080)?;
+            "native_tcp_redirect_missing"
+        } else {
+            restrict_wan_dispatch(&lab, "meta nfproto ipv4")?;
+            "native_wan_dispatch_restricted"
+        };
+        assert!(lab.inbound_probe(probe)?.status.success());
+        let restricted = fw4_policy()?;
+        let saved_firewall = lab.exec(&["uci", "export", "firewall"], None)?;
+        for _ in 0..2 {
+            let restarted = lab.raw_with_deadline(
+                &[
+                    "/usr/bin/tunnel-detour",
+                    "--inbound-config",
+                    "/tmp/inbound-config.json",
+                ],
+                None,
+                "8",
+            )?;
+            assert_eq!(restarted.status.code(), Some(1));
+            assert!(String::from_utf8_lossy(&restarted.stderr).contains("kernel_conflict"));
+            assert_eq!(fw4_policy()?, restricted);
+            assert_eq!(
+                lab.exec(&["uci", "export", "firewall"], None)?,
+                saved_firewall
+            );
+            assert_eq!(
+                lab.exec(&["cat", "/tmp/inbound-test/state.json"], None)?,
+                journal
+            );
+            assert!(lab.inbound_probe(probe)?.status.success());
+        }
+        lab.exec(&["fw4", "reload"], None)?;
+    }
+    let mut state: Value = serde_json::from_slice(&journal)?;
     assert_eq!(state["admissions"], json!({"sample":1}));
     config["rules"][0]["public_port"] = json!(18082);
     let mut extra = config["rules"][0].clone();
@@ -3127,6 +3799,73 @@ fn r057_inbound_recovers_partial_native_firewall_commits_without_reusing_retired
     lab.exec(&["nft", "--file", "-"], Some(b"flush chain inet tunnel_detour_inbound authorized\nadd rule inet tunnel_detour_inbound authorized drop\n"))?;
     lab.exec(&["uci", "batch"], Some(b"delete firewall.td_in_sample_0\nset firewall.td_in_extra_0=redirect\nset firewall.td_in_extra_0.name='Tunnel Detour: Additional publication'\nset firewall.td_in_extra_0.enabled='1'\nset firewall.td_in_extra_0.family='ipv6'\nset firewall.td_in_extra_0.src='wan'\nset firewall.td_in_extra_0.dest='lan'\nset firewall.td_in_extra_0.src_dip='2001:db8:2::1'\nset firewall.td_in_extra_0.src_dport='18083'\nset firewall.td_in_extra_0.dest_ip='2001:db8:1::2'\nset firewall.td_in_extra_0.dest_port='8080'\nset firewall.td_in_extra_0.proto='tcp'\nset firewall.td_in_extra_0.target='DNAT'\nset firewall.td_in_extra_0.reflection='0'\nset firewall.td_in_extra_0.mark='1413742595/0xffffffff'\ncommit firewall\n"))?;
     lab.exec(&["fw4", "reload"], None)?;
+    lab.exec(
+        &["tee", "/tmp/inbound-config.json"],
+        Some(&serde_json::to_vec(&config)?),
+    )?;
+    // A known partial commit must not authorize removing a live administrator
+    // rule. Retry after the laboratory administrator withdraws the restriction.
+    shadow_wan_tcp(&lab, "dstnat", 18083)?;
+    let restricted = fw4_policy()?;
+    let partial_uci = lab.exec(&["uci", "export", "firewall"], None)?;
+    let partial_journal: Value =
+        serde_json::from_slice(&lab.exec(&["cat", "/tmp/inbound-test/state.json"], None)?)?;
+    for _ in 0..2 {
+        let blocked = lab.raw_with_deadline(
+            &[
+                "/usr/bin/tunnel-detour",
+                "--inbound-config",
+                "/tmp/inbound-config.json",
+            ],
+            None,
+            "8",
+        )?;
+        assert_eq!(blocked.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&blocked.stderr).contains("kernel_conflict"));
+        assert_eq!(fw4_policy()?, restricted);
+        assert_eq!(lab.exec(&["uci", "export", "firewall"], None)?, partial_uci);
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &lab.exec(&["cat", "/tmp/inbound-test/state.json"], None)?
+            )?,
+            partial_journal
+        );
+        verify_flowtable()?;
+        assert!(
+            lab.inbound_probe("native_candidate_closed")?
+                .status
+                .success()
+        );
+    }
+    lab.exec(&["fw4", "reload"], None)?;
+    lab.exec(
+        &["nft", "-f", "-"],
+        Some(b"insert rule inet fw4 forward iifname \"tdwan0\" meta nfproto ipv6 meta l4proto tcp ct original proto-dst 18083 reject with tcp reset comment \"lab recovered forward restriction\"\n"),
+    )?;
+    let forward_policy = || -> TestResult<(usize, Value)> {
+        let listing: Value = serde_json::from_slice(&lab.exec(
+            &[
+                "nft", "-j", "-s", "-a", "list", "chain", "inet", "fw4", "forward",
+            ],
+            None,
+        )?)?;
+        listing["nftables"]
+            .as_array()
+            .and_then(|items| {
+                items.iter().enumerate().find_map(|(index, item)| {
+                    let rule = &item["rule"];
+                    (rule["comment"] == "lab recovered forward restriction")
+                        .then(|| (index, rule.clone()))
+                })
+            })
+            .ok_or_else(|| "missing recovery forward restriction".into())
+    };
+    let forward_before = forward_policy()?;
+    assert!(
+        lab.inbound_probe("native_candidate_closed")?
+            .status
+            .success()
+    );
     lab.start_inbound(&config)?;
     let recovered: Value =
         serde_json::from_slice(&lab.exec(&["cat", "/tmp/inbound-test/state.json"], None)?)?;
@@ -3141,6 +3880,28 @@ fn r057_inbound_recovers_partial_native_firewall_commits_without_reusing_retired
         sample > 3 && extra > 3 && sample != extra,
         "interrupted generations must never be reused"
     );
+    assert_eq!(forward_policy()?, forward_before);
+    assert!(
+        lab.inbound_probe("native_candidate_closed")?
+            .status
+            .success()
+    );
+    let handle = forward_before.1["handle"]
+        .as_u64()
+        .ok_or("missing forward restriction handle")?;
+    lab.exec(
+        &[
+            "nft",
+            "delete",
+            "rule",
+            "inet",
+            "fw4",
+            "forward",
+            "handle",
+            &handle.to_string(),
+        ],
+        None,
+    )?;
     let traffic = lab.inbound_probe("updated_client")?;
     assert!(
         traffic.status.success(),
@@ -3167,7 +3928,213 @@ fn r057_inbound_recovers_partial_native_firewall_commits_without_reusing_retired
         foreign_nft
     );
     assert_eq!(lab.exec(&["uci", "export", "dhcp"], None)?, dns);
+    shadow_wan_tcp(&lab, "dstnat", 18083)?;
+    let restricted = fw4_policy()?;
+    let saved_uci = lab.exec(&["uci", "export", "firewall"], None)?;
+    let ready: Value =
+        serde_json::from_slice(&lab.exec(&["cat", "/tmp/inbound-test/status.json"], None)?)?;
+    let pid = ready["process_id"].as_u64().ok_or("missing inbound PID")?;
+    lab.exec(&["kill", "-TERM", &pid.to_string()], None)?;
+    let mut stopped = lab
+        .background
+        .borrow_mut()
+        .pop()
+        .ok_or("missing inbound controller")?;
+    wait(|| Ok(stopped.try_wait()?.is_some()))?;
+    let stopped = stopped.wait_with_output()?;
+    assert_eq!(stopped.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&stopped.stderr).contains("kernel_conflict"));
+    assert_eq!(fw4_policy()?, restricted);
+    assert_eq!(lab.exec(&["uci", "export", "firewall"], None)?, saved_uci);
+    verify_flowtable()?;
+    assert!(
+        lab.inbound_probe("native_candidate_closed")?
+            .status
+            .success()
+    );
+
+    lab.exec(&["fw4", "reload"], None)?;
+    lab.start_inbound(&config)?;
+    verify_concurrent_nat_edit(&lab)?;
+    lab.exec(&["fw4", "reload"], None)?;
+    lab.start_inbound(&config)?;
+    verify_named_dnat_counter_preserved(&lab)?;
+    lab.exec(&["fw4", "reload"], None)?;
+    lab.start_inbound(&config)?;
+    assert!(lab.inbound_probe("updated_client")?.status.success());
+    let counted = r057_redirect(&lab, false)?;
+    assert!(
+        counted["expr"]
+            .as_array()
+            .is_some_and(|expr| expr.iter().any(|entry| {
+                entry["counter"]["packets"]
+                    .as_u64()
+                    .is_some_and(|packets| packets > 0)
+                    && entry["counter"]["bytes"]
+                        .as_u64()
+                        .is_some_and(|bytes| bytes > 0)
+            })),
+        "the canonical redirect must count actual traffic before withdrawal"
+    );
     lab.stop_inbound()?;
+    assert!(
+        !lab.raw(&["uci", "get", "firewall.td_in_extra_0"], None)?
+            .status
+            .success()
+    );
+    assert!(
+        lab.inbound_probe("native_candidate_closed")?
+            .status
+            .success()
+    );
+    Ok(())
+}
+
+fn r057_redirect(lab: &Lab, stateless: bool) -> TestResult<Value> {
+    let mut options = vec!["nft", "-j", "-a"];
+    if stateless {
+        options.push("-s");
+    }
+    options.extend(["list", "chain", "inet", "fw4", "dstnat_wan"]);
+    let listing: Value = serde_json::from_slice(&lab.exec(&options, None)?)?;
+    listing["nftables"]
+        .as_array()
+        .and_then(|items| {
+            items.iter().find_map(|entry| {
+                let rule = &entry["rule"];
+                (rule["comment"] == "!fw4: Tunnel Detour: Additional publication")
+                    .then(|| rule.clone())
+            })
+        })
+        .ok_or_else(|| "missing owned rule selected for the redirect test".into())
+}
+
+fn stop_json_controller(lab: &Lab) -> TestResult<Output> {
+    let ready: Value =
+        serde_json::from_slice(&lab.exec(&["cat", "/tmp/inbound-test/status.json"], None)?)?;
+    let pid = ready["process_id"].as_u64().ok_or("missing ready PID")?;
+    lab.exec(&["kill", "-TERM", &pid.to_string()], None)?;
+    let mut controller = lab
+        .background
+        .borrow_mut()
+        .pop()
+        .ok_or("missing controller")?;
+    wait(|| Ok(controller.try_wait()?.is_some()))?;
+    Ok(controller.wait_with_output()?)
+}
+
+fn verify_concurrent_nat_edit(lab: &Lab) -> TestResult {
+    let original = r057_redirect(lab, true)?;
+    let mut replacement = original.clone();
+    replacement["expr"]
+        .as_array_mut()
+        .ok_or("missing DNAT expression")?
+        .insert(
+            0,
+            json!({
+                "match":{"op":"==","left":{"payload":{"protocol":"ip6","field":"saddr"}},
+                "right":"2001:db8:2::2"}
+            }),
+        );
+    lab.exec(
+        &["tee", "/tmp/r057-edit.json"],
+        Some(&serde_json::to_vec(
+            &json!({"nftables":[{"replace":{"rule":replacement}}]}),
+        )?),
+    )?;
+    let stopped = lab.with_command_fault(
+        "uci",
+        "r057-commit",
+        r#"if [ "$1" = '-t' ] && [ "$3" = commit ] && [ "$4" = firewall ]; then
+  "$REAL" "$@" || exit
+  nft -j -f /tmp/r057-edit.json || exit
+  touch /tmp/r057-concurrent-edit
+  exit
+fi"#,
+        || stop_json_controller(lab),
+    )?;
+    lab.exec(&["test", "-e", "/tmp/r057-concurrent-edit"], None)?;
+    assert_owned_rule_conflict(stopped);
+    let actual = r057_redirect(lab, true)?;
+    assert_eq!(actual["handle"], original["handle"]);
+    assert_eq!(actual["expr"], replacement["expr"]);
+    assert!(
+        lab.inbound_probe("native_candidate_closed")?
+            .status
+            .success()
+    );
+    Ok(())
+}
+
+fn assert_owned_rule_conflict(stopped: Output) {
+    assert_eq!(stopped.status.code(), Some(1));
+    let diagnostic = String::from_utf8_lossy(&stopped.stderr);
+    assert!(
+        diagnostic.contains("kernel_conflict") && diagnostic.contains("nat_stage=owned_rule"),
+        "{diagnostic}"
+    );
+}
+
+fn verify_named_dnat_counter_preserved(lab: &Lab) -> TestResult {
+    let original = r057_redirect(lab, true)?;
+    let mut replacement = original.clone();
+    let expressions = replacement["expr"]
+        .as_array_mut()
+        .ok_or("missing DNAT expression")?;
+    let action = expressions
+        .iter()
+        .position(|entry| entry.get("dnat").is_some())
+        .ok_or("missing DNAT action")?;
+    expressions.insert(action, json!({"counter":"r057_admin"}));
+    let batch = json!({"nftables":[
+        {"add":{"counter":{"family":"inet","table":"fw4","name":"r057_admin"}}},
+        {"replace":{"rule":replacement}}
+    ]});
+    lab.exec(
+        &["nft", "-j", "-f", "-"],
+        Some(&serde_json::to_vec(&batch)?),
+    )?;
+    assert!(lab.inbound_probe("updated_client")?.status.success());
+    let counters = || -> TestResult<Value> {
+        Ok(serde_json::from_slice(&lab.exec(
+            &[
+                "nft",
+                "-j",
+                "-a",
+                "list",
+                "counter",
+                "inet",
+                "fw4",
+                "r057_admin",
+            ],
+            None,
+        )?)?)
+    };
+    let observed = counters()?;
+    assert!(
+        observed["nftables"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|entry| {
+                entry["counter"]["packets"]
+                    .as_u64()
+                    .is_some_and(|packets| packets > 0)
+            })),
+        "the preserved rule must have fed the administrator's counter"
+    );
+    assert_owned_rule_conflict(stop_json_controller(lab)?);
+    let actual = r057_redirect(lab, true)?;
+    assert_eq!(actual["handle"], original["handle"]);
+    assert_eq!(actual["expr"], replacement["expr"]);
+    assert!(
+        lab.inbound_probe("native_candidate_closed")?
+            .status
+            .success()
+    );
+    assert_eq!(
+        counters()?,
+        observed,
+        "the fenced publication cannot feed the administrator's counter"
+    );
     Ok(())
 }
 
@@ -3281,7 +4248,8 @@ fn r116_native_ipv6_opt_in_restarts_for_family_changes_preserves_cached_ipv4_and
                     .success())
             })?;
         }
-        lab.change("set tunnel-detour.globals.ipv6_enabled='1'\nset tunnel-detour.globals.wan6_network='wan6'\nset tunnel-detour.ipv6only=exception\nset tunnel-detour.ipv6only.pattern='ipv6-only.example.net'\nset tunnel-detour.ipv6only.enabled='1'")?;
+        let enable = if adguard { "1" } else { "on" };
+        lab.change(&format!("set tunnel-detour.globals.enabled='{enable}'\nset tunnel-detour.globals.ipv6_enabled='1'\nset tunnel-detour.globals.wan6_network='wan6'\nset tunnel-detour.ipv6only=exception\nset tunnel-detour.ipv6only.pattern='ipv6-only.example.net'\nset tunnel-detour.ipv6only.enabled='1'"))?;
         let dual = lab.ready(Some(first))?;
         let status = lab.ubus("tunnel-detour", "status", json!({}))?;
         assert_eq!(status["status"]["ipv6_wan_source"], "2001:db8:2::1");
@@ -3420,6 +4388,10 @@ fn r095_native_resolver_reload_preserves_established_tcp_and_requires_explicit_r
             lab.configure_dnsmasq()?;
         }
         let pid = lab.ready(None)?;
+        lab.change("set tunnel-detour.globals.observability='1'")?;
+        wait(|| {
+            Ok(lab.ubus("tunnel-detour", "status", json!({}))?["status"]["observability"] == true)
+        })?;
         let marker = |name: &str| -> TestResult {
             wait(|| {
                 Ok(lab
@@ -3584,12 +4556,38 @@ fn r095_native_resolver_reload_preserves_established_tcp_and_requires_explicit_r
                     .contains(&json!("tcp://[::1]:15355"))
             );
         }
+        let dns_status = || -> TestResult<Value> {
+            Ok(serde_json::from_slice(&lab.exec(
+                &["cat", "/var/run/tunnel-detour/status.json"],
+                None,
+            )?)?)
+        };
+        // A fresh transfer yields visible details even if the AdGuard audit
+        // paused a previous period. Keep the original streams held as well.
+        assert!(lab.lookup("selected.example.net")?.contains("198.18."));
+        assert!(lab.inbound_probe("dns_once")?.status.success());
+        wait(|| {
+            Ok(current()?["status"]["completed_connections"]
+                .as_u64()
+                .is_some_and(|completed| completed > 0))
+        })?;
         lab.change("set tunnel-detour.globals.real_upstream='203.0.113.2:53'")?;
         wait(|| Ok(current()?["status"]["last_error"] == "resolver_route_unavailable"))?;
-        assert_eq!(current()?["status"]["applied_resolver"], "[::1]:15355");
-        assert_eq!(current()?["status"]["configuration_applied"], false);
+        let rejected = current()?;
+        assert_eq!(rejected["status"]["process_id"], pid);
+        assert_eq!(rejected["status"]["applied_resolver"], "[::1]:15355");
+        assert_eq!(rejected["status"]["configuration_applied"], false);
+        assert_eq!(rejected["observability_requested"], true);
+        for state in [&rejected["status"], &dns_status()?] {
+            assert_diagnostics_off(
+                state,
+                &["dns_queries", "connections", "completed_connections"],
+            );
+        }
         lab.change("set tunnel-detour.globals.real_upstream='[::1]:15355'")?;
         applied("[::1]:15355")?;
+        assert_eq!(current()?["status"]["connections"], json!({}));
+        assert_eq!(current()?["status"]["completed_connections"], 0);
         for stem in ["dns-reloading", "dns-holding"] {
             lab.exec(&["touch", &format!("/tmp/inbound-test/check-{stem}")], None)?;
             marker(&format!("{stem}-complete"))?;
@@ -3714,8 +4712,1689 @@ fn r056_uci_ports_and_dns_run_independently_and_port_edits_preserve_existing_dns
         "UCI re-enable must restore real TCP and UDP traffic without a manual service start: {}",
         String::from_utf8_lossy(&restored.stderr)
     );
+
+    lab.change("set tunnel-detour.globals.enabled='1'")?;
+    let dns_pid = lab.ready(None)?;
+    let inode = |path| lab.exec(&["ls", "-i", path], None);
+    let table = |name| lab.exec(&["nft", "-s", "-a", "list", "table", "inet", name], None);
+    let dns_status = "/var/run/tunnel-detour/status.json";
+    let inbound_status = "/var/run/tunnel-detour/inbound/status.json";
+    let initial_dns_guard = table("tunnel_detour")?;
+    let mut dns_snapshot = inode(dns_status)?;
+    for enabled in [true, false] {
+        let consent = u8::from(enabled);
+        lab.change(&format!(
+            "set tunnel-detour.inbound.observability='{consent}'"
+        ))?;
+        wait(|| {
+            assert!(
+                lab.lookup("selected.example.net")?.contains("198.18.0.1"),
+                "DNS must answer a selected query during an inbound-only Apply"
+            );
+            let connection = lab.inbound_probe("dns_once")?;
+            assert!(
+                connection.status.success(),
+                "DNS must admit a new WAN connection during an inbound-only Apply: {}",
+                String::from_utf8_lossy(&connection.stderr)
+            );
+            let result = lab.ubus("tunnel-detour", "inbound_status", json!({}))?;
+            Ok(result["status"]["observability"] == enabled
+                && result["observability_revocation_pending"] == false
+                && inode(dns_status)? != dns_snapshot)
+        })?;
+        dns_snapshot = inode(dns_status)?;
+        assert_eq!(
+            table("tunnel_detour")?,
+            initial_dns_guard,
+            "inbound consent Apply must not reinstall the DNS guard"
+        );
+    }
+    assert_eq!(
+        lab.ubus("tunnel-detour", "status", json!({}))?["status"]["process_id"],
+        dns_pid
+    );
+
+    // A native fw4 reload replaces handles but leaves the same effective policy.
+    lab.exec(&["fw4", "reload"], None)?;
+    let native_guard = table("tunnel_detour_inbound")?;
+    let fw4 = table("fw4")?;
+    let inbound_snapshot = inode(inbound_status)?;
+    let inbound_pid = ready_ports()?["status"]["process_id"].clone();
+    lab.change("set tunnel-detour.globals.observability='1'")?;
+    wait(|| {
+        let reply = lab.inbound_probe("client")?;
+        assert!(
+            reply.status.success(),
+            "native publications must admit new TCP and UDP traffic during a DNS-only Apply: {}",
+            String::from_utf8_lossy(&reply.stderr)
+        );
+        let result = lab.ubus("tunnel-detour", "status", json!({}))?;
+        Ok(result["status"]["observability"] == true && inode(inbound_status)? != inbound_snapshot)
+    })?;
+    assert_eq!(ready_ports()?["status"]["process_id"], inbound_pid);
+    assert_eq!(
+        table("tunnel_detour_inbound")?,
+        native_guard,
+        "DNS consent Apply must not reinstall the inbound guard"
+    );
+    assert_eq!(table("fw4")?, fw4, "DNS consent Apply must not reload fw4");
+
+    let chain = |name| -> TestResult<Value> {
+        Ok(serde_json::from_slice(&lab.exec(
+            &[
+                "nft", "-j", "-s", "-a", "list", "chain", "inet", "fw4", name,
+            ],
+            None,
+        )?)?)
+    };
+    let admin_rule = || -> TestResult<Value> {
+        let current = chain("input_wan")?;
+        let mut rule = current["nftables"]
+            .as_array()
+            .and_then(|objects| {
+                objects.iter().find_map(|object| {
+                    (object["rule"]["comment"] == "!fw4: Allow-ICMPv6-ND")
+                        .then(|| object["rule"].clone())
+                })
+            })
+            .ok_or("missing administrator firewall rule")?;
+        rule.as_object_mut()
+            .ok_or("invalid administrator rule")?
+            .remove("handle");
+        Ok(rule)
+    };
+    let administrator = admin_rule()?;
+    lab.exec(
+        &["nft", "-f", "-"],
+        Some(b"add table inet td_r056_admin\nadd chain inet td_r056_admin marker\n"),
+    )?;
+    let administrator_table = table("td_r056_admin")?;
+    let nat_chain = chain("dstnat_wan")?;
+    let tcp_redirects: Vec<_> = nat_chain["nftables"]
+        .as_array()
+        .ok_or("missing native DNAT listing")?
+        .iter()
+        .filter_map(|object| object.get("rule"))
+        .filter(|rule| rule["comment"] == "!fw4: Tunnel Detour: Renamed publication")
+        .filter(|rule| {
+            rule["expr"].as_array().is_some_and(|expr| {
+                expr.iter().any(|entry| entry.get("dnat").is_some())
+                    && expr.iter().any(|entry| {
+                        entry["match"]["left"]["payload"]
+                            == json!({"protocol":"tcp","field":"dport"})
+                            && entry["match"]["right"] == 18080
+                    })
+            })
+        })
+        .cloned()
+        .collect();
+    let [tcp_rule] = tcp_redirects.as_slice() else {
+        return Err("expected exactly one owned TCP DNAT rule".into());
+    };
+    let handle = tcp_rule["handle"].as_u64().ok_or("missing DNAT handle")?;
+    lab.exec(
+        &[
+            "nft",
+            "delete",
+            "rule",
+            "inet",
+            "fw4",
+            "dstnat_wan",
+            "handle",
+            &handle.to_string(),
+        ],
+        None,
+    )?;
+    let denied = lab.inbound_probe("native_tcp_redirect_missing")?;
+    assert!(
+        denied.status.success(),
+        "missing TCP DNAT must fail closed while UDP still reaches the native backend: {}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    lab.exec(
+        &["nft", "-f", "-"],
+        Some(b"insert rule inet fw4 forward iifname \"tdwan0\" ip6 daddr 2001:db8:1::2 tcp dport 8080 reject with tcp reset comment \"lab live forward restriction\"\n"),
+    )?;
+    let forward_restriction = || -> TestResult<(usize, Value)> {
+        let inventory = chain("forward")?;
+        inventory["nftables"]
+            .as_array()
+            .and_then(|items| {
+                items.iter().enumerate().find_map(|(index, item)| {
+                    let rule = &item["rule"];
+                    (rule["comment"] == "lab live forward restriction")
+                        .then(|| (index, rule.clone()))
+                })
+            })
+            .ok_or_else(|| "missing live forward restriction".into())
+    };
+    let restriction = forward_restriction()?;
+    let revision = ready_ports()?["status"]["revision"]
+        .as_u64()
+        .ok_or("missing pre-repair inbound revision")?;
+    lab.exec(&["/etc/init.d/tunnel-detour-inbound", "reload"], None)?;
+    wait(|| {
+        let state = lab.ubus("tunnel-detour", "inbound_status", json!({}))?;
+        Ok(state["status"]["applied"] == true
+            && state["status"]["revision"]
+                .as_u64()
+                .is_some_and(|current| current > revision))
+    })?;
+    assert_eq!(forward_restriction()?, restriction);
+    assert!(
+        lab.inbound_probe("native_tcp_redirect_missing")?
+            .status
+            .success(),
+        "the live forward restriction must still deny TCP after repair while UDP remains available"
+    );
+    let restriction_handle = restriction.1["handle"]
+        .as_u64()
+        .ok_or("missing live forward handle")?;
+    lab.exec(
+        &[
+            "nft",
+            "delete",
+            "rule",
+            "inet",
+            "fw4",
+            "forward",
+            "handle",
+            &restriction_handle.to_string(),
+        ],
+        None,
+    )?;
+    let restored = lab.inbound_probe("client")?;
+    assert!(
+        restored.status.success(),
+        "reloading unchanged UCI must restore the missing DNAT and real TCP delivery: {}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert_eq!(ready_ports()?["status"]["process_id"], inbound_pid);
+    assert_eq!(admin_rule()?, administrator);
+    assert_eq!(table("td_r056_admin")?, administrator_table);
+
+    let log_sequence = std::cell::Cell::new(0_u32);
+    let mark_nat_log = || -> TestResult<String> {
+        let next = log_sequence.get() + 1;
+        log_sequence.set(next);
+        let marker = format!("r056 NAT check {next} begins");
+        lab.exec(&["logger", "-t", "r056-fixture", &marker], None)?;
+        Ok(marker)
+    };
+    let verify_nat_log = |marker: &str, stage| -> TestResult {
+        let expected = format!("nat_stage=\"{stage}\"");
+        wait(|| {
+            let logs = String::from_utf8(lab.exec(&["logread"], None)?)?;
+            Ok(logs
+                .lines()
+                .skip_while(|line| !line.contains(marker))
+                .skip(1)
+                .find(|line| line.contains("inbound reconciliation failed"))
+                .is_some_and(|line| {
+                    line.contains("kernel_conflict")
+                        && line.contains(&expected)
+                        && !line.contains("2001:db8")
+                        && !line.contains("18080")
+                }))
+        })
+    };
+
+    let independent_publication = || -> TestResult {
+        lab.exec(
+            &["uci", "batch"],
+            Some(b"set tunnel-detour.independent=inbound_port\nset tunnel-detour.independent.name='Other publication'\nset tunnel-detour.independent.enabled='1'\nset tunnel-detour.independent.protocol='tcp'\nset tunnel-detour.independent.public_port='18081'\nset tunnel-detour.independent.destination_address='2001:db8:1::2'\nset tunnel-detour.independent.destination_port='8080'\ncommit tunnel-detour\n"),
+        )?;
+        Ok(())
+    };
+    // Neither a different publication edit nor a failed read can turn a
+    // recognizable restricted rule into a repairable absence.
+    for fault in [
+        None,
+        Some("exit 1"),
+        Some("printf 'invalid JSON\\n'; exit 0"),
+        Some("exec sleep 20"),
+    ] {
+        let repaired_chain = chain("dstnat_wan")?;
+        let mut restricted_tcp = repaired_chain["nftables"]
+            .as_array()
+            .ok_or("missing repaired DNAT listing")?
+            .iter()
+            .filter_map(|object| object.get("rule"))
+            .find(|rule| rule["comment"] == tcp_rule["comment"] && rule["expr"] == tcp_rule["expr"])
+            .cloned()
+            .ok_or("missing repaired TCP DNAT")?;
+        restricted_tcp["expr"]
+            .as_array_mut()
+            .ok_or("missing TCP DNAT expressions")?
+            .insert(0, json!({"match":{"op":"==","left":{"payload":{"protocol":"ip6","field":"saddr"}},"right":{"prefix":{"addr":"2001:db8:2::","len":64}}}}));
+        lab.exec(
+            &["nft", "-j", "-f", "-"],
+            Some(&serde_json::to_vec(
+                &json!({"nftables":[{"replace":{"rule":restricted_tcp}}]}),
+            )?),
+        )?;
+        let restricted_fw4 = table("fw4")?;
+        let restricted_guard = table("tunnel_detour_inbound")?;
+        let saved_firewall = lab.exec(&["uci", "export", "firewall"], None)?;
+        assert!(
+            lab.inbound_probe("native_tcp_redirect_missing")?
+                .status
+                .success()
+        );
+        let rejected = |stage| -> TestResult {
+            let marker = mark_nat_log()?;
+            lab.exec(&["/etc/init.d/tunnel-detour-inbound", "reload"], None)?;
+            wait(|| {
+                let state = lab.ubus("tunnel-detour", "inbound_status", json!({}))?;
+                Ok(state["status"]["last_error"] == "kernel_conflict"
+                    && state["status"]["applied"] == false
+                    && state["status"]["process_id"] == inbound_pid)
+            })?;
+            assert!(
+                lab.inbound_probe("native_tcp_redirect_missing")?
+                    .status
+                    .success()
+            );
+            assert_eq!(table("fw4")?, restricted_fw4);
+            assert_eq!(table("tunnel_detour_inbound")?, restricted_guard);
+            assert_eq!(
+                lab.exec(&["uci", "export", "firewall"], None)?,
+                saved_firewall
+            );
+            assert_eq!(table("td_r056_admin")?, administrator_table);
+            verify_nat_log(&marker, stage)
+        };
+        if let Some(fault) = fault {
+            let nft_path = String::from_utf8(
+                lab.exec(&["sh", "-c", "readlink -f \"$(command -v nft)\""], None)?,
+            )?;
+            let nft_path = nft_path.trim();
+            lab.exec(&["cp", nft_path, "/usr/libexec/r056-real-nft"], None)?;
+            lab.exec(&["rm", "-f", "/tmp/r056-nft-fault-observed"], None)?;
+            let script = format!(
+                "#!/bin/sh\ncase \"$*\" in\n  '-j -s -a list chain inet fw4 dstnat_wan') touch /tmp/r056-nft-fault-observed; {fault} ;;\nesac\nexec /usr/libexec/r056-real-nft \"$@\"\n"
+            );
+            lab.exec(
+                &["tee", "/usr/libexec/r056-nft-read-fault"],
+                Some(script.as_bytes()),
+            )?;
+            lab.exec(&["chmod", "755", "/usr/libexec/r056-nft-read-fault"], None)?;
+            lab.exec(
+                &[
+                    "mount",
+                    "--bind",
+                    "/usr/libexec/r056-nft-read-fault",
+                    nft_path,
+                ],
+                None,
+            )?;
+            let outcome = rejected("inspection");
+            let unmounted = lab.exec(&["umount", nft_path], None);
+            outcome?;
+            unmounted?;
+            lab.exec(&["test", "-e", "/tmp/r056-nft-fault-observed"], None)?;
+        } else {
+            independent_publication()?;
+            rejected("owned_rule")?;
+            lab.exec(
+                &["uci", "batch"],
+                Some(b"delete tunnel-detour.independent\ncommit tunnel-detour\n"),
+            )?;
+        }
+        lab.exec(&["fw4", "reload"], None)?;
+        lab.exec(&["/etc/init.d/tunnel-detour-inbound", "reload"], None)?;
+        wait(|| Ok(ready_ports()?["status"]["applied"] == true))?;
+    }
+
+    for chain_name in ["dstnat", "dstnat_wan"] {
+        shadow_wan_tcp(&lab, chain_name, 18080)?;
+        let restricted_fw4 = table("fw4")?;
+        let restricted_guard = table("tunnel_detour_inbound")?;
+        let saved_firewall = lab.exec(&["uci", "export", "firewall"], None)?;
+        assert!(
+            lab.inbound_probe("native_tcp_redirect_missing")?
+                .status
+                .success()
+        );
+
+        independent_publication()?;
+        let marker = mark_nat_log()?;
+        lab.exec(&["/etc/init.d/tunnel-detour-inbound", "reload"], None)?;
+        wait(|| {
+            let state = lab.ubus("tunnel-detour", "inbound_status", json!({}))?;
+            Ok(state["status"]["last_error"] == "kernel_conflict"
+                && state["status"]["applied"] == false
+                && state["status"]["process_id"] == inbound_pid)
+        })?;
+        assert!(
+            lab.inbound_probe("native_tcp_redirect_missing")?
+                .status
+                .success()
+        );
+        verify_nat_log(&marker, "rule_order")?;
+        assert_eq!(table("fw4")?, restricted_fw4);
+        assert_eq!(table("tunnel_detour_inbound")?, restricted_guard);
+        assert_eq!(table("td_r056_admin")?, administrator_table);
+        assert_eq!(
+            lab.exec(&["uci", "export", "firewall"], None)?,
+            saved_firewall
+        );
+
+        lab.exec(
+            &["uci", "batch"],
+            Some(b"delete tunnel-detour.independent\ncommit tunnel-detour\n"),
+        )?;
+        lab.exec(&["fw4", "reload"], None)?;
+        lab.exec(&["/etc/init.d/tunnel-detour-inbound", "reload"], None)?;
+        wait(|| Ok(ready_ports()?["status"]["applied"] == true))?;
+    }
+
+    // Foreign restrictions can leave the owned DNAT intact while excluding the
+    // external IPv6 client's traffic at the WAN dispatch.
+    for predicate in ["ip6 saddr 2001:db8:2::/64", "meta nfproto ipv4"] {
+        let nat_before = chain("dstnat_wan")?;
+        restrict_wan_dispatch(&lab, predicate)?;
+        assert_eq!(chain("dstnat_wan")?, nat_before);
+        let restricted_fw4 = table("fw4")?;
+        let restricted_guard = table("tunnel_detour_inbound")?;
+        let saved_firewall = lab.exec(&["uci", "export", "firewall"], None)?;
+        let denied = lab.inbound_probe("native_wan_dispatch_restricted")?;
+        assert!(
+            denied.status.success(),
+            "the WAN predicate {predicate} must exclude the external fixture client: {}",
+            String::from_utf8_lossy(&denied.stderr)
+        );
+
+        let marker = mark_nat_log()?;
+        lab.exec(&["/etc/init.d/tunnel-detour-inbound", "reload"], None)?;
+        wait(|| {
+            let state = lab.ubus("tunnel-detour", "inbound_status", json!({}))?;
+            Ok(state["running"] == true
+                && state["status"]["phase"] == "ready"
+                && state["status"]["applied"] == false
+                && state["status"]["last_error"] == "kernel_conflict"
+                && state["status"]["process_id"] == inbound_pid)
+        })?;
+        assert_eq!(table("fw4")?, restricted_fw4);
+        assert_eq!(table("tunnel_detour_inbound")?, restricted_guard);
+        assert_eq!(
+            lab.exec(&["uci", "export", "firewall"], None)?,
+            saved_firewall
+        );
+        assert_eq!(table("td_r056_admin")?, administrator_table);
+        verify_nat_log(&marker, "dispatch")?;
+        let denied = lab.inbound_probe("native_wan_dispatch_restricted")?;
+        assert!(
+            denied.status.success(),
+            "reload must preserve the foreign WAN predicate {predicate} for new TCP and UDP traffic: {}",
+            String::from_utf8_lossy(&denied.stderr)
+        );
+        lab.exec(&["fw4", "reload"], None)?;
+        lab.exec(&["/etc/init.d/tunnel-detour-inbound", "reload"], None)?;
+        wait(|| {
+            let state = lab.ubus("tunnel-detour", "inbound_status", json!({}))?;
+            Ok(state["status"]["applied"] == true && state["status"]["process_id"] == inbound_pid)
+        })?;
+    }
+
     lab.change("set tunnel-detour.inbound.enabled='0'")?;
     wait(|| Ok(lab.ubus("tunnel-detour", "inbound_status", json!({}))?["running"] == false))?;
+    Ok(())
+}
+
+#[track_caller]
+fn assert_diagnostics_off(status: &Value, fields: &[&str]) {
+    assert_eq!(
+        status["observability"], false,
+        "missing applied privacy state: {status}"
+    );
+    for field in fields {
+        assert!(
+            status.get(*field).is_none(),
+            "off snapshot contains {field}: {status}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the isolated OpenWrt management laboratory"]
+fn r153b_startup_cannot_scrub_an_active_dns_or_inbound_owner() -> TestResult {
+    const DNS: &str = "/var/run/tunnel-detour/status.json";
+    const INBOUND: &str = "/var/run/tunnel-detour/inbound/status.json";
+    let lab = Lab::create(true)?;
+    let read_status = |path: &str| -> TestResult<Value> {
+        Ok(serde_json::from_slice(&lab.exec(&["cat", path], None)?)?)
+    };
+    let reject_inbound_json = |path: &str, options: &[&str]| -> TestResult {
+        const CANDIDATE: &str = "/tmp/r153b-inbound-contender.json";
+        const JOURNAL: &str = "/tmp/r153b-inbound-contender/state.json";
+        let read = || -> TestResult<Option<Vec<u8>>> {
+            if lab.raw(&["test", "-e", path], None)?.status.success() {
+                Ok(Some(lab.exec(&["cat", path], None)?))
+            } else {
+                Ok(None)
+            }
+        };
+        let snapshot = read()?;
+        let resolved = String::from_utf8(lab.exec(&["readlink", "-f", path], None)?)?;
+        let mut config = lab.inbound_configuration();
+        config["state_file"] = json!(JOURNAL);
+        config["status_file"] = json!(resolved.trim());
+        lab.exec(&["tee", CANDIDATE], Some(&serde_json::to_vec(&config)?))?;
+        for option in options {
+            let result =
+                lab.raw_with_deadline(&["/usr/bin/tunnel-detour", option, CANDIDATE], None, "8")?;
+            assert_eq!(
+                result.status.code(),
+                Some(1),
+                "inbound candidate {option} accepted or failed unexpectedly: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&result.stderr).contains("inbound_configuration_failed")
+            );
+            assert_eq!(read()?, snapshot);
+        }
+        for candidate in [JOURNAL, &format!("{JOURNAL}.lock")] {
+            assert!(!lab.raw(&["test", "-e", candidate], None)?.status.success());
+        }
+        Ok(())
+    };
+    lab.inbound_endpoints()?;
+    // The reserved UCI paths below are independent of collisions between JSON
+    // controllers. First give the DNS JSON controller a live private snapshot.
+    const JSON_DNS: &str = "/tmp/r153b-json-dns/status.json";
+    let mut json_dns = json!({
+        "dns_listen": "127.0.0.1:15535", "proxy_listen": "0.0.0.0:15536",
+        "real_upstream": "127.0.0.1:15353", "observability": false,
+        "state_file": "/tmp/r153b-json-dns/leases.json", "status_file": JSON_DNS,
+        "fake_range": "198.18.2.0/28", "lan_device": "tdlan0",
+        "lan_networks": ["192.0.2.0/24"],
+        "wan": {"device":"tdwan0","gateway":null,"route_table":41874,"mark":21573,"rule_priority":11001},
+        "rules": [{"pattern":"selected.example.net","enabled":true}],
+        "limits": {"max_mappings":14}
+    });
+    const JSON_CONFIG: &str = "/tmp/r153b-json-dns-config.json";
+    lab.exec(&["tee", JSON_CONFIG], Some(&serde_json::to_vec(&json_dns)?))?;
+    let mut json_controller = lab
+        .background_command(&["/usr/bin/tunnel-detour", "--config", JSON_CONFIG])?
+        .spawn()?;
+    wait(|| {
+        if let Some(status) = json_controller.try_wait()? {
+            let mut diagnostic = String::new();
+            if let Some(stderr) = json_controller.stderr.take() {
+                stderr.take(8192).read_to_string(&mut diagnostic)?;
+            }
+            return Err(format!(
+                "JSON DNS exited before recording ownership: {status}: {diagnostic}"
+            )
+            .into());
+        }
+        Ok(read_status(JSON_DNS).is_ok_and(|status| status["phase"] == "ready"))
+    })?;
+    let json_pid = read_status(JSON_DNS)?["process_id"]
+        .as_u64()
+        .filter(|pid| *pid > 1)
+        .ok_or("missing JSON DNS controller")?
+        .to_string();
+    let owner = read_status(JSON_DNS)?["status_owner"].clone();
+    assert!(owner.as_array().is_some_and(|identity| identity.len() == 2));
+    let reject_with_owner = |observing: bool| -> TestResult {
+        lab.exec(&["kill", "-STOP", &json_pid], None)?;
+        let checked = (|| {
+            let status = read_status(JSON_DNS)?;
+            assert_eq!(status["status_owner"], owner);
+            assert_eq!(status["observability"], observing);
+            if !observing {
+                assert_diagnostics_off(&status, &["dns_queries", "connections"]);
+            }
+            reject_inbound_json(JSON_DNS, &["--check-inbound-config", "--inbound-config"])
+        })();
+        let resumed = lab.exec(&["kill", "-CONT", &json_pid], None);
+        checked?;
+        resumed?;
+        Ok(())
+    };
+    reject_with_owner(false)?;
+    lab.exec(&["kill", "-STOP", &json_pid], None)?;
+    let conflict_without_snapshot = (|| {
+        const SAVED: &str = "/tmp/r153b-json-dns/status.saved";
+        lab.exec(&["mv", JSON_DNS, SAVED], None)?;
+        let rejected =
+            reject_inbound_json(JSON_DNS, &["--check-inbound-config", "--inbound-config"]);
+        let restored = lab.exec(&["mv", SAVED, JSON_DNS], None);
+        rejected?;
+        restored?;
+        Ok::<_, Box<dyn Error>>(())
+    })();
+    let resumed = lab.exec(&["kill", "-CONT", &json_pid], None);
+    conflict_without_snapshot?;
+    resumed?;
+
+    json_dns["observability"] = json!(true);
+    lab.exec(&["tee", JSON_CONFIG], Some(&serde_json::to_vec(&json_dns)?))?;
+    lab.exec(&["kill", "-HUP", &json_pid], None)?;
+    wait(|| Ok(read_status(JSON_DNS)?["observability"] == true))?;
+    lab.exec(
+        &[
+            "nslookup",
+            "-retry=1",
+            "-timeout=2",
+            "-port=15535",
+            "-type=A",
+            "selected.example.net",
+            "127.0.0.1",
+        ],
+        None,
+    )?;
+    wait(|| {
+        Ok(read_status(JSON_DNS)?["dns_queries"]
+            .as_u64()
+            .is_some_and(|queries| queries > 0))
+    })?;
+    reject_with_owner(true)?;
+    json_dns["observability"] = json!(false);
+    lab.exec(&["tee", JSON_CONFIG], Some(&serde_json::to_vec(&json_dns)?))?;
+    lab.exec(&["kill", "-HUP", &json_pid], None)?;
+    wait(|| Ok(read_status(JSON_DNS)?["observability"] == false))?;
+    reject_with_owner(false)?;
+    lab.exec(&["kill", "-TERM", &json_pid], None)?;
+    wait(|| {
+        Ok(json_controller
+            .try_wait()?
+            .is_some_and(|status| status.success()))
+    })?;
+
+    lab.spawn_inbound_probe("relay_server")?;
+    wait(|| {
+        Ok(lab
+            .inbound_marker("td-in-lan", "test", "relay-endpoint-ready")?
+            .status
+            .success())
+    })?;
+    lab.prepare_inbound_uci()?;
+    lab.configure_dnsmasq()?;
+    lab.ready(None)?;
+    lab.change("set tunnel-detour.globals.observability='1'")?;
+    wait(|| Ok(read_status(DNS)?["observability"] == true))?;
+    lab.lookup("selected.example.net")?;
+    let dns_pid = read_status(DNS)?["process_id"]
+        .as_u64()
+        .ok_or("missing DNS PID")?
+        .to_string();
+    lab.exec(&["kill", "-STOP", &dns_pid], None)?;
+    let rejected = reject_inbound_json(DNS, &["--check-inbound-config", "--inbound-config"]);
+    lab.exec(&["kill", "-CONT", &dns_pid], None)?;
+    rejected?;
+    lab.change("set tunnel-detour.sample.protocol='tcp'\nset tunnel-detour.sample.destination_address='192.0.2.2'\nset tunnel-detour.inbound.enabled='1'\nset tunnel-detour.inbound.observability='1'")?;
+    wait(|| {
+        let status = lab.ubus("tunnel-detour", "inbound_status", json!({}))?;
+        let dns = lab.ubus("tunnel-detour", "status", json!({}))?;
+        Ok(status["status"]["applied"] == true
+            && status["status"]["observability"] == true
+            && dns["status"]["observability"] == true)
+    })?;
+    lab.lookup("selected.example.net")?;
+    assert!(lab.inbound_probe("relay_client")?.status.success());
+    wait(|| {
+        Ok(read_status(DNS)?["dns_queries"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+            && read_status(INBOUND)?["relay"]["completed"]
+                .as_u64()
+                .is_some_and(|count| count > 0))
+    })?;
+    for (file, mode, rpc, service, section, field) in [
+        (
+            DNS,
+            "--uci",
+            "status",
+            "tunnel-detour",
+            "globals",
+            "dns_queries",
+        ),
+        (
+            INBOUND,
+            "--inbound-uci",
+            "inbound_status",
+            "tunnel-detour-inbound",
+            "inbound",
+            "relay",
+        ),
+    ] {
+        let pid = read_status(file)?["process_id"]
+            .as_u64()
+            .filter(|pid| *pid > 1)
+            .ok_or("missing active controller")?;
+        lab.exec(&["kill", "-STOP", &pid.to_string()], None)?;
+        let snapshot = lab.exec(&["cat", file], None)?;
+        if file == DNS {
+            let contender_path = "/tmp/r153b-foreign-dns.json";
+            let resolved = String::from_utf8(lab.exec(&["readlink", "-f", DNS], None)?)?;
+            let config = json!({
+                "dns_listen": "127.0.0.1:15535", "proxy_listen": "0.0.0.0:15536",
+                "real_upstream": "127.0.0.1:15353",
+                "state_file": "/tmp/r153b-foreign-dns/leases.json",
+                "status_file": resolved.trim(), "observability": false,
+                "fake_range": "198.18.2.0/28", "lan_device": "tdlan0",
+                "lan_networks": ["192.0.2.0/24"],
+                "wan": {"device":"tdwan0","gateway":null,"route_table":41874,"mark":21573,"rule_priority":11001},
+                "rules": [{"pattern":"other.example.test","enabled":true}],
+                "limits": {"max_mappings":14}
+            });
+            lab.exec(
+                &["tee", contender_path],
+                Some(&serde_json::to_vec(&config)?),
+            )?;
+            let contender = lab.raw_with_deadline(
+                &["/usr/bin/tunnel-detour", "--config", contender_path],
+                None,
+                "8",
+            )?;
+            assert_eq!(contender.status.code(), Some(1));
+            assert!(String::from_utf8_lossy(&contender.stderr).contains("invalid_configuration"));
+            assert_eq!(lab.exec(&["cat", file], None)?, snapshot);
+        }
+        // Commit without running the reload script so the contender cannot rely on a marker.
+        let batch =
+            format!("set tunnel-detour.{section}.observability='0'\ncommit tunnel-detour\n");
+        lab.exec(&["uci", "batch"], Some(batch.as_bytes()))?;
+        let contender = lab.raw_with_deadline(&["/usr/bin/tunnel-detour", mode], None, "8")?;
+        assert_eq!(
+            contender.status.code(),
+            Some(1),
+            "duplicate controller did not exit with a startup error: {}",
+            String::from_utf8_lossy(&contender.stderr)
+        );
+        assert_eq!(lab.exec(&["cat", file], None)?, snapshot);
+        if file == INBOUND {
+            reject_inbound_json(file, &["--check-inbound-config", "--inbound-config"])?;
+        }
+        let visible = lab.ubus("tunnel-detour", rpc, json!({}))?;
+        assert_eq!(visible["observability_revocation_pending"], true);
+        assert_diagnostics_off(&visible["status"], &[field]);
+        lab.exec(&["kill", "-CONT", &pid.to_string()], None)?;
+        lab.exec(&[&format!("/etc/init.d/{service}"), "reload"], None)?;
+        wait(|| {
+            let visible = lab.ubus("tunnel-detour", rpc, json!({}))?;
+            Ok(visible["status"]["process_id"] == pid
+                && visible["observability_revocation_pending"] == false)
+        })?;
+        assert_diagnostics_off(&read_status(file)?, &[field]);
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the isolated OpenWrt management laboratory"]
+fn r155e_inbound_json_hup_rejects_a_fifo_without_blocking_active_publications() -> TestResult {
+    const CONFIG: &str = "/tmp/inbound-config.json";
+    const STATUS: &str = "/tmp/inbound-test/status.json";
+    let lab = Lab::create(true)?;
+    let status =
+        || -> TestResult<Value> { Ok(serde_json::from_slice(&lab.exec(&["cat", STATUS], None)?)?) };
+    lab.inbound_endpoints()?;
+    lab.spawn_inbound_probe("relay_server")?;
+    wait(|| {
+        Ok(lab
+            .inbound_marker("td-in-lan", "test", "relay-endpoint-ready")?
+            .status
+            .success())
+    })?;
+    let mut config = lab.inbound_configuration();
+    config["observability"] = json!(true);
+    config["lan_networks"] = json!(["2001:db8:1::/64", "192.0.2.0/24"]);
+    config["rules"][0]["protocol"] = json!("tcp");
+    config["rules"][0]["destination"] = json!("192.0.2.2:8080");
+    lab.start_inbound(&config)?;
+    lab.spawn_inbound_probe("relay_holding")?;
+    wait(|| {
+        Ok(status()?["relay"]["connections"]
+            .as_array()
+            .is_some_and(|sessions| sessions.len() == 1))
+    })?;
+    let before = status()?;
+    let pid = before["process_id"]
+        .as_u64()
+        .filter(|pid| *pid > 1)
+        .ok_or("missing active controller")?
+        .to_string();
+    lab.exec(&["rm", CONFIG], None)?;
+    lab.exec(&["mkfifo", CONFIG], None)?;
+    lab.exec(&["kill", "-HUP", &pid], None)?;
+    wait_for(Duration::from_secs(10), || {
+        let current = status()?;
+        Ok(current["observability"] == false && current["last_error"] == "invalid_configuration")
+    })?;
+    let after = status()?;
+    assert_diagnostics_off(&after, &["relay"]);
+    assert_eq!(after["phase"], "ready");
+    assert_eq!(after["process_id"], before["process_id"]);
+    assert_eq!(after["publications"], before["publications"]);
+    assert!(lab.inbound_probe("relay_client")?.status.success());
+    lab.inbound_marker("td-in-wan", "touch", "relay-client-release")?;
+    wait(|| {
+        Ok(lab
+            .inbound_marker("td-in-wan", "test", "relay-client-complete")?
+            .status
+            .success())
+    })?;
+    assert_diagnostics_off(&status()?, &["relay"]);
+    lab.stop_inbound()
+}
+
+#[test]
+#[ignore = "requires the isolated OpenWrt management laboratory"]
+fn r155g_inbound_json_startup_redacts_only_its_idle_snapshot_when_the_journal_is_corrupt()
+-> TestResult {
+    const CONFIG: &str = "/tmp/inbound-config.json";
+    const STATE: &str = "/tmp/inbound-test/state.json";
+    const STATUS: &str = "/tmp/inbound-test/status.json";
+    const FOREIGN: &str = "/tmp/inbound-test/foreign.json";
+    const CORRUPT: &[u8] = b"{incomplete";
+    let lab = Lab::create(true)?;
+    let status = || lab.exec(&["cat", STATUS], None);
+    lab.inbound_endpoints()?;
+    lab.spawn_inbound_probe("relay_server")?;
+    wait(|| {
+        Ok(lab
+            .inbound_marker("td-in-lan", "test", "relay-endpoint-ready")?
+            .status
+            .success())
+    })?;
+    let mut config = lab.inbound_configuration();
+    config["observability"] = json!(true);
+    config["lan_networks"] = json!(["2001:db8:1::/64", "192.0.2.0/24"]);
+    config["rules"][0]["protocol"] = json!("tcp");
+    config["rules"][0]["destination"] = json!("192.0.2.2:8080");
+    let controller = lab.background.borrow().len();
+    lab.start_inbound(&config)?;
+    lab.spawn_inbound_probe("relay_holding")?;
+    let mut live = Value::Null;
+    wait(|| {
+        live = serde_json::from_slice(&status()?)?;
+        Ok(live["relay"]["connections"]
+            .as_array()
+            .is_some_and(|sessions| sessions.len() == 1 && sessions[0]["client"].is_string()))
+    })?;
+    let pid = live["process_id"]
+        .as_u64()
+        .filter(|pid| *pid > 1)
+        .ok_or("missing active controller")?
+        .to_string();
+    // Let the bound controller audit its own locked snapshot before simulating a crash.
+    thread::sleep(Duration::from_secs(6));
+    let audited: Value = serde_json::from_slice(&status()?)?;
+    assert_eq!(audited["process_id"], live["process_id"]);
+    assert_eq!(audited["phase"], "ready");
+    assert!(lab.inbound_probe("relay_client")?.status.success());
+    lab.exec(&["kill", "-STOP", &pid], None)?;
+    let prior = status()?;
+    config["observability"] = json!(false);
+    lab.exec(&["tee", STATE], Some(CORRUPT))?;
+    let refused = |candidate: &Value| -> TestResult {
+        lab.exec(&["tee", CONFIG], Some(&serde_json::to_vec(candidate)?))?;
+        let failed = lab.raw_with_deadline(
+            &["/usr/bin/tunnel-detour", "--inbound-config", CONFIG],
+            None,
+            "5",
+        )?;
+        assert_eq!(failed.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&failed.stderr).lines().last(),
+            Some("Tunnel Detour daemon exited: inbound_configuration_failed")
+        );
+        Ok(())
+    };
+    refused(&config)?;
+    assert_eq!(status()?, prior, "the active owner holds this snapshot");
+    lab.exec(&["kill", "-KILL", &pid], None)?;
+    assert!(!lab.background.borrow_mut()[controller].wait()?.success());
+
+    lab.exec(&["cp", "-p", STATE, FOREIGN], None)?;
+    lab.exec(
+        &[
+            "cp",
+            "-p",
+            "/tmp/inbound-test/state.json.lock",
+            "/tmp/inbound-test/foreign.json.lock",
+        ],
+        None,
+    )?;
+    let mut foreign = config.clone();
+    foreign["state_file"] = json!(FOREIGN);
+    refused(&foreign)?;
+    assert_eq!(
+        status()?,
+        prior,
+        "an unrelated idle lock cannot grant ownership"
+    );
+
+    refused(&config)?;
+    let redacted = serde_json::from_slice(&status()?)?;
+    assert_diagnostics_off(&redacted, &["relay", "observability_owner"]);
+    assert_eq!(redacted["process_id"], live["process_id"]);
+    assert_eq!(redacted["publications"], live["publications"]);
+    assert_eq!(lab.exec(&["cat", STATE], None)?, CORRUPT);
+    assert_eq!(lab.exec(&["cat", FOREIGN], None)?, CORRUPT);
+    Ok(())
+}
+
+fn apply_coalesced_revocation(
+    lab: &Lab,
+    pid: u64,
+    service: &str,
+    section: &str,
+    method: &str,
+    fields: &[&str],
+) -> TestResult {
+    assert!(pid > 1, "expected the active fixture controller");
+    let directory = if section == "inbound" {
+        "/var/run/tunnel-detour/inbound"
+    } else {
+        "/var/run/tunnel-detour"
+    };
+    let locker = lab
+        .background_command(&[
+            "env",
+            "TUNNEL_DETOUR_INBOUND_PROBE=observability_lock",
+            "flock",
+            "-x",
+            directory,
+            "/usr/libexec/tunnel-detour-test-fixture",
+            "--ignored",
+            "--exact",
+            "r052_native_tcp_udp_publications_preserve_client_identity_and_return_through_wan",
+        ])?
+        .spawn()?;
+    let locker_index = lab.background.borrow().len();
+    lab.background.borrow_mut().push(locker);
+    wait(|| {
+        Ok(lab
+            .raw(&["test", "-e", "/tmp/observability-lock-ready"], None)?
+            .status
+            .success())
+    })?;
+    if section == "inbound" {
+        assert!(lab.inbound_probe("relay_client")?.status.success());
+    } else {
+        assert!(lab.lookup("selected.example.net")?.contains("198.18.0.1"));
+    }
+    lab.exec(&["kill", "-STOP", &pid.to_string()], None)?;
+    for value in ["0", "1"] {
+        let batch =
+            format!("set tunnel-detour.{section}.observability='{value}'\ncommit tunnel-detour\n");
+        lab.exec(&["uci", "batch"], Some(batch.as_bytes()))?;
+        let reloaded =
+            lab.raw_with_deadline(&[&format!("/etc/init.d/{service}"), "reload"], None, "5")?;
+        assert!(
+            reloaded.status.success(),
+            "{service} reload returned {} with a held directory lock: {}",
+            reloaded.status,
+            String::from_utf8_lossy(&reloaded.stderr)
+        );
+        let rpc = lab.raw_with_deadline(
+            &["ubus", "-S", "call", "tunnel-detour", method, "{}"],
+            None,
+            "5",
+        )?;
+        assert!(
+            rpc.status.success(),
+            "{method} returned {} with a held directory lock: {}",
+            rpc.status,
+            String::from_utf8_lossy(&rpc.stderr)
+        );
+        let visible: Value = serde_json::from_slice(&rpc.stdout)?;
+        assert_eq!(visible["observability_revocation_pending"], true);
+        assert_eq!(visible["observability_requested"], value == "1");
+        assert_diagnostics_off(&visible["status"], fields);
+        assert_eq!(visible["status"]["process_id"], pid);
+    }
+    let acknowledged = finish_coalesced_revocation(lab, pid, service, method);
+    let lock_still_held = lab.background.borrow_mut()[locker_index]
+        .try_wait()?
+        .is_none();
+    lab.exec(&["touch", "/tmp/observability-lock-release"], None)?;
+    assert!(
+        lock_still_held,
+        "revocation waited for the obsolete directory lock to be released"
+    );
+    acknowledged
+}
+
+fn mount_status_quota(lab: &Lab, directory: &str) -> TestResult {
+    lab.exec(
+        &[
+            "sh",
+            "-c",
+            "umask 077; mkdir -p \"$1\"",
+            "prepare-status-quota",
+            directory,
+        ],
+        None,
+    )?;
+    lab.exec(
+        &[
+            "mount",
+            "-t",
+            "tmpfs",
+            "-o",
+            "mode=0700,nr_inodes=32",
+            "tmpfs",
+            directory,
+        ],
+        None,
+    )?;
+    Ok(())
+}
+
+fn fill_status_quota(lab: &Lab, directory: &str) -> TestResult {
+    let filled = lab.raw(
+        &[
+            "sh",
+            "-c",
+            "for i in $(seq 1 32); do touch \"$1/quota-$i\" || exit $?; done",
+            "fill-status-quota",
+            directory,
+        ],
+        None,
+    )?;
+    assert!(!filled.status.success());
+    assert!(String::from_utf8_lossy(&filled.stderr).contains("No space left on device"));
+    Ok(())
+}
+
+fn release_status_quota(lab: &Lab, directory: &str) -> TestResult {
+    lab.exec(
+        &[
+            "sh",
+            "-c",
+            "for i in $(seq 1 32); do rm -f \"$1/quota-$i\" || exit $?; done",
+            "release-status-quota",
+            directory,
+        ],
+        None,
+    )?;
+    Ok(())
+}
+
+fn apply_coalesced_luci_revocation(
+    lab: &Lab,
+    pid: u64,
+    service: &str,
+    section: &str,
+    method: &str,
+    fields: &[&str],
+) -> TestResult {
+    assert!(pid > 1, "expected the active fixture controller");
+    let script = format!("/etc/init.d/{service}");
+    let hold = "/tmp/hold-consent-reload";
+    let triggered = "/tmp/consent-reload-deferred";
+    let injection = format!(
+        "/^reload_service() {{/a\\\n\tif [ -e {hold} ]; then touch {triggered}; return 0; fi"
+    );
+    lab.exec(&["sed", "-i", &injection, &script], None)?;
+    lab.exec(&["touch", hold], None)?;
+    let directory = if section == "inbound" {
+        "/var/run/tunnel-detour/inbound"
+    } else {
+        "/var/run/tunnel-detour"
+    };
+    let grant = format!("{directory}/observability.grant");
+    assert_eq!(lab.exec(&["cat", &grant], None)?.len(), 16);
+    let consent = format!("tunnel-detour.{section}.observability");
+    let epoch = format!("{consent}_epoch");
+    let restored_epoch = lab.exec(&["uci", "get", &epoch], None)?;
+    let password = secret()?;
+    lab.exec(
+        &["passwd", "root"],
+        Some(format!("{password}\n{password}\n").as_bytes()),
+    )?;
+    lab.exec(&["kill", "-STOP", &pid.to_string()], None)?;
+    fill_status_quota(lab, directory)?;
+    for (value, confirm) in [("0", false), ("0", true), ("1", true)] {
+        let session = lab.ubus(
+            "session",
+            "login",
+            json!({"username":"root", "password":password}),
+        )?;
+        let session = session["ubus_rpc_session"]
+            .as_str()
+            .ok_or("missing synthetic LuCI RPC session")?;
+        let values = if value == "1" {
+            json!({"observability":"1", "observability_epoch":"0123456789abcdef0123456789abcdef"})
+        } else {
+            json!({"observability":"0"})
+        };
+        let prior = lab.ubus("tunnel-detour", method, json!({}))?;
+        lab.ubus("uci", "set", json!({"config":"tunnel-detour", "section":section, "values":values, "ubus_rpc_session":session}))?;
+        if value == "0" {
+            lab.ubus("uci", "delete", json!({"config":"tunnel-detour", "section":section, "options":["observability_epoch"], "ubus_rpc_session":session}))?;
+        }
+        let staged = lab.ubus("tunnel-detour", method, json!({}))?;
+        assert_eq!(
+            staged["observability_requested"], prior["observability_requested"],
+            "staging a form did not apply it"
+        );
+        lab.exec(&["rm", "-f", triggered], None)?;
+        lab.ubus(
+            "uci",
+            "apply",
+            json!({"rollback":true, "timeout":8, "ubus_rpc_session":session}),
+        )?;
+        if confirm {
+            lab.ubus("uci", "confirm", json!({"ubus_rpc_session":session}))?;
+        } else {
+            // The first application expires under a real inode quota. The
+            // withdrawal must already be recorded before any status read.
+            wait(|| {
+                Ok(lab
+                    .raw(&["test", "!", "-e", &grant], None)?
+                    .status
+                    .success())
+            })?;
+            let withdrawn = lab.ubus("tunnel-detour", method, json!({}))?;
+            assert_eq!(withdrawn["observability_requested"], false);
+            assert_eq!(withdrawn["observability_revocation_pending"], true);
+            assert_diagnostics_off(&withdrawn["status"], fields);
+            wait(|| Ok(lab.exec(&["uci", "get", &consent], None)? == b"1\n"))?;
+            assert_eq!(lab.exec(&["uci", "get", &epoch], None)?, restored_epoch);
+        }
+        wait(|| Ok(lab.raw(&["test", "-e", triggered], None)?.status.success()))?;
+        let visible = lab.ubus("tunnel-detour", method, json!({}))?;
+        assert_eq!(visible["observability_revocation_pending"], true);
+        assert_eq!(visible["observability_requested"], !confirm || value == "1");
+        assert_diagnostics_off(&visible["status"], fields);
+        assert_eq!(visible["status"]["process_id"], pid);
+        assert!(visible["status"].get("observability_epoch").is_none());
+        assert!(visible["status"].get("observability_grant").is_none());
+        if !confirm {
+            release_status_quota(lab, directory)?;
+        }
+    }
+    lab.exec(&["rm", hold], None)?;
+    lab.exec(&[&script, "reload"], None)?;
+    finish_coalesced_revocation(lab, pid, service, method)
+}
+
+fn finish_coalesced_revocation(lab: &Lab, pid: u64, service: &str, method: &str) -> TestResult {
+    lab.exec(&["kill", "-CONT", &pid.to_string()], None)?;
+    wait(|| {
+        let visible = lab.ubus("tunnel-detour", method, json!({}))?;
+        Ok(visible["observability_revocation_pending"] == false
+            && visible["status"]["observability"] == true
+            && visible["status"]["process_id"] == pid)
+    })
+    .map_err(|error| {
+        format!(
+            "{service} did not acknowledge the coalesced revocation: {error}; state: {:?}",
+            lab.ubus("tunnel-detour", method, json!({}))
+        )
+        .into()
+    })
+}
+
+fn pause_for_luci_review(variable: &str, details: Value) -> TestResult {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let Some(path) = env::var_os(variable).map(std::path::PathBuf::from) else {
+        return Ok(());
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(&serde_json::to_vec(&details)?)?;
+    wait_for(Duration::from_secs(240), || {
+        Ok(path.with_extension("continue").exists())
+    })
+}
+
+#[test]
+#[ignore = "requires the isolated OpenWrt management laboratory"]
+fn r153_dns_observability_requires_consent_and_revokes_live_and_stale_diagnostics() -> TestResult {
+    const FILE: &str = "/var/run/tunnel-detour/status.json";
+    const FIELDS: &[&str] = &[
+        "connections",
+        "dns_queries",
+        "completed_connections",
+        "failures",
+        "last_request_error",
+        "bytes_to_wan",
+        "bytes_from_wan",
+        "mapping_usage",
+    ];
+    let lab = Lab::create(true)?;
+    mount_status_quota(&lab, "/var/run/tunnel-detour")?;
+    let raw =
+        || -> TestResult<Value> { Ok(serde_json::from_slice(&lab.exec(&["cat", FILE], None)?)?) };
+    let status = || lab.ubus("tunnel-detour", "status", json!({}));
+    let logs = || -> TestResult<String> { Ok(String::from_utf8(lab.exec(&["logread"], None)?)?) };
+    let marker = |name: &str| {
+        wait(|| {
+            Ok(lab
+                .inbound_marker("td-in-wan", "test", name)?
+                .status
+                .success())
+        })
+    };
+    assert_eq!(
+        lab.exec(&["uci", "get", "tunnel-detour.globals.observability"], None)?,
+        b"0\n"
+    );
+    lab.exec(
+        &["uci", "delete", "tunnel-detour.globals.observability"],
+        None,
+    )?;
+    lab.inbound_endpoints()?;
+    lab.configure_dnsmasq()?;
+    let pid = lab.ready(None)?;
+    lab.spawn_inbound_probe("dns_server")?;
+    marker("dns-endpoint-ready")?;
+    assert!(lab.lookup("selected.example.net")?.contains("198.18.0.1"));
+    lab.spawn_inbound_probe("dns_holding")?;
+    marker("dns-holding-ready")?;
+    assert_diagnostics_off(&raw()?, FIELDS);
+    assert_diagnostics_off(&status()?["status"], FIELDS);
+    assert!(!logs()?.contains("DNS traffic diagnostics enabled"));
+
+    lab.change("set tunnel-detour.globals.observability='1'\nset tunnel-detour.globals.observability_epoch='fedcba9876543210fedcba9876543210'")?;
+    wait(|| {
+        Ok(raw()?["observability"] == true && logs()?.contains("DNS traffic diagnostics enabled"))
+    })?;
+    assert_eq!(
+        raw()?["connections"],
+        json!({}),
+        "traffic admitted without consent was imported"
+    );
+    let forwarding = lab.exec(&["uci", "export", "dhcp"], None)?;
+    lab.lookup("selected.example.net")?;
+    lab.spawn_inbound_probe("dns_reloading")?;
+    marker("dns-reloading-ready")?;
+    wait(|| {
+        Ok(raw()?["connections"]
+            .as_object()
+            .is_some_and(|entries| entries.len() == 1))
+    })?;
+    assert_eq!(status()?["status"]["process_id"], pid);
+    assert_eq!(lab.exec(&["uci", "export", "dhcp"], None)?, forwarding);
+    pause_for_luci_review(
+        "TUNNEL_DETOUR_LUCI_DNS_DIAGNOSTICS_REVIEW",
+        json!({"url":lab.http,"container":lab.name}),
+    )?;
+    apply_coalesced_luci_revocation(&lab, pid, "tunnel-detour", "globals", "status", FIELDS)?;
+    assert_eq!(raw()?["connections"], json!({}));
+    assert_eq!(raw()?["dns_queries"], 0);
+    lab.lookup("selected.example.net")?;
+    wait(|| {
+        Ok(raw()?["dns_queries"]
+            .as_u64()
+            .is_some_and(|count| count > 0))
+    })?;
+    apply_coalesced_revocation(&lab, pid, "tunnel-detour", "globals", "status", FIELDS)?;
+    assert_eq!(raw()?["connections"], json!({}));
+    assert_eq!(raw()?["dns_queries"], 0);
+
+    let applied_port =
+        String::from_utf8(lab.exec(&["uci", "get", "tunnel-detour.globals.dns_port"], None)?)?;
+    let applied_port: u16 = applied_port.trim().parse()?;
+    lab.exec(&["uci", "batch"], Some(b"set tunnel-detour.globals.observability='0'\nset tunnel-detour.globals.real_upstream='invalid'\nset tunnel-detour.globals.dns_port='invalid'\ndelete tunnel-detour.globals.enabled\ncommit tunnel-detour\n"))?;
+    assert_eq!(
+        raw()?["observability"],
+        true,
+        "stale snapshot control was not exercised"
+    );
+    let pending = status()?;
+    assert_diagnostics_off(&pending["status"], FIELDS);
+    assert_eq!(pending["observability_revocation_pending"], true);
+    lab.ubus(
+        "service",
+        "event",
+        json!({"type":"config.change","data":{"package":"tunnel-detour"}}),
+    )?;
+    wait(|| Ok(raw()?["observability"] == false && raw()?["configuration_applied"] == false))?;
+    assert_diagnostics_off(&raw()?, FIELDS);
+    assert_eq!(status()?["status"]["process_id"], pid);
+
+    lab.change(&format!("set tunnel-detour.globals.enabled='1'\nset tunnel-detour.globals.real_upstream='127.0.0.1:15353'\nset tunnel-detour.globals.dns_port='{applied_port}'\nset tunnel-detour.globals.observability='1'"))?;
+    wait(|| Ok(raw()?["observability"] == true && raw()?["configuration_applied"] == true))?;
+    for name in ["dns-holding", "dns-reloading"] {
+        lab.exec(&["touch", &format!("/tmp/inbound-test/check-{name}")], None)?;
+        marker(&format!("{name}-complete"))?;
+    }
+    // A fresh session completes in this epoch. Neither earlier session may be counted.
+    assert!(lab.inbound_probe("dns_once")?.status.success());
+    wait(|| Ok(raw()?["completed_connections"] == 1))?;
+    assert_eq!(raw()?["connections"], json!({}));
+    assert_eq!(raw()?["process_id"], pid);
+
+    lab.exec(
+        &["uci", "batch"],
+        Some(b"set tunnel-detour.globals.observability='0'\nset tunnel-detour.globals.enabled='off'\ncommit tunnel-detour\n"),
+    )?;
+    lab.exec(&["/etc/init.d/tunnel-detour", "reload"], None)?;
+    wait(|| {
+        // Keep the daemon disabled across any previously queued reload and
+        // wait for its final write before installing the legacy fixture.
+        Ok(status()?["running"] == false
+            && !lab
+                .raw(&["kill", "-0", &pid.to_string()], None)?
+                .status
+                .success())
+    })?;
+    lab.exec(&["tee", FILE], Some(br#"{"phase":"stopped","connections":{"old":{"domain":"private.example.test"}},"dns_queries":17,"last_error":"filtered_destination"}"#))?;
+    lab.exec(&["chmod", "600", FILE], None)?;
+    assert_eq!(
+        raw()?["dns_queries"],
+        17,
+        "legacy snapshot was not installed"
+    );
+    let legacy = status()?["status"].clone();
+    assert_diagnostics_off(&legacy, FIELDS);
+    assert!(legacy.get("last_error").is_none());
+    assert_eq!(
+        raw()?["dns_queries"],
+        17,
+        "the RPC must redact a genuinely stale snapshot"
+    );
+    lab.exec(
+        &["uci", "batch"],
+        Some(b"set tunnel-detour.globals.enabled='1'\ncommit tunnel-detour\n"),
+    )?;
+    lab.exec(&["/etc/init.d/tunnel-detour", "start"], None)?;
+    lab.ready(Some(pid))?;
+    assert_diagnostics_off(&raw()?, FIELDS);
+    assert!(!logs()?.contains("private.example.test"));
+    let running = status()?["status"]["process_id"]
+        .as_u64()
+        .ok_or("missing restarted DNS PID")?;
+    fill_status_quota(&lab, "/var/run/tunnel-detour")?;
+    lab.exec(
+        &["uci", "batch"],
+        Some(b"delete tunnel-detour.selected\ncommit tunnel-detour\n"),
+    )?;
+    lab.exec(&["/etc/init.d/tunnel-detour", "reload"], None)?;
+    wait(|| {
+        Ok(lab
+            .lookup("selected.example.net")
+            .is_ok_and(|answer| answer.contains("203.0.113.2") && !answer.contains("198.18.0.1")))
+    })?;
+    release_status_quota(&lab, "/var/run/tunnel-detour")?;
+    let applied = lab.ready(Some(running))?;
+    assert_diagnostics_off(&raw()?, FIELDS);
+    fill_status_quota(&lab, "/var/run/tunnel-detour")?;
+    lab.exec(
+        &["uci", "batch"],
+        Some(b"set tunnel-detour.globals.enabled='off'\ncommit tunnel-detour\n"),
+    )?;
+    lab.exec(&["/etc/init.d/tunnel-detour", "reload"], None)?;
+    wait(|| {
+        Ok(status()?["running"] == false
+            && !lab
+                .raw(&["kill", "-0", &applied.to_string()], None)?
+                .status
+                .success())
+    })?;
+    release_status_quota(&lab, "/var/run/tunnel-detour")?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the isolated OpenWrt management laboratory"]
+fn r156_inbound_observability_revokes_relay_diagnostics_without_retiring_sessions() -> TestResult {
+    const FILE: &str = "/var/run/tunnel-detour/inbound/status.json";
+    let lab = Lab::create(true)?;
+    mount_status_quota(&lab, "/var/run/tunnel-detour/inbound")?;
+    let raw =
+        || -> TestResult<Value> { Ok(serde_json::from_slice(&lab.exec(&["cat", FILE], None)?)?) };
+    let status = || lab.ubus("tunnel-detour", "inbound_status", json!({}));
+    let marker = |namespace: &str, name: &str| -> TestResult {
+        wait(|| {
+            Ok(lab
+                .inbound_marker(namespace, "test", name)?
+                .status
+                .success())
+        })
+        .map_err(|error| format!("relay marker {name}: {error}; state: {:?}", status()).into())
+    };
+    assert_eq!(
+        lab.exec(&["uci", "get", "tunnel-detour.inbound.observability"], None)?,
+        b"0\n"
+    );
+    lab.exec(
+        &["uci", "delete", "tunnel-detour.inbound.observability"],
+        None,
+    )?;
+    lab.inbound_endpoints()?;
+    lab.spawn_inbound_probe("relay_server")?;
+    marker("td-in-lan", "relay-endpoint-ready")?;
+    lab.prepare_inbound_uci()?;
+    lab.change("set tunnel-detour.sample.protocol='tcp'\nset tunnel-detour.sample.destination_address='192.0.2.2'\nset tunnel-detour.inbound.enabled='1'")?;
+    wait(|| Ok(status()?["status"]["applied"] == true)).map_err(|error| {
+        let exits = lab
+            .raw(&["logread", "-e", "Tunnel Detour daemon exited"], None)
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+        format!(
+            "initial inbound readiness: {error}; status: {:?}; daemon exits: {exits:?}",
+            status()
+        )
+    })?;
+    let pid = raw()?["process_id"].clone();
+    let revision = raw()?["revision"].clone();
+    assert!(lab.inbound_probe("relay_client")?.status.success());
+    assert_diagnostics_off(&raw()?, &["relay"]);
+    assert_diagnostics_off(&status()?["status"], &["relay"]);
+    assert!(
+        !String::from_utf8(lab.exec(&["logread"], None)?)?.contains("inbound publications ready")
+    );
+
+    lab.change("set tunnel-detour.inbound.observability='1'\nset tunnel-detour.inbound.observability_epoch='fedcba9876543210fedcba9876543210'")?;
+    wait(|| Ok(raw()?["observability"] == true))
+        .map_err(|error| format!("first inbound opt-in: {error}; state: {:?}", status()))?;
+    lab.spawn_inbound_probe("relay_holding")?;
+    marker("td-in-wan", "relay-client-ready")?;
+    wait(|| {
+        Ok(raw()?["relay"]["connections"]
+            .as_array()
+            .is_some_and(|sessions| sessions.len() == 1))
+    })
+    .map_err(|error| format!("initial observed relay: {error}; state: {:?}", status()))?;
+    assert_eq!(raw()?["revision"], revision);
+    assert!(
+        String::from_utf8(lab.exec(&["logread"], None)?)?
+            .contains("inbound traffic diagnostics enabled")
+    );
+    apply_coalesced_luci_revocation(
+        &lab,
+        pid.as_u64().ok_or("missing inbound PID")?,
+        "tunnel-detour-inbound",
+        "inbound",
+        "inbound_status",
+        &["relay"],
+    )?;
+    assert_eq!(raw()?["relay"]["connections"], json!([]));
+    assert_eq!(raw()?["relay"]["completed"], 0);
+    assert!(lab.inbound_probe("relay_client")?.status.success());
+    wait(|| Ok(raw()?["relay"]["completed"] == 1))?;
+    apply_coalesced_revocation(
+        &lab,
+        pid.as_u64().ok_or("missing inbound PID")?,
+        "tunnel-detour-inbound",
+        "inbound",
+        "inbound_status",
+        &["relay"],
+    )?;
+    assert_eq!(raw()?["relay"]["connections"], json!([]));
+    assert_eq!(raw()?["relay"]["completed"], 0);
+
+    lab.change("set tunnel-detour.inbound.observability='invalid'\nset tunnel-detour.inbound.relay_port='invalid'")?;
+    wait(|| Ok(raw()?["observability"] == false && raw()?["last_error"].is_string()))
+        .map_err(|error| format!("invalid inbound candidate: {error}; state: {:?}", status()))?;
+    assert_diagnostics_off(&raw()?, &["relay"]);
+    assert_diagnostics_off(&status()?["status"], &["relay"]);
+    assert_eq!(raw()?["process_id"], pid);
+
+    lab.change(
+        "delete tunnel-detour.inbound.relay_port\nset tunnel-detour.inbound.observability='1'",
+    )?;
+    wait(|| Ok(raw()?["observability"] == true && raw()?["applied"] == true))
+        .map_err(|error| format!("repair inbound candidate: {error}; state: {:?}", status()))?;
+    assert_eq!(raw()?["relay"]["connections"], json!([]));
+    lab.inbound_marker("td-in-wan", "touch", "relay-client-release")?;
+    marker("td-in-wan", "relay-client-complete")?;
+    assert!(lab.inbound_probe("relay_client")?.status.success());
+    wait(|| Ok(raw()?["relay"]["completed"] == 1))
+        .map_err(|error| format!("fresh relay completion: {error}; state: {:?}", status()))?;
+    assert_eq!(raw()?["process_id"], pid);
+    let before_limits = raw()?["revision"].clone();
+    lab.change("set tunnel-detour.inbound.relay_connections='3'")?;
+    wait(|| {
+        let state = raw()?;
+        Ok(state["revision"] != before_limits && state["applied"] == true)
+    })?;
+    assert_eq!(raw()?["process_id"], pid);
+    assert_eq!(raw()?["observability"], true);
+    assert_eq!(raw()?["relay"]["completed"], 1);
+    let hold_observed_relay = || -> TestResult {
+        for name in [
+            "relay-client-ready",
+            "relay-client-release",
+            "relay-client-complete",
+        ] {
+            lab.exec(&["rm", &format!("/tmp/inbound-test/{name}")], None)?;
+        }
+        lab.spawn_inbound_probe("relay_holding")?;
+        marker("td-in-wan", "relay-client-ready")?;
+        wait(|| {
+            Ok(raw()?["relay"]["connections"]
+                .as_array()
+                .is_some_and(|rows| rows.len() == 1))
+        })
+    };
+    hold_observed_relay()?;
+    lab.inbound_marker("td-in-wan", "touch", "relay-client-release")?;
+    marker("td-in-wan", "relay-client-complete")?;
+    wait(|| Ok(raw()?["relay"]["completed"] == 2))?;
+
+    // The management web server owns port 80. This candidate parses, and its
+    // operational validation must reject it before rewriting the live policy.
+    hold_observed_relay()?;
+    let previous = raw()?;
+    lab.change("set tunnel-detour.inbound.relay_port='80'")?;
+    wait(|| {
+        let state = raw()?;
+        Ok(state["port_conflict"]["location"] == "relay_listener"
+            && state["port_conflict"]["port"] == 80)
+    })?;
+    assert_diagnostics_off(&raw()?, &["relay"]);
+    let rejected = status()?;
+    assert_eq!(rejected["observability_requested"], true);
+    assert_eq!(rejected["observability_revocation_pending"], false);
+    let state = &rejected["status"];
+    assert_eq!(state["applied"], false);
+    assert_eq!(state["phase"], "ready");
+    assert_eq!(state["process_id"], pid);
+    assert_eq!(state["revision"], previous["revision"]);
+    assert_eq!(state["public_addresses"], previous["public_addresses"]);
+    assert_eq!(state["publications"], previous["publications"]);
+    assert_diagnostics_off(state, &["relay"]);
+    assert!(lab.inbound_probe("relay_client")?.status.success());
+    lab.inbound_marker("td-in-wan", "touch", "relay-client-release")?;
+    marker("td-in-wan", "relay-client-complete")?;
+    lab.change("delete tunnel-detour.inbound.relay_port")?;
+    wait(|| Ok(raw()?["applied"] == true && raw()?["observability"] == true))?;
+    let restored = raw()?;
+    assert_eq!(restored["process_id"], pid);
+    assert_eq!(restored["relay"]["connections"], json!([]));
+    assert_eq!(restored["relay"]["completed"], 0);
+
+    lab.change("delete tunnel-detour.inbound.enabled")?;
+    wait(|| Ok(raw()?["last_error"].is_string()))?;
+    assert_eq!(raw()?["process_id"], pid);
+    assert!(lab.inbound_probe("relay_client")?.status.success());
+    lab.change("set tunnel-detour.inbound.enabled='1'")?;
+    wait(|| Ok(raw()?["applied"] == true))?;
+    let journal: Value = serde_json::from_slice(
+        &lab.exec(&["cat", "/etc/tunnel-detour/inbound/state.json"], None)?,
+    )?;
+    assert!(journal["control"].get("observability").is_none());
+    assert!(journal["control"].get("observability_epoch").is_none());
+    lab.change("set tunnel-detour.inbound.observability='0'")?;
+    wait(|| Ok(raw()?["observability"] == false))?;
+    assert_diagnostics_off(&raw()?, &["relay"]);
+    assert_diagnostics_off(&status()?["status"], &["relay"]);
+    assert_eq!(raw()?["process_id"], pid);
+    lab.exec(
+        &["uci", "batch"],
+        Some(b"set tunnel-detour.inbound.enabled='off'\ncommit tunnel-detour\n"),
+    )?;
+    lab.exec(&["/etc/init.d/tunnel-detour-inbound", "reload"], None)?;
+    wait(|| Ok(status()?["running"] == false))?;
+    let denied = lab.inbound_probe("native_wan_dispatch_restricted")?;
+    assert!(
+        denied.status.success(),
+        "the UCI off alias left the WAN publication active: {}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the isolated OpenWrt management laboratory"]
+fn r159b_inbound_revocation_purges_an_unwritable_snapshot_without_retiring_sessions() -> TestResult
+{
+    const DIRECTORY: &str = "/tmp/inbound-status-quota";
+    const STATUS: &str = "/tmp/inbound-status-quota/status.json";
+    const FILLER: &str = "/tmp/inbound-status-quota/filler";
+    const READY: &str = "/tmp/snapshot-inode-held";
+    const RELEASE: &str = "/tmp/snapshot-inode-release";
+    const CLOSED: &str = "/tmp/snapshot-inode-closed";
+
+    let lab = Lab::create(true)?;
+    lab.inbound_endpoints()?;
+    lab.spawn_inbound_probe("relay_server")?;
+    wait(|| {
+        Ok(lab
+            .inbound_marker("td-in-lan", "test", "relay-endpoint-ready")?
+            .status
+            .success())
+    })?;
+    lab.exec(&["mkdir", "-m", "700", DIRECTORY], None)?;
+    lab.exec(
+        &[
+            "mount",
+            "-t",
+            "tmpfs",
+            "-o",
+            "mode=0700,nr_inodes=4",
+            "tmpfs",
+            DIRECTORY,
+        ],
+        None,
+    )?;
+    let status =
+        || -> TestResult<Value> { Ok(serde_json::from_slice(&lab.exec(&["cat", STATUS], None)?)?) };
+    let mut config = lab.inbound_configuration();
+    config["status_file"] = json!(STATUS);
+    config["observability"] = json!(true);
+    config["lan_networks"] = json!(["2001:db8:1::/64", "192.0.2.0/24"]);
+    config["rules"][0]["protocol"] = json!("tcp");
+    config["rules"][0]["destination"] = json!("192.0.2.2:8080");
+    lab.start_inbound(&config)?;
+    lab.spawn_inbound_probe("relay_holding")?;
+    wait(|| {
+        Ok(status().is_ok_and(|status| {
+            status["relay"]["connections"]
+                .as_array()
+                .is_some_and(|sessions| sessions.len() == 1)
+        }))
+    })?;
+    let before = status()?;
+    let pid = before["process_id"]
+        .as_u64()
+        .filter(|pid| *pid > 1)
+        .ok_or("missing active controller")?
+        .to_string();
+
+    lab.exec(&["kill", "-STOP", &pid], None)?;
+    let prepared = (|| -> TestResult {
+        wait(|| {
+            Ok(lab
+                .raw(
+                    &[
+                        "grep",
+                        "-q",
+                        "^State:[[:space:]]*T",
+                        &format!("/proc/{pid}/status"),
+                    ],
+                    None,
+                )?
+                .status
+                .success())
+        })?;
+        // The directory and writer lock occupy two slots. Keep the previous
+        // snapshot and any interrupted replacement allocated in the other two,
+        // even after they are unlinked.
+        let holder = lab
+            .background_command(&[
+                "sh",
+                "-c",
+                "exec 3<\"$1\"; held=1\n\
+                 for file in \"${1%/*}\"/.[!.]*; do\n\
+                     test -f \"$file\" || continue\n\
+                     exec 4<\"$file\"; held=2\n\
+                 done\n\
+                 printf '%s' \"$held\" > \"$2\" || exit 1\n\
+                 for second in $(seq 1 45); do\n\
+                     if test -e \"$3\"; then\n\
+                         exec 3<&- 4<&-; touch \"$4\"; exit $?\n\
+                     fi\n\
+                     sleep 1\n\
+                 done\n\
+                 exit 1",
+                "snapshot-inode-holder",
+                STATUS,
+                READY,
+                RELEASE,
+                CLOSED,
+            ])?
+            .spawn()?;
+        lab.background.borrow_mut().push(holder);
+        wait(|| Ok(lab.raw(&["test", "-s", READY], None)?.status.success()))?;
+        if lab.exec(&["cat", READY], None)? == b"1" {
+            lab.exec(&["touch", FILLER], None)?;
+        }
+        let refused = lab.raw(&["touch", "/tmp/inbound-status-quota/probe"], None)?;
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("No space left on device"));
+        config["observability"] = json!(false);
+        lab.exec(
+            &["tee", "/tmp/inbound-config.json"],
+            Some(&serde_json::to_vec(&config)?),
+        )?;
+        lab.exec(&["kill", "-HUP", &pid], None)?;
+        Ok(())
+    })();
+    let resumed = lab.exec(&["kill", "-CONT", &pid], None);
+    prepared?;
+    resumed?;
+
+    let unpublished = || -> TestResult<bool> {
+        Ok(lab
+            .raw(&["test", "!", "-e", STATUS], None)?
+            .status
+            .success())
+    };
+    wait(unpublished)?;
+    assert!(lab.inbound_probe("relay_client")?.status.success());
+    lab.inbound_marker("td-in-wan", "touch", "relay-client-release")?;
+    wait(|| {
+        Ok(lab
+            .inbound_marker("td-in-wan", "test", "relay-client-complete")?
+            .status
+            .success())
+    })?;
+    assert!(
+        unpublished()?,
+        "the snapshot reappeared before the fault was removed"
+    );
+    lab.exec(&["rm", "-f", FILLER], None)?;
+    lab.exec(&["touch", RELEASE], None)?;
+    wait(|| Ok(lab.raw(&["test", "-e", CLOSED], None)?.status.success()))?;
+    wait(|| {
+        Ok(status().is_ok_and(|status| {
+            status["process_id"] == before["process_id"]
+                && status["applied"] == true
+                && status["phase"] == "ready"
+                && status["observability"] == false
+                && status.get("relay").is_none()
+        }))
+    })?;
+    assert_eq!(status()?["publications"], before["publications"]);
+    lab.exec(&["kill", "-TERM", &pid], None)?;
+    wait(|| Ok(status().is_ok_and(|status| status["phase"] == "stopped")))?;
+    lab.exec(&["umount", DIRECTORY], None)?;
     Ok(())
 }
 
@@ -3870,9 +6549,7 @@ fn r054_changed_and_disabled_publications_close_their_flows_while_other_publicat
     lab.inbound_endpoints()?;
     let accelerated = lab.vm.is_some();
     if accelerated {
-        lab.exec(&["uci", "batch"], Some(b"set firewall.@defaults[0].flow_offloading='1'\nset firewall.@defaults[0].flow_offloading_hw='0'\ncommit firewall\n"))?;
-        lab.exec(&["fw4", "reload"], None)?;
-        lab.exec(&["nft", "list", "flowtable", "inet", "fw4", "ft"], None)?;
+        enable_software_flow_offload(&lab)?;
     }
     let mut config = lab.inbound_configuration();
     let mut stable = config["rules"][0].clone();
@@ -3884,7 +6561,9 @@ fn r054_changed_and_disabled_publications_close_their_flows_while_other_publicat
         .as_array_mut()
         .ok_or("missing rules")?
         .push(stable);
+    let controller_index = lab.background.borrow().len();
     lab.start_inbound(&config)?;
+    let foreign_set = accelerated.then(|| large_foreign_set(&lab)).transpose()?;
     let state = || -> TestResult<Value> {
         Ok(serde_json::from_slice(
             &lab.exec(&["cat", "/tmp/inbound-test/state.json"], None)?,
@@ -3915,6 +6594,9 @@ fn r054_changed_and_disabled_publications_close_their_flows_while_other_publicat
         }
         result
     };
+    if accelerated {
+        observe_inbound_forward(&lab)?;
+    }
     lab.spawn_inbound_probe("holding")?;
     marker("holding-ready")?;
     let is_offloaded = |mark: &str, protocol: &str| -> TestResult<bool> {
@@ -3958,6 +6640,10 @@ fn r054_changed_and_disabled_publications_close_their_flows_while_other_publicat
         })?;
         let before = forwarded_packets()?;
         assert!(
+            before > 0,
+            "the forward probe missed the initial native traffic"
+        );
+        assert!(
             lab.inbound_marker("td-in-wan", "touch", "check-fastpath")?
                 .status
                 .success()
@@ -3971,6 +6657,9 @@ fn r054_changed_and_disabled_publications_close_their_flows_while_other_publicat
     }
     config["rules"][0]["destination"] = json!("[2001:db8:1::2]:8081");
     lab.reload_inbound(&config)?;
+    if let Some(fingerprint) = &foreign_set {
+        assert_eq!(foreign_set_fingerprint(&lab)?, *fingerprint);
+    }
     assert_ne!(state()?["admissions"]["sample"], initial["sample"]);
     assert_eq!(state()?["admissions"]["stable"], initial["stable"]);
     assert!(
@@ -4033,7 +6722,212 @@ fn r054_changed_and_disabled_publications_close_their_flows_while_other_publicat
             .success()
     );
     marker("holding-released")?;
-    lab.stop_inbound()?;
+    if let Some(fingerprint) = foreign_set {
+        let backend_bytes = || -> TestResult<[u64; 2]> {
+            let counts = lab.exec(&["cat", "/tmp/inbound-test/r054-backend-counts"], None)?;
+            Ok(serde_json::from_slice(&counts)?)
+        };
+        lab.exec(&["touch", "/tmp/inbound-test/r054-count-backend"], None)?;
+        wait(|| {
+            Ok(lab
+                .raw(
+                    &["test", "-e", "/tmp/inbound-test/r054-backend-counts"],
+                    None,
+                )?
+                .status
+                .success())
+        })?;
+        let zero = backend_bytes()?;
+        lab.spawn_inbound_probe("holding_for_stop")?;
+        marker("holding-stop-ready")?;
+        wait(|| Ok(is_offloaded("1413742594", "tcp")? && is_offloaded("1413742594", "udp")?))?;
+        let delivered = backend_bytes()?;
+        assert!(
+            delivered[0] > zero[0] && delivered[1] > zero[1],
+            "observer must detect real TCP and UDP payload"
+        );
+        // Keep nftables writes and all other reads working. Losing the offload
+        // inventory must not leave either new or accelerated flows admitted.
+        let failed = || -> TestResult {
+            let current: Value = serde_json::from_slice(
+                &lab.exec(&["cat", "/tmp/inbound-test/status.json"], None)?,
+            )?;
+            let pid = current["process_id"]
+                .as_u64()
+                .ok_or("missing inbound PID")?;
+            lab.exec(&["kill", "-TERM", &pid.to_string()], None)?;
+            let guard_closed = || -> TestResult<bool> {
+                let guard = lab.exec(
+                    &[
+                        "nft",
+                        "-s",
+                        "list",
+                        "chain",
+                        "inet",
+                        "tunnel_detour_inbound",
+                        "tag",
+                    ],
+                    None,
+                )?;
+                Ok(!String::from_utf8(guard)?.contains("ct mark set"))
+            };
+            wait(guard_closed)?;
+            wait(
+                || Ok(!is_offloaded("1413742594", "tcp")? && !is_offloaded("1413742594", "udp")?),
+            )?;
+            lab.exec(&["test", "-e", "/tmp/r054-offload-inspection-failed"], None)?;
+            let mut controller = lab.background.borrow_mut().remove(controller_index);
+            wait(|| Ok(controller.try_wait()?.is_some()))?;
+            let result = controller.wait_with_output()?;
+            assert_eq!(result.status.code(), Some(1));
+            assert!(String::from_utf8_lossy(&result.stderr).contains("kernel_conflict"));
+            Ok(())
+        };
+        lab.with_command_fault(
+            "nft",
+            "r054-inspection",
+            r#"if [ "$*" = '--json list flowtables' ]; then
+  touch /tmp/r054-offload-inspection-failed
+  exit 1
+fi"#,
+            failed,
+        )?;
+        assert!(
+            lab.inbound_marker("td-in-wan", "touch", "check-failed-stop")?
+                .status
+                .success()
+        );
+        marker("holding-stop-closed")?;
+        assert!(lab.inbound_probe("native_stable_closed")?.status.success());
+        assert_eq!(
+            backend_bytes()?,
+            delivered,
+            "no old or fresh probe bytes may reach the backend after containment"
+        );
+        assert_eq!(foreign_set_fingerprint(&lab)?, fingerprint);
+        verify_second_retirement_fault(&lab, &config)?;
+    } else {
+        lab.stop_inbound()?;
+    }
+    Ok(())
+}
+
+fn verify_second_retirement_fault(lab: &Lab, config: &Value) -> TestResult {
+    lab.exec(
+        &[
+            "rm",
+            "-f",
+            "/tmp/inbound-test/holding-stop-ready",
+            "/tmp/inbound-test/holding-stop-closed",
+            "/tmp/inbound-test/check-failed-stop",
+            "/tmp/r054-offload-inspection-failed",
+        ],
+        None,
+    )?;
+    let controller_index = lab.background.borrow().len();
+    lab.start_inbound(config)?;
+    let status: Value =
+        serde_json::from_slice(&lab.exec(&["cat", "/tmp/inbound-test/state.json"], None)?)?;
+    let generation = status["admissions"]["stable"]
+        .as_u64()
+        .ok_or("missing stable generation")?;
+    let mark = (0x5444_0000_u64 | generation).to_string();
+    let entries = |mark: &str| {
+        lab.exec(
+            &["conntrack", "-L", "--family", "ipv6", "--mark", mark],
+            None,
+        )
+    };
+    lab.spawn_inbound_probe("holding_for_stop")?;
+    wait(|| {
+        Ok(lab
+            .inbound_marker("td-in-wan", "test", "holding-stop-ready")?
+            .status
+            .success())
+    })?;
+    wait(|| {
+        let listing = String::from_utf8(entries(&mark)?)?;
+        Ok(["tcp", "udp"].iter().all(|protocol| {
+            listing
+                .lines()
+                .any(|line| line.starts_with(protocol) && line.contains("[OFFLOAD]"))
+        }))
+    })?;
+    lab.exec(
+        &["nft", "-f", "-"],
+        Some(b"table inet lab_control {\n chain mark_control {\n type filter hook prerouting priority -102;\n ip6 daddr 2001:db8:2::1 udp dport 18085 ct mark set 0x43430001\n }\n}\n"),
+    )?;
+    start_unmarked_router_server(lab)?;
+    assert!(
+        lab.inbound_probe("unmarked_router_client")?
+            .status
+            .success()
+    );
+    let foreign_mark = 0x4343_0001_u32.to_string();
+    assert!(
+        !entries(&foreign_mark)?.is_empty(),
+        "the control flow must actually carry an unrelated mark"
+    );
+    let guard = || {
+        lab.exec(
+            &[
+                "nft",
+                "-s",
+                "-a",
+                "list",
+                "table",
+                "inet",
+                "tunnel_detour_inbound",
+            ],
+            None,
+        )
+    };
+    let previous = guard()?;
+    let result = lab.with_command_fault(
+        "nft",
+        "r054-containment",
+        r#"case "$*" in
+  '--json list flowtables') touch /tmp/r054-offload-inspection-failed; exit 1 ;;
+  '--file -') cat >/dev/null; touch /tmp/r054-guard-write-failed; exit 1 ;;
+esac"#,
+        || {
+            let state: Value = serde_json::from_slice(
+                &lab.exec(&["cat", "/tmp/inbound-test/status.json"], None)?,
+            )?;
+            let pid = state["process_id"].as_u64().ok_or("missing inbound PID")?;
+            lab.exec(&["kill", "-TERM", &pid.to_string()], None)?;
+            let mut child = lab.background.borrow_mut().remove(controller_index);
+            wait(|| Ok(child.try_wait()?.is_some()))?;
+            Ok(child.wait_with_output()?)
+        },
+    )?;
+    lab.exec(&["test", "-e", "/tmp/r054-offload-inspection-failed"], None)?;
+    lab.exec(&["test", "-e", "/tmp/r054-guard-write-failed"], None)?;
+    assert_eq!(result.status.code(), Some(1));
+    let errors = String::from_utf8(result.stderr)?;
+    assert!(
+        errors.contains("initial=\"kernel_conflict\"") && errors.contains("conntrack=\"purged\""),
+        "{errors}"
+    );
+    assert!(
+        errors.contains("inbound emergency containment could not be fully verified")
+            && errors.contains("guard=\"kernel_command_failed\""),
+        "{errors}"
+    );
+    assert_eq!(
+        guard()?,
+        previous,
+        "the fixture must prevent the guard update, not claim it succeeded"
+    );
+    assert!(
+        entries(&mark)?.is_empty(),
+        "owned IPv6 conntrack state must be purged despite the guard failure"
+    );
+    assert!(
+        !entries(&foreign_mark)?.is_empty(),
+        "purging the package prefix must preserve the independent flow"
+    );
+    lab.inbound_marker("td-in-wan", "touch", "unmarked-router-stop")?;
     Ok(())
 }
 
@@ -4048,7 +6942,7 @@ fn r053_inbound_refuses_foreign_ipv6_routing_tables_priorities_and_firewall_owne
         &["tee", "/tmp/inbound-config.json"],
         Some(&serde_json::to_vec(&config)?),
     )?;
-    let rejected = || -> TestResult {
+    let rejected = || -> TestResult<String> {
         let before = lab.exec(&["nft", "-j", "-a", "list", "ruleset"], None)?;
         let routing = lab.exec(&["ip", "-j", "-6", "route", "show", "table", "all"], None)?;
         let priorities = lab.exec(&["ip", "-j", "-6", "rule", "show"], None)?;
@@ -4098,8 +6992,16 @@ fn r053_inbound_refuses_foreign_ipv6_routing_tables_priorities_and_firewall_owne
             priorities
         );
         assert_eq!(lab.exec(&["uci", "export", "firewall"], None)?, firewall);
-        Ok(())
+        Ok(String::from_utf8(attempt.stderr)?)
     };
+    if lab.vm.is_some() {
+        lab.exec(
+            &["nft", "-f", "-"],
+            Some(b"table inet unrelated {\n flowtable unrelated { hook ingress priority 10; devices = { tdwan0 }; }\n}\n"),
+        )?;
+        assert!(rejected()?.contains("kernel_conflict"));
+        return Ok(());
+    }
     for priority in ["50", "100"] {
         lab.exec(
             &[
@@ -4235,6 +7137,65 @@ fn r052_native_tcp_udp_publications_preserve_client_identity_and_return_through_
     let plaintext = lab.inbound_vpn_plaintext()?;
     let dns = lab.exec(&["uci", "export", "dhcp"], None)?;
     let firewall = lab.ubus("uci", "get", json!({"config":"firewall"}))?;
+    lab.exec(
+        &["nft", "-f", "-"],
+        Some(b"add chain inet fw4 dstnat_wan\nadd rule inet fw4 dstnat_wan ip6 daddr 2001:db8:2::1 udp dport 18085 redirect to :18086 comment \"lab unrelated redirect\"\n"),
+    )?;
+    let dormant_chain = || {
+        lab.exec(
+            &[
+                "nft",
+                "-s",
+                "-a",
+                "list",
+                "chain",
+                "inet",
+                "fw4",
+                "dstnat_wan",
+            ],
+            None,
+        )
+    };
+    let dormant = dormant_chain()?;
+    start_unmarked_router_server(&lab)?;
+    let classifier = instrument_wan_classifier(&lab)?;
+    let unmarked_probe = || -> TestResult {
+        let [before, reference_before] = classifier_counts(&lab)?;
+        assert_eq!(
+            before, reference_before,
+            "no extra observations before the probe"
+        );
+        let logged_before = lab
+            .vm
+            .is_some()
+            .then(|| classifier_log_count(&lab))
+            .transpose()?;
+        let result = lab.inbound_probe("unmarked_router_client")?;
+        assert!(
+            result.status.success(),
+            "unmarked traffic must still reach the original router port: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let [after, reference_after] = classifier_counts(&lab)?;
+        assert!(
+            after > before,
+            "the original classifier must count the ordinary datagram"
+        );
+        assert_eq!(
+            after, reference_after,
+            "the NAT dispatch must not duplicate the original counter"
+        );
+        if let Some(previous) = logged_before {
+            assert_eq!(
+                classifier_log_count(&lab)?,
+                previous + 1,
+                "the guest kernel must record exactly one observation of the ordinary probe"
+            );
+        }
+        assert_eq!(live_wan_classifier(&lab)?, classifier);
+        Ok(())
+    };
+    unmarked_probe()?;
     let mut configuration = lab.inbound_configuration();
     configuration["lan_networks"] = json!(["2001:db8:1::/64", "fd00:1234::/64"]);
     let mut ula = configuration["rules"][0].clone();
@@ -4247,6 +7208,31 @@ fn r052_native_tcp_udp_publications_preserve_client_identity_and_return_through_
         .ok_or("missing publications")?
         .push(ula);
     lab.start_inbound(&configuration)?;
+    let base: Value = serde_json::from_slice(&lab.exec(
+        &[
+            "nft", "-j", "-s", "-a", "list", "chain", "inet", "fw4", "dstnat",
+        ],
+        None,
+    )?)?;
+    let dispatch = base["nftables"]
+        .as_array()
+        .and_then(|items| {
+            items.iter().find_map(|entry| {
+                let rule = &entry["rule"];
+                let expr = rule["expr"].as_array()?;
+                (rule["comment"] == "tunnel-detour:inbound-dispatch:v1"
+                    && expr.last()?["jump"]["target"] == "dstnat_wan")
+                    .then_some(expr)
+            })
+        })
+        .ok_or("missing package WAN dispatch")?;
+    assert!(
+        dispatch
+            .iter()
+            .all(|statement| statement.get("log").is_none() && statement.get("counter").is_none()),
+        "the live package dispatch must not copy the administrator's logging or counters"
+    );
+    unmarked_probe()?;
     let probe = lab.inbound_probe("client")?;
     if !probe.status.success() {
         for arguments in [
@@ -4314,6 +7300,9 @@ fn r052_native_tcp_udp_publications_preserve_client_identity_and_return_through_
     }
     assert_eq!(lab.exec(&["uci", "export", "dhcp"], None)?, dns);
     lab.stop_inbound()?;
+    unmarked_probe()?;
+    assert_eq!(dormant_chain()?, dormant);
+    lab.inbound_marker("td-in-wan", "touch", "unmarked-router-stop")?;
     let after = lab.ubus("uci", "get", json!({"config":"firewall"}))?;
     assert_eq!(
         after["values"]
@@ -4328,6 +7317,115 @@ fn r052_native_tcp_udp_publications_preserve_client_identity_and_return_through_
     Ok(())
 }
 
+fn live_wan_classifier(lab: &Lab) -> TestResult<Value> {
+    let rules: Value = serde_json::from_slice(&lab.exec(
+        &[
+            "nft", "-j", "-s", "-a", "list", "chain", "inet", "fw4", "input",
+        ],
+        None,
+    )?)?;
+    rules["nftables"]
+        .as_array()
+        .and_then(|items| {
+            items.iter().find_map(|entry| {
+                let rule = &entry["rule"];
+                (rule["expr"].as_array()?.last()?["jump"]["target"] == "input_wan")
+                    .then(|| rule.clone())
+            })
+        })
+        .ok_or_else(|| "missing original WAN input classifier".into())
+}
+
+fn instrument_wan_classifier(lab: &Lab) -> TestResult<Value> {
+    let mut classifier = live_wan_classifier(lab)?;
+    let handle = classifier["handle"]
+        .as_u64()
+        .ok_or("missing classifier handle")?;
+    let expr = classifier["expr"]
+        .as_array_mut()
+        .ok_or("missing classifier expression")?;
+    let jump = expr.pop().ok_or("missing classifier jump")?;
+    let mut reference = expr.clone();
+    reference.push(json!({"counter":"r052_reference"}));
+    let logging = if lab.vm.is_some() {
+        // Only the guest has its own kernel log; its image has no NFLOG backend.
+        json!({"log":{"prefix":"r052 original classifier"}})
+    } else {
+        json!({"log":{"prefix":"r052 original classifier","group":64}})
+    };
+    expr.extend([json!({"counter":"r052_original"}), logging.clone(), jump]);
+    let batch = json!({"nftables":[
+        {"add":{"counter":{"family":"inet","table":"fw4","name":"r052_original"}}},
+        {"add":{"counter":{"family":"inet","table":"fw4","name":"r052_reference"}}},
+        {"insert":{"rule":{"family":"inet","table":"fw4","chain":"input","handle":handle,"expr":reference}}},
+        {"replace":{"rule":classifier}}
+    ]});
+    lab.exec(
+        &["nft", "-j", "-f", "-"],
+        Some(&serde_json::to_vec(&batch)?),
+    )?;
+    let live = live_wan_classifier(lab)?;
+    assert_eq!(live["handle"], handle);
+    assert!(
+        live["expr"]
+            .as_array()
+            .is_some_and(|items| items.contains(&logging))
+    );
+    Ok(live)
+}
+
+fn classifier_log_count(lab: &Lab) -> TestResult<u64> {
+    if lab.vm.is_none() {
+        return Err("the classifier kernel-log probe requires an isolated guest".into());
+    }
+    let count = lab.exec(
+        &[
+            "sh",
+            "-c",
+            "set -o pipefail; dmesg | awk '/r052 original classifier.*DPT=18085([[:space:]]|$)/ { count++ } END { print count+0 }'",
+        ],
+        None,
+    )?;
+    Ok(String::from_utf8(count)?.trim().parse()?)
+}
+
+fn classifier_counts(lab: &Lab) -> TestResult<[u64; 2]> {
+    let listings: Value =
+        serde_json::from_slice(&lab.exec(&["nft", "-j", "list", "counters", "inet"], None)?)?;
+    let items = listings["nftables"]
+        .as_array()
+        .ok_or("missing counter listing")?;
+    let packets = |name: &str| {
+        items
+            .iter()
+            .find_map(|entry| {
+                let counter = &entry["counter"];
+                (counter["name"] == name && counter["table"] == "fw4")
+                    .then(|| counter["packets"].as_u64())
+                    .flatten()
+            })
+            .ok_or("missing classifier packet count")
+    };
+    Ok([packets("r052_original")?, packets("r052_reference")?])
+}
+
+fn start_unmarked_router_server(lab: &Lab) -> TestResult {
+    // The fixture's WAN input policy rejects by default. Allow just the
+    // isolated control source and both destinations so the reply can identify
+    // whether an unexpected redirect changed the selected socket.
+    lab.exec(
+        &["nft", "-f", "-"],
+        Some(b"insert rule inet fw4 input_wan ip6 saddr 2001:db8:2::2 ip6 daddr 2001:db8:2::1 udp dport { 18085, 18086 } accept comment \"lab router control sockets\"\n"),
+    )?;
+    lab.spawn_inbound_probe("unmarked_router_server")?;
+    wait(|| {
+        Ok(lab
+            .inbound_marker("td-in-wan", "test", "unmarked-router-ready")?
+            .status
+            .success())
+    })
+}
+
 fn inbound_endpoint_probe(role: &str) -> TestResult {
     use std::net::{TcpListener, TcpStream, UdpSocket};
     if env::var("TUNNEL_DETOUR_OPENWRT_LAB").as_deref() != Ok("1")
@@ -4336,10 +7434,78 @@ fn inbound_endpoint_probe(role: &str) -> TestResult {
         return Err("inbound probes require the isolated OpenWrt laboratory".into());
     }
     match role {
-        "cache_guard_lock" => {
-            File::create("/tmp/cache-guard-lock-ready")?;
+        "unmarked_router_server" => {
+            let original = UdpSocket::bind("[2001:db8:2::1]:18085")?;
+            let redirected = UdpSocket::bind("[2001:db8:2::1]:18086")?;
+            original.set_nonblocking(true)?;
+            redirected.set_nonblocking(true)?;
+            File::create("/tmp/inbound-test/unmarked-router-ready")?;
+            let end = Instant::now() + Duration::from_secs(300);
+            while Instant::now() < end
+                && !std::path::Path::new("/tmp/inbound-test/unmarked-router-stop").exists()
+            {
+                for (socket, response) in [
+                    (&original, &b"original"[..]),
+                    (&redirected, &b"redirected"[..]),
+                ] {
+                    match socket.recv_from(&mut [0; 32]) {
+                        Ok((_, peer)) => {
+                            socket.send_to(response, peer)?;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        "unmarked_router_client" => {
+            let socket = UdpSocket::bind("[2001:db8:2::2]:0")?;
+            socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+            socket.connect("[2001:db8:2::1]:18085")?;
+            socket.send(b"unmarked test")?;
+            let mut bytes = [0; 32];
+            let count = socket.recv(&mut bytes)?;
+            assert_eq!(&bytes[..count], b"original");
+        }
+        "native_tcp_redirect_missing"
+        | "native_wan_dispatch_restricted"
+        | "native_stable_closed"
+        | "native_candidate_closed" => {
+            let port = match role {
+                "native_stable_closed" => 18081,
+                "native_candidate_closed" => 18083,
+                _ => 18080,
+            };
+            match socket_addr_tcp("[2001:db8:3::2]:0", &format!("[2001:db8:2::1]:{port}")) {
+                Ok(mut stream) => {
+                    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                    stream_closed(&mut stream)?;
+                }
+                Err(error)
+                    if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::PermissionDenied
+                        )
+                    }) => {}
+                Err(error) => return Err(error),
+            }
+            let udp = inbound_udp(port)?;
+            if role == "native_tcp_redirect_missing" {
+                udp_echo(&udp, b"independent native UDP without TCP DNAT")?;
+            } else {
+                udp_closed(&udp)?;
+            }
+        }
+        "cache_guard_lock" | "observability_lock" => {
+            let name = role.replace('_', "-");
+            File::create(format!("/tmp/{name}-ready"))?;
             wait_for(Duration::from_secs(15), || {
-                Ok(std::path::Path::new("/tmp/cache-guard-lock-release").exists())
+                Ok(std::path::Path::new(&format!("/tmp/{name}-release")).exists())
             })?;
         }
         "relay_capacity" => {
@@ -4372,14 +7538,23 @@ fn inbound_endpoint_probe(role: &str) -> TestResult {
             stream_closed(&mut fresh)?;
             File::create("/tmp/inbound-test/relay-capacity-complete")?;
         }
-        "relay_lifecycle" => {
-            let mut original = relay_test_stream("[2001:db8:3::2]:0", 18080, "192.0.2.2:8080")?;
-            let mut stable = inbound_stream(18081)?;
+        "relay_lifecycle" | "relay_lifecycle_fixture_failure" => {
+            let mut original = relay_test_stream("[2001:db8:3::2]:0", 18080, "192.0.2.2:8080")
+                .map_err(|error| format!("initial IPv4 relay: {error}"))?;
+            if role == "relay_lifecycle_fixture_failure" {
+                stream_echo(&mut original, b"fixture control echo")?;
+                return Err("r079 synthetic initial probe failure after confirmed echo".into());
+            }
+            let mut stable = inbound_stream(18081)
+                .map_err(|error| format!("initial native TCP publication: {error}"))?;
             let udp = inbound_udp(18081)?;
-            stream_echo(&mut original, b"original relay before change")?;
+            stream_echo(&mut original, b"original relay before change")
+                .map_err(|error| format!("IPv4 relay echo before retarget: {error}"))?;
             for _ in 0..3 {
-                stream_echo(&mut stable, b"native stream before relay change")?;
-                udp_echo(&udp, b"native UDP before relay change")?;
+                stream_echo(&mut stable, b"native stream before relay change")
+                    .map_err(|error| format!("native TCP echo before relay retarget: {error}"))?;
+                udp_echo(&udp, b"native UDP before relay change")
+                    .map_err(|error| format!("native UDP echo before relay retarget: {error}"))?;
             }
             File::create("/tmp/inbound-test/relay-lifecycle-ready")?;
             if env::var("TUNNEL_DETOUR_EXPECT_OFFLOAD").as_deref() == Ok("1") {
@@ -4441,7 +7616,13 @@ fn inbound_endpoint_probe(role: &str) -> TestResult {
         "relay_direct_router" => {
             blocked_inbound_tcp("[::1]:0", "[::1]:10537")?;
         }
+        "transport_start_refused" => {
+            let mut stream = socket_addr_tcp("[2001:db8:3::2]:0", "[2001:db8:2::1]:18080")?;
+            stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+            stream_closed(&mut stream)?;
+        }
         "relay_client"
+        | "relay_recovery_client"
         | "relay_holding"
         | "lan_public_relay_client"
         | "updated_relay_client"
@@ -4454,6 +7635,8 @@ fn inbound_endpoint_probe(role: &str) -> TestResult {
             };
             let mut stream = if matches!(role, "updated_relay_client" | "relay_crash_holding") {
                 relay_test_endpoint(source, "[2001:db8:2::10]:18080", "192.0.2.2:8080")?
+            } else if role == "relay_recovery_client" {
+                relay_test_stream(source, 18080, "192.0.2.2:8081")?
             } else {
                 relay_test_stream(source, 18080, "192.0.2.2:8080")?
             };
@@ -4471,7 +7654,9 @@ fn inbound_endpoint_probe(role: &str) -> TestResult {
                     stream.local_addr()?.to_string(),
                 )?;
                 File::create("/tmp/inbound-test/relay-client-ready")?;
-                wait_file("relay-client-release")?;
+                // Control-plane scenarios can take multiple bounded steps while
+                // the same client must stay connected through every step.
+                wait_file_for("relay-client-release", 90)?;
                 stream_echo(
                     &mut stream,
                     b"the observed original session is still active",
@@ -4798,7 +7983,12 @@ fn inbound_endpoint_probe(role: &str) -> TestResult {
                 return Ok(());
             }
             File::create(format!("/tmp/inbound-test/{stem}-ready"))?;
-            wait_for(Duration::from_secs(100), || {
+            let hold_seconds = if env::var("TUNNEL_DETOUR_LUCI_REVIEW").as_deref() == Ok("1") {
+                300
+            } else {
+                100
+            };
+            wait_for(Duration::from_secs(hold_seconds), || {
                 Ok(std::path::Path::new(&format!("/tmp/inbound-test/check-{stem}")).exists())
             })?;
             stream_echo(
@@ -4837,6 +8027,31 @@ fn inbound_endpoint_probe(role: &str) -> TestResult {
                 _ => return Err("reply bytes reached the client during WAN loss".into()),
             }
             File::create("/tmp/inbound-test/wan-failure-observed")?;
+        }
+        "holding_for_stop" => {
+            let mut tcp = inbound_stream(18081)?;
+            let udp = inbound_udp(18081)?;
+            for _ in 0..8 {
+                stream_echo(&mut tcp, b"TCP works before failed stop")?;
+                udp_echo(&udp, b"UDP works before failed stop")?;
+            }
+            File::create("/tmp/inbound-test/holding-stop-ready")?;
+            wait_file("check-failed-stop")?;
+            match tcp.write_all(b"retired TCP fastpath must not deliver") {
+                Ok(()) => match tcp.read(&mut [0; 1]) {
+                    Ok(0) => {}
+                    Ok(_) => return Err("a retired TCP tuple forwarded payload".into()),
+                    Err(error)
+                        if tcp_peer_closed(&error)
+                            || error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(error) => return Err(error.into()),
+                },
+                Err(error) if tcp_peer_closed(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
+            udp_closed(&udp)?;
+            File::create("/tmp/inbound-test/holding-stop-closed")?;
         }
         "holding" => {
             let mut affected = inbound_stream(18080)?;
@@ -4973,12 +8188,17 @@ fn inbound_endpoint_probe(role: &str) -> TestResult {
                 + Duration::from_secs(match env::var("TUNNEL_DETOUR_LUCI_REVIEW").as_deref() {
                     Ok("2") => 720,
                     Ok("1") => 300,
+                    _ if env::var("TUNNEL_DETOUR_EXPECT_OFFLOAD").as_deref() == Ok("1") => 300,
                     _ => 120,
                 });
             let mut streams: Vec<TcpStream> = Vec::new();
             let mut pushed = false;
             let mut previous_active = usize::MAX;
+            let mut measured = [0_u64; 2];
+            let mut published = None;
             while Instant::now() < deadline {
+                let measure = role == "server"
+                    && std::path::Path::new("/tmp/inbound-test/r054-count-backend").exists();
                 let push = if role == "relay_server" {
                     "/tmp/inbound-test/push-from-relay-server"
                 } else {
@@ -4998,17 +8218,23 @@ fn inbound_endpoint_probe(role: &str) -> TestResult {
                 match tcp.accept() {
                     Ok((mut stream, peer)) if streams.len() < 32 => {
                         stream.set_write_timeout(Some(Duration::from_secs(1)))?;
-                        stream.write_all(format!("peer={peer}\n").as_bytes())?;
+                        let mut greeting = format!("peer={peer}\n");
                         if matches!(
                             role,
                             "ula_server" | "other_server" | "relay_server" | "relay_other_server"
                         ) {
-                            stream.write_all(
-                                format!("local={}\n", stream.local_addr()?).as_bytes(),
-                            )?;
+                            greeting.push_str(&format!("local={}\n", stream.local_addr()?));
                         }
-                        stream.set_nonblocking(true)?;
-                        streams.push(stream);
+                        // The worker-refusal case may close a new connection
+                        // before the backend can send its greeting.
+                        match stream.write_all(greeting.as_bytes()) {
+                            Ok(()) => {
+                                stream.set_nonblocking(true)?;
+                                streams.push(stream);
+                            }
+                            Err(error) if tcp_peer_closed(&error) => {}
+                            Err(error) => return Err(error.into()),
+                        }
                     }
                     Ok(_) => return Err("fixture connection capacity exceeded".into()),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -5022,19 +8248,21 @@ fn inbound_endpoint_probe(role: &str) -> TestResult {
                             streams.swap_remove(index);
                         }
                         Ok(length) => {
-                            streams[index].write_all(&buffer[..length])?;
-                            index += 1;
+                            if measure {
+                                measured[0] += u64::try_from(length)?;
+                            }
+                            match streams[index].write_all(&buffer[..length]) {
+                                Ok(()) => index += 1,
+                                Err(error) if tcp_peer_closed(&error) => {
+                                    streams.swap_remove(index);
+                                }
+                                Err(error) => return Err(error.into()),
+                            }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             index += 1;
                         }
-                        Err(error)
-                            if matches!(
-                                error.kind(),
-                                std::io::ErrorKind::ConnectionReset
-                                    | std::io::ErrorKind::BrokenPipe
-                            ) =>
-                        {
+                        Err(error) if tcp_peer_closed(&error) => {
                             streams.swap_remove(index);
                         }
                         Err(error) => return Err(error.into()),
@@ -5043,6 +8271,9 @@ fn inbound_endpoint_probe(role: &str) -> TestResult {
                 let mut buffer = [0; 256];
                 match udp.recv_from(&mut buffer) {
                     Ok((length, peer)) => {
+                        if measure {
+                            measured[1] += u64::try_from(length)?;
+                        }
                         let mut response = format!("peer={peer}\n").into_bytes();
                         if role == "ula_server" {
                             response.extend_from_slice(
@@ -5054,6 +8285,17 @@ fn inbound_endpoint_probe(role: &str) -> TestResult {
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(error) => return Err(error.into()),
+                }
+                if measure && published != Some(measured) {
+                    std::fs::write(
+                        "/tmp/inbound-test/r054-backend-counts.tmp",
+                        serde_json::to_vec(&measured)?,
+                    )?;
+                    std::fs::rename(
+                        "/tmp/inbound-test/r054-backend-counts.tmp",
+                        "/tmp/inbound-test/r054-backend-counts",
+                    )?;
+                    published = Some(measured);
                 }
                 if matches!(role, "relay_server" | "relay_other_server")
                     && previous_active != streams.len()
@@ -5124,14 +8366,25 @@ fn inbound_endpoint_probe(role: &str) -> TestResult {
 }
 
 fn wait_file(name: &str) -> TestResult {
+    wait_file_for(name, 30)
+}
+
+fn wait_file_for(name: &str, default_seconds: u64) -> TestResult {
     let seconds = if env::var("TUNNEL_DETOUR_LUCI_REVIEW").as_deref() == Ok("1") {
         240
     } else {
-        30
+        default_seconds
     };
     wait_for(Duration::from_secs(seconds), || {
         Ok(std::path::Path::new(&format!("/tmp/inbound-test/{name}")).exists())
     })
+}
+
+fn observe_inbound_forward(lab: &Lab) -> TestResult {
+    // Scope measurement to the fixture's marked publications at the normal
+    // forward hook. The production guard owns no packet counters.
+    lab.exec(&["nft", "-f", "-"], Some(b"table inet inbound_forward_probe {\n counter forwarded {}\n chain observe { type filter hook forward priority -2; policy accept;\n  meta nfproto ipv6 meta l4proto { tcp, udp } ct mark & 0xffff0000 == 1413742592 counter name forwarded\n }\n}\n"))?;
+    Ok(())
 }
 
 fn inbound_forwarded_packets(lab: &Lab) -> TestResult<u64> {
@@ -5140,29 +8393,19 @@ fn inbound_forwarded_packets(lab: &Lab) -> TestResult<u64> {
             "nft",
             "-j",
             "list",
-            "chain",
+            "counter",
             "inet",
-            "tunnel_detour_inbound",
-            "authorized",
+            "inbound_forward_probe",
+            "forwarded",
         ],
         None,
     )?)?;
-    let mut packets = 0_u64;
-    for item in listing["nftables"]
+    listing["nftables"]
         .as_array()
         .ok_or("missing nftables listing")?
-    {
-        if let Some(expressions) = item["rule"]["expr"].as_array() {
-            for expression in expressions {
-                if let Some(value) = expression["counter"]["packets"].as_u64() {
-                    packets = packets
-                        .checked_add(value)
-                        .ok_or("packet counter overflow")?;
-                }
-            }
-        }
-    }
-    Ok(packets)
+        .iter()
+        .find_map(|entry| entry["counter"]["packets"].as_u64())
+        .ok_or_else(|| "missing isolated forwarded packet count".into())
 }
 
 fn lan_public_stream() -> TestResult<std::net::TcpStream> {
@@ -5287,30 +8530,25 @@ fn udp_closed(socket: &std::net::UdpSocket) -> TestResult {
     Ok(())
 }
 
+fn tcp_peer_closed(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::NotConnected
+    )
+}
+
 fn stream_closed(stream: &mut std::net::TcpStream) -> TestResult {
     if let Err(error) = stream.write_all(b"retired connection must be rejected") {
-        if matches!(
-            error.kind(),
-            std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::NotConnected
-        ) {
+        if tcp_peer_closed(&error) {
             return Ok(());
         }
         return Err(error.into());
     }
     match stream.read(&mut [0; 1]) {
         Ok(0) => Ok(()),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::NotConnected
-            ) =>
-        {
-            Ok(())
-        }
+        Err(error) if tcp_peer_closed(&error) => Ok(()),
         _ => Err("retired connection was not closed promptly".into()),
     }
 }
@@ -6123,6 +9361,10 @@ fn r047_dnsmasq_alias_rewrites_rebind_protection_and_lost_forwarding_guard_cache
     let lab = Lab::create(true)?;
     lab.dnsmasq_endpoints()?;
     lab.prepare_dnsmasq()?;
+    lab.exec(
+        &["uci", "set", "tunnel-detour.globals.observability=1"],
+        None,
+    )?;
     lab.exec(&["uci", "batch"], Some(b"set tunnel-detour.selected.pattern='alias.example.net'\ncommit tunnel-detour\nset dhcp.rewritten=domain\nset dhcp.rewritten.name='rewritten.example.net'\nset dhcp.rewritten.ip='192.0.2.1'\ncommit dhcp\n"))?;
     lab.exec(&["/etc/init.d/dnsmasq", "reload", "main"], None)?;
     lab.exec(&["/etc/init.d/tunnel-detour", "start"], None)?;
@@ -6160,7 +9402,7 @@ fn r047_dnsmasq_alias_rewrites_rebind_protection_and_lost_forwarding_guard_cache
     );
     wait(|| {
         Ok(
-            lab.ubus("tunnel-detour", "status", json!({}))?["status"]["last_error"]
+            lab.ubus("tunnel-detour", "status", json!({}))?["status"]["last_request_error"]
                 == "dnsmasq_integration_failed",
         )
     })?;
@@ -6195,7 +9437,7 @@ fn r047_dnsmasq_alias_rewrites_rebind_protection_and_lost_forwarding_guard_cache
     );
     wait(|| {
         Ok(
-            lab.ubus("tunnel-detour", "status", json!({}))?["status"]["last_error"]
+            lab.ubus("tunnel-detour", "status", json!({}))?["status"]["last_request_error"]
                 == "forbidden_destination",
         )
     })?;
@@ -6229,7 +9471,7 @@ fn r047_dnsmasq_alias_rewrites_rebind_protection_and_lost_forwarding_guard_cache
     );
     wait(|| {
         Ok(
-            lab.ubus("tunnel-detour", "status", json!({}))?["status"]["last_error"]
+            lab.ubus("tunnel-detour", "status", json!({}))?["status"]["last_request_error"]
                 == "dnsmasq_integration_failed",
         )
     })?;
@@ -6485,6 +9727,43 @@ fn r106_native_cache_guard_refuses_foreign_unsafe_files_and_foreign_chain_names_
         lab.background.borrow_mut()[child_index].wait()?.success(),
         "the native lock holder failed"
     );
+    let fingerprint = large_foreign_set(&lab)?;
+    lab.exec(&["/etc/init.d/tunnel-detour", "start"], None)?;
+    lab.ready(None)?;
+    assert!(lab.lookup("selected.example.net")?.contains("198.18.0.1"));
+    assert_eq!(foreign_set_fingerprint(&lab)?, fingerprint);
+    let include = format!("table inet fw4 {{\n include \"{path}\"\n}}\n");
+    lab.exec(&["nft", "-f", "-"], Some(include.as_bytes()))?;
+    lab.exec(
+        &[
+            "nft",
+            "list",
+            "chain",
+            "inet",
+            "fw4",
+            "tunnel_detour_cache_forward",
+        ],
+        None,
+    )?;
+    lab.exec(&["/etc/init.d/tunnel-detour", "stop"], None)?;
+    lab.exec(&["/usr/bin/tunnel-detour", "--uninstall"], None)?;
+    assert!(!lab.raw(&["test", "-e", path], None)?.status.success());
+    assert!(
+        !lab.raw(
+            &[
+                "nft",
+                "list",
+                "chain",
+                "inet",
+                "fw4",
+                "tunnel_detour_cache_forward"
+            ],
+            None
+        )?
+        .status
+        .success()
+    );
+    assert_eq!(foreign_set_fingerprint(&lab)?, fingerprint);
     Ok(())
 }
 
@@ -6687,8 +9966,7 @@ fn r039_adguard_connection_test_checks_applied_and_draft_local_credentials_witho
         );
         assert!(!String::from_utf8_lossy(&failed.stderr).contains("discarded-fs-draft"));
         assert!(
-            String::from_utf8_lossy(&failed.stderr)
-                .contains("private AdGuard credential storage failed")
+            String::from_utf8_lossy(&failed.stderr).contains("adguard_credentials_storage_failed")
         );
         Ok(())
     };
@@ -7114,7 +10392,8 @@ fn r133_isolated_transport_cannot_mutate_router_control_and_worker_crashes_close
             .inbound_marker("td-in-wan", "test", "relay-crash-closed")?
             .status
             .success())
-    })?;
+    })
+    .map_err(|error| format!("worker crash did not close the held relay: {error}"))?;
     let fresh = lab.inbound_probe("relay_client")?;
     assert!(
         fresh.status.success(),
@@ -7125,14 +10404,110 @@ fn r133_isolated_transport_cannot_mutate_router_control_and_worker_crashes_close
         lab.ubus("tunnel-detour", "inbound_status", json!({}))?["status"]["applied"],
         true
     );
-    lab.change("set tunnel-detour.inbound.enabled='0'")?;
+    // R133f: test a real worker startup refusal after the daemon is ready. The
+    // worker validates the shared chroot before touching either TCP direction.
+    const START_FAILURE: &str = "transport_worker_failed";
+    let transport_root = "/var/run/tunnel-detour/transport";
+    let moved_root = "/var/run/tunnel-detour/worker-start-refusal.example.test";
+    let inbound_status = || lab.ubus("tunnel-detour", "inbound_status", json!({}));
+    let pid = inbound_status()?["status"]["process_id"]
+        .as_u64()
+        .ok_or("missing inbound process identifier")?;
+    let check_health = |degraded: bool| -> TestResult {
+        wait(|| {
+            let status = &inbound_status()?["status"];
+            assert_eq!(status["process_id"], pid);
+            assert_eq!(status["applied"], true);
+            assert_eq!(status["observability"], false);
+            assert!(status.get("relay").is_none());
+            let expected = if degraded {
+                json!([START_FAILURE])
+            } else {
+                json!([])
+            };
+            Ok(status["degraded"] == expected)
+        })
+    };
+    let health_log = || -> TestResult<Vec<String>> {
+        let log = String::from_utf8(lab.exec(&["logread"], None)?)?;
+        assert!(!log.contains("transport worker initialization details"));
+        Ok(log
+            .lines()
+            .filter(|line| line.contains(START_FAILURE))
+            .map(str::to_owned)
+            .collect())
+    };
+    let workers_drained = || -> TestResult {
+        wait(|| {
+            Ok(!lab
+                .raw(&["ps", "w"], None)?
+                .stdout
+                .windows(b"--transport-worker".len())
+                .any(|part| part == b"--transport-worker"))
+        })
+    };
+    check_health(false)?;
+    assert!(
+        health_log()?.is_empty(),
+        "a worker crash is not a startup refusal"
+    );
+    lab.spawn_inbound_probe("relay_holding")?;
     wait(|| {
-        Ok(!lab
-            .raw(&["ps", "w"], None)?
-            .stdout
-            .windows(b"--transport-worker".len())
-            .any(|part| part == b"--transport-worker"))
+        Ok(lab
+            .inbound_marker("td-in-wan", "test", "relay-client-ready")?
+            .status
+            .success())
     })?;
+    // A missing directory supplies a real OS errno to the optional event.
+    lab.exec(&["mv", transport_root, moved_root], None)?;
+    for _ in 0..3 {
+        let refused = lab.inbound_probe("transport_start_refused")?;
+        assert!(
+            refused.status.success(),
+            "unsafe worker start left a usable stream: {}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+    }
+    check_health(true)?;
+    let warnings = health_log()?;
+    assert_eq!(warnings.len(), 1, "worker refusal warnings were repeated");
+    for detail in ["errno", "example.test", "2001:db8:", "192.0.2."] {
+        assert!(
+            !warnings[0].contains(detail),
+            "health warning exposed {detail}"
+        );
+    }
+    assert!(lab.ubus("system", "info", json!({}))?["uptime"].is_u64());
+    assert!(lab.lookup("router.lan")?.contains("192.0.2.1"));
+    lab.inbound_marker("td-in-wan", "touch", "relay-client-release")?;
+    wait(|| {
+        Ok(lab
+            .inbound_marker("td-in-wan", "test", "relay-client-complete")?
+            .status
+            .success())
+    })
+    .map_err(|error| format!("older relay did not complete during new worker refusals: {error}"))?;
+    workers_drained()?;
+    // The earlier worker delivered traffic and exited while the fault remained.
+    // Observe management for two status ticks so its completion cannot clear health.
+    let observe_until = Instant::now() + Duration::from_secs(2);
+    wait(|| {
+        assert_eq!(
+            inbound_status()?["status"]["degraded"],
+            json!([START_FAILURE])
+        );
+        Ok(Instant::now() >= observe_until)
+    })?;
+    lab.exec(&["mv", moved_root, transport_root], None)?;
+    let recovered = lab.inbound_probe("relay_client")?;
+    assert!(
+        recovered.status.success(),
+        "removing the worker startup fault did not restore relay traffic: {}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    check_health(false)?;
+    lab.change("set tunnel-detour.inbound.enabled='0'")?;
+    workers_drained()?;
     Ok(())
 }
 

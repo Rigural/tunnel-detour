@@ -19,6 +19,24 @@ fn decode(value: &Value) -> Result<InboundConfig, Box<dyn Error>> {
 }
 
 #[test]
+fn r155b_inbound_json_consent_is_strict_and_absent_from_recoverable_config()
+-> Result<(), Box<dyn Error>> {
+    let mut config = fixture();
+    assert!(!decode(&config)?.observability_enabled());
+    config["observability"] = json!(true);
+    let opted_in = decode(&config)?;
+    assert!(opted_in.observability_enabled());
+    let stored = serde_json::to_value(&opted_in)?;
+    assert!(stored.get("observability").is_none());
+    assert!(!decode(&stored)?.observability_enabled());
+    for invalid in [json!("1"), json!(1), Value::Null] {
+        config["observability"] = invalid;
+        assert!(decode(&config).is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn r050_inbound_configuration_requires_no_dns_settings_and_rejects_unsafe_wan_routing_and_paths()
 -> Result<(), Box<dyn Error>> {
     let original = fixture();

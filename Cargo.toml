@@ -3,7 +3,7 @@ members = ["sources/core", "sources/service", "sources/xtask", "sources/tests/fu
 resolver = "3"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.96"
 license = "GPL-3.0-only"
@@ -36,6 +36,21 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
+
+# Cargo's default test profile inherits these development settings.
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+
+[profile.dev.package."*"]
+debug = "none"
+
+[profile.debugging]
+inherits = "dev"
+debug = "full"
+
+[profile.debugging.package."*"]
+debug = "full"
 
 [profile.release]
 lto = "thin"

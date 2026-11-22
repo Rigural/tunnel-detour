@@ -19,6 +19,24 @@ fn configuration() -> Value {
 }
 
 #[test]
+fn r155a_json_dns_diagnostics_require_an_explicit_boolean_opt_in() -> TestResult {
+    let mut config = configuration();
+    assert!(!ServiceConfig::from_json(&serde_json::to_vec(&config)?)?.observability_enabled());
+    for setting in [false, true] {
+        config["observability"] = json!(setting);
+        assert_eq!(
+            ServiceConfig::from_json(&serde_json::to_vec(&config)?)?.observability_enabled(),
+            setting
+        );
+    }
+    for invalid in [json!("1"), json!(1), Value::Null] {
+        config["observability"] = invalid;
+        assert!(ServiceConfig::from_json(&serde_json::to_vec(&config)?).is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn r134_trusted_client_configuration_cannot_expand_the_selected_lan_or_accept_ambiguous_scopes()
 -> TestResult {
     for clients in [json!([]), json!(["192.0.2.2/32"]), json!(["192.0.2.0/25"])] {

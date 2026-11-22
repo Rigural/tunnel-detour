@@ -641,68 +641,60 @@ fn openwrt_tests_observed(
         return Err("Cargo metadata failed".into());
     }
     let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout)?;
-    // Native fixtures share a reserved Docker management subnet. Serialize their
-    // lifetimes across xtask processes; dropping the descriptor releases a crashed run.
-    // The --network=none kernel VM does not use that subnet and remains independent.
-    let _native_lock = if virtual_kernel {
-        None
-    } else {
-        let path = Path::new(
-            metadata["target_directory"]
-                .as_str()
-                .ok_or("missing Cargo target directory")?,
-        )
-        .join("openwrt-native.lock");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)?;
-        file.lock()?;
-        Some(file)
-    };
-    let binary = Path::new(
+    let target = Path::new(
         metadata["target_directory"]
             .as_str()
             .ok_or("missing Cargo target directory")?,
-    )
-    .join("x86_64-unknown-linux-musl/debug/tunnel-detour");
-    for (stage, image) in [
-        ("adguard-lab", "tunnel-detour-openwrt-lab:local"),
-        ("dnsmasq-lab", "tunnel-detour-openwrt-dnsmasq-lab:local"),
-        (
-            "transition-lab",
-            "tunnel-detour-openwrt-transition-lab:local",
-        ),
-    ] {
-        checked(Command::new("docker").current_dir(root).args([
-            "build",
-            "--target",
-            stage,
-            "--tag",
-            image,
-            "--file",
-            "sources/tests/openwrt/Dockerfile",
-            ".",
-        ]))?;
+    );
+    // Serialize native use of the reserved management subnet and, separately,
+    // VM use of the cached guest disk. Dropping either descriptor releases it.
+    let lock = target.join(if virtual_kernel {
+        "openwrt-vm.lock"
+    } else {
+        "openwrt-native.lock"
+    });
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock)?;
+    lock.lock()?;
+    if !virtual_kernel {
+        xtask::native_openwrt::check_management_network()?;
     }
-    if wan_dhcpv6 {
-        checked(Command::new("docker").current_dir(root).args([
-            "build",
-            "--target",
-            "dhcpv6-wan-lab",
-            "--tag",
-            xtask::vm::DHCPV6_WAN_IMAGE,
-            "--file",
-            "sources/tests/openwrt/Dockerfile",
-            ".",
-        ]))?;
-    }
+    let binary = target.join("x86_64-unknown-linux-musl/debug/tunnel-detour");
+    let snapshot = tempfile::tempdir()?;
+    let nonce = snapshot
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("missing OpenWrt image nonce")?;
+    let mut images = OpenWrtImages::default();
+    // Retain a separate tag for each image until all fixtures using its ID exit.
+    let mut build_image =
+        |name: &str, dockerfile: &str, stage: Option<&str>| -> Result<String, Box<dyn Error>> {
+            let id = snapshot.path().join(format!("{name}.iid"));
+            let tag = format!("tunnel-detour-openwrt-fixture:run-{nonce}-{name}");
+            let mut build = Command::new("docker");
+            build
+                .current_dir(root)
+                .args(["build", "--tag", &tag, "--file", dockerfile]);
+            if let Some(stage) = stage {
+                build.args(["--target", stage]);
+            }
+            checked(build.arg("--iidfile").arg(&id).arg("."))?;
+            images.0.push(tag);
+            Ok(std::fs::read_to_string(id)?.trim().to_owned())
+        };
+    let fixture_dockerfile = "sources/tests/openwrt/Dockerfile";
+    let adguard_image = build_image("adguard-lab", fixture_dockerfile, Some("adguard-lab"))?;
+    let dnsmasq_image = build_image("dnsmasq-lab", fixture_dockerfile, Some("dnsmasq-lab"))?;
+    let transition_image =
+        build_image("transition-lab", fixture_dockerfile, Some("transition-lab"))?;
     // A concurrent Cargo invocation can replace these artifacts while a long laboratory
     // run is active. Snapshot both files: current_exe must remain an executable path,
     // and a later container must use the same runtime as the first one.
-    let snapshot = tempfile::tempdir()?;
     let fixture_snapshot = snapshot.path().join("openwrt-fixture");
     let binary_snapshot = snapshot.path().join("tunnel-detour");
     std::fs::copy(&executable, &fixture_snapshot)?;
@@ -712,28 +704,34 @@ fn openwrt_tests_observed(
         .current_dir(root)
         .args(["--ignored", "--test-threads=1", "--nocapture"])
         .env("TUNNEL_DETOUR_OPENWRT_LAB", "1")
-        .env("TUNNEL_DETOUR_OPENWRT_BINARY", &binary_snapshot);
+        .env("TUNNEL_DETOUR_OPENWRT_BINARY", &binary_snapshot)
+        .env("TUNNEL_DETOUR_OPENWRT_ADGUARD_IMAGE", adguard_image)
+        .env("TUNNEL_DETOUR_OPENWRT_DNSMASQ_IMAGE", &dnsmasq_image)
+        .env("TUNNEL_DETOUR_OPENWRT_TRANSITION_IMAGE", transition_image);
     if let Some((directory, seconds)) = observation {
         command
             .env("TUNNEL_DETOUR_LAB_OBSERVE", directory)
             .env("TUNNEL_DETOUR_LAB_HOLD_SECONDS", seconds.to_string());
     }
     if virtual_kernel {
-        let target = Path::new(
-            metadata["target_directory"]
-                .as_str()
-                .ok_or("missing Cargo target directory")?,
-        );
+        let vm_image = if wan_dhcpv6 {
+            build_image("dhcpv6-wan-lab", fixture_dockerfile, Some("dhcpv6-wan-lab"))?
+        } else {
+            dnsmasq_image
+        };
+        let driver = build_image("vm-driver", "sources/tests/vm/Dockerfile", None)?;
         let (kernel, image) = xtask::vm::prepare(
-            root,
             target,
             &binary_snapshot,
             &fixture_snapshot,
+            &vm_image,
+            &driver,
             wan_dhcpv6,
         )?;
         command
             .env("TUNNEL_DETOUR_VM_KERNEL", kernel)
-            .env("TUNNEL_DETOUR_VM_IMAGE", image);
+            .env("TUNNEL_DETOUR_VM_IMAGE", image)
+            .env("TUNNEL_DETOUR_VM_DRIVER", driver);
     } else {
         // Guest-only faults must never run against host cgroups. Keep native
         // acceptance separate; R146 remains owned by the explicit QEMU run.
@@ -746,6 +744,21 @@ fn openwrt_tests_observed(
         command.arg(filter);
     }
     checked(&mut command)
+}
+
+#[derive(Default)]
+struct OpenWrtImages(Vec<String>);
+
+impl Drop for OpenWrtImages {
+    fn drop(&mut self) {
+        for tag in &self.0 {
+            if let Err(error) =
+                checked(Command::new("docker").args(["image", "rm", "--no-prune", tag]))
+            {
+                eprintln!("OpenWrt fixture image cleanup failed: {error}");
+            }
+        }
+    }
 }
 
 fn checked(command: &mut Command) -> Result<(), Box<dyn Error>> {

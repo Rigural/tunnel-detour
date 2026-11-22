@@ -43,6 +43,7 @@ pub async fn run(isolated: bool) -> Result<(), Box<dyn Error>> {
             } else {
                 relay
             };
+            relay.set_observability(true);
             relay.admit(incoming, admission.clone())?;
             let (mut server, _) = origin.accept().await?;
             client.shutdown().await?;
@@ -93,7 +94,7 @@ pub async fn run(isolated: bool) -> Result<(), Box<dyn Error>> {
                 assert_eq!(received, payload, "normal close lost queued output");
                 let completion = relay.next_completion().await?;
                 assert_eq!(completion.outcome, RelayOutcome::Complete);
-                assert_eq!(completion.bytes, Some((0, 256 * 1024)));
+                assert_eq!(completion.bytes, (!isolated).then_some((0, 256 * 1024)));
                 assert!(relay.connections().is_empty());
             }
             relay.shutdown().await?;

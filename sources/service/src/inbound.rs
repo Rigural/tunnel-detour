@@ -17,6 +17,8 @@ use crate::{
     inbound_firewall::{self as firewall, Sections},
     inbound_kernel::{Admissions, InboundKernel},
     integration_state::{IntegrationStateError, PrivateJournal},
+    observability::{AppliedConsent, Consent},
+    status::SnapshotPublication,
 };
 
 #[derive(Debug, Error)]
@@ -135,14 +137,26 @@ pub struct BoundInbound {
     config: InboundConfig,
     ownership: Ownership,
     journal: PrivateJournal,
+    status_writer: Option<std::fs::File>,
     healthy: bool,
     revision: u64,
+    guard_fingerprint: Option<String>,
     relay_listener: Option<TcpListener>,
     relay_sessions: RelaySessions,
-    relay_notices: BTreeMap<InboundId, (RelayOutcome, Instant)>,
-    relay_denied: u64,
+    relay_observation: Option<RelayObservation>,
+    applied_consent: AppliedConsent,
+    observability_log: crate::ObservabilityLog,
     status_error: Option<&'static str>,
     status_conflict: Value,
+    published_transport_degradation: bool,
+    status_publication: SnapshotPublication,
+}
+
+#[derive(Default)]
+struct RelayObservation {
+    notices: BTreeMap<InboundId, (RelayOutcome, Instant)>,
+    rejected: u64,
+    completed: u64,
 }
 
 async fn prepare_relay_listener(
@@ -193,6 +207,45 @@ fn same_identity(left: &InboundConfig, right: &InboundConfig) -> bool {
         && left.wan.rule_priority == right.wan.rule_priority
 }
 
+fn clear_prior_observations(config: &InboundConfig) {
+    if config.observability_enabled() {
+        return;
+    }
+    tokio::task::block_in_place(|| {
+        if InboundConfig::check_status_path(&config.status_file, config.from_uci).is_err() {
+            return;
+        }
+        let _status_writer = if config.from_uci {
+            None
+        } else {
+            let Ok(guard) = InboundConfig::status_writer(&config.status_file, false) else {
+                return;
+            };
+            guard
+        };
+        crate::management::clear_when_idle(&config.state_file, |lock| {
+            if let Some(owner) = crate::management::snapshot_owner(&config.status_file)? {
+                if owner == crate::integration_state::lock_identity(lock)? {
+                    crate::management::clear_snapshot(&config.status_file, true)?;
+                }
+                return Ok(());
+            }
+            let ownership = crate::integration_state::existing::<Ownership>(&config.state_file);
+            let same_owner = match ownership {
+                Ok(Some(ownership)) => ownership
+                    .config()
+                    .is_ok_and(|previous| same_identity(&previous, config)),
+                Ok(None) | Err(IntegrationStateError::Json(_)) => false,
+                Err(error) => return Err(InboundRuntimeError::from(error).into()),
+            };
+            if same_owner {
+                crate::management::clear_snapshot(&config.status_file, true)?;
+            }
+            Ok(())
+        });
+    });
+}
+
 fn same_network(left: &InboundConfig, right: &InboundConfig) -> bool {
     left.lan_device == right.lan_device
         && left.lan_zone == right.lan_zone
@@ -205,6 +258,90 @@ fn same_network(left: &InboundConfig, right: &InboundConfig) -> bool {
 }
 
 impl BoundInbound {
+    /// Share the daemon's local logging gate with the reload path.
+    pub fn with_observability_log(mut self, log: crate::ObservabilityLog) -> Self {
+        log.set_enabled(self.relay_observation.is_some());
+        self.observability_log = log;
+        self
+    }
+
+    fn set_observability(&mut self, applied: AppliedConsent) -> bool {
+        if self.applied_consent == applied {
+            return false;
+        }
+        self.applied_consent = applied;
+        let enabled = applied.consent.enabled();
+        self.observability_log.set_enabled(enabled);
+        self.relay_sessions.set_observability(false);
+        self.relay_sessions.set_observability(enabled);
+        self.relay_observation = enabled.then(RelayObservation::default);
+        if enabled {
+            tracing::info!(target: "tunnel_detour::diagnostics", "inbound traffic diagnostics enabled");
+        }
+        true
+    }
+
+    async fn apply_observability(&mut self) {
+        let applied = if self.config.from_uci {
+            AppliedConsent::confirm_uci(true, self.config.observability).await
+        } else {
+            AppliedConsent::for_json(self.config.observability)
+        };
+        self.set_observability(applied);
+    }
+
+    /// Revoke diagnostics independently of a traffic-policy reconciliation.
+    pub fn disable_observability(&mut self) -> Result<(), ServiceError> {
+        self.publish_revocation(AppliedConsent::default())
+    }
+
+    fn publish_revocation(&mut self, applied: AppliedConsent) -> Result<(), ServiceError> {
+        if self.set_observability(applied)
+            && let Err(error) = self.refresh_status()
+        {
+            if !matches!(error, ServiceError::Io(_)) {
+                tokio::task::block_in_place(|| {
+                    crate::observability::discard_snapshot(&self.config.status_file)
+                })?;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Publish health changes and periodic traffic metrics while consent is active.
+    pub fn refresh_diagnostics(&mut self) -> Result<(), ServiceError> {
+        if self.config.from_uci {
+            self.publish_revocation(
+                self.applied_consent
+                    .invalidate_uci(true, self.applied_consent.consent),
+            )?;
+        }
+        if self.relay_observation.is_some()
+            || self.published_transport_degradation != self.transport_degraded()?
+            || self.status_publication.retry_pending()
+        {
+            self.refresh_status()?;
+        }
+        Ok(())
+    }
+
+    /// Read consent and the inbound candidate from one committed UCI snapshot.
+    pub async fn load_uci_candidate(&mut self) -> Result<Option<InboundConfig>, ServiceError> {
+        let sections = crate::uci::read_sections().await;
+        let requested = sections
+            .as_ref()
+            .map_or(Consent::Off, |sections| sections.consent("inbound"));
+        self.publish_revocation(self.applied_consent.invalidate_uci(true, requested))?;
+        crate::inbound_uci::load_inbound_sections(sections?, false).await
+    }
+
+    fn reject_relay(&mut self) {
+        if let Some(observation) = &mut self.relay_observation {
+            observation.rejected = observation.rejected.saturating_add(1);
+        }
+    }
+
     /// Write bounded, safe status for local management. This reports application only;
     /// reachability from LAN or the public Internet requires an explicit acceptance probe.
     pub fn report_status(&mut self, error: Option<&'static str>) -> Result<(), ServiceError> {
@@ -222,17 +359,55 @@ impl BoundInbound {
 
     /// Refresh volatile session state without clearing a rejected candidate's diagnostic.
     /// Only active client endpoints are retained; recent notices contain no client identity.
-    pub fn refresh_status(&self) -> Result<(), ServiceError> {
-        let notices: Vec<_> = self.relay_notices.iter().filter(|(_, (_, at))| at.elapsed().as_secs() < 300).map(|(id, (outcome, at))| serde_json::json!({"publication":id,"outcome":outcome,"age_seconds":at.elapsed().as_secs()})).collect();
-        let value = serde_json::json!({"process_id":std::process::id(),"revision":self.revision,"phase":if self.healthy {"ready"} else {"failed"},
+    pub fn refresh_status(&mut self) -> Result<(), ServiceError> {
+        let transport_degraded = self.transport_degraded()?;
+        let degradation =
+            transport_degraded.then_some(crate::transport_worker::INITIALIZATION_FAILED);
+        let mut value = serde_json::json!({"process_id":std::process::id(),"revision":self.revision,"phase":if self.healthy {"ready"} else {"failed"},
             "last_error":self.status_error,"port_conflict":self.status_conflict,"public_addresses":self.config.wan.addresses,"publications":self.config.rules,
-            "relay":{"connections":self.relay_sessions.connections(),"rejected":self.relay_denied,"notices":notices},
+            "degraded":degradation.as_slice(),
+            "observability":self.relay_observation.is_some(),
             "applied":self.healthy && self.status_error.is_none(),"lan_reachability":"unverified","internet_reachability":"unverified"});
-        tokio::task::block_in_place(|| {
-            crate::integration_state::atomic_write(&self.config.status_file, &value)
-        })
-        .map_err(InboundRuntimeError::from)?;
+        if let Some(epoch) = self.applied_consent.consent.epoch() {
+            value["observability_epoch"] = serde_json::json!(epoch);
+        }
+        if let Some(token) = self.applied_consent.grant {
+            value["observability_grant"] = serde_json::json!(token);
+        }
+        if let Some(observation) = &mut self.relay_observation {
+            observation
+                .notices
+                .retain(|_, (_, at)| at.elapsed().as_secs() < 300);
+            let notices: Vec<_> = observation.notices.iter().map(|(id, (outcome, at))| serde_json::json!({"publication":id,"outcome":outcome,"age_seconds":at.elapsed().as_secs()})).collect();
+            value["relay"] = serde_json::json!({
+                "connections": self.relay_sessions.connections(),
+                "rejected": observation.rejected, "notices": notices, "completed": observation.completed,
+            });
+        }
+        self.write_status(value, self.relay_observation.is_some())?;
+        self.published_transport_degradation = transport_degraded;
         Ok(())
+    }
+
+    fn write_status(&self, mut value: Value, observing: bool) -> Result<(), ServiceError> {
+        tokio::task::block_in_place(|| {
+            if !self.config.from_uci {
+                // Every JSON snapshot belongs to this lock, including stopped status.
+                value["status_owner"] = serde_json::json!(self.journal.lock_identity()?);
+            }
+            let path = &self.config.status_file;
+            let written = match crate::integration_state::atomic_write(path, &value) {
+                Ok(()) => Ok(()),
+                Err(IntegrationStateError::Io(error)) => Err(error),
+                Err(error) => return Err(InboundRuntimeError::from(error).into()),
+            };
+            self.status_publication.complete(path, observing, written)?;
+            Ok(())
+        })
+    }
+
+    fn transport_degraded(&self) -> Result<bool, ServiceError> {
+        Ok(self.config.has_relays() && self.relay_sessions.transport_initialization_failed()?)
     }
 
     /// Whether the last accepted configuration is fully applied. Invalid candidates do not
@@ -263,30 +438,39 @@ impl BoundInbound {
         match event {
             Event::Completed(result) => {
                 let completion = result?;
-                let id = completion.connection.publication;
+                let (Some(observation), Some(connection)) =
+                    (&mut self.relay_observation, completion.connection)
+                else {
+                    return Ok(());
+                };
+                if completion.outcome == RelayOutcome::Complete {
+                    observation.completed = observation.completed.saturating_add(1);
+                }
+                let id = connection.publication;
                 match completion.outcome {
                     RelayOutcome::IdentityRejected => {
-                        self.relay_denied = self.relay_denied.saturating_add(1);
+                        observation.rejected = observation.rejected.saturating_add(1);
                     }
                     RelayOutcome::AdmissionTimeout => {
-                        self.relay_denied = self.relay_denied.saturating_add(1);
-                        self.relay_notices
+                        observation.rejected = observation.rejected.saturating_add(1);
+                        observation
+                            .notices
                             .insert(id, (RelayOutcome::AdmissionTimeout, Instant::now()));
                     }
                     RelayOutcome::Complete
                     | RelayOutcome::IdleTimeout
                     | RelayOutcome::Cancelled => {
-                        self.relay_notices.remove(&id);
+                        observation.notices.remove(&id);
                     }
                     outcome => {
-                        self.relay_notices.insert(id, (outcome, Instant::now()));
+                        observation.notices.insert(id, (outcome, Instant::now()));
                     }
                 }
             }
             Event::Accepted(result) => {
                 let (stream, peer) = result?;
                 let SocketAddr::V6(peer) = peer else {
-                    self.relay_denied = self.relay_denied.saturating_add(1);
+                    self.reject_relay();
                     return Ok(());
                 };
                 let public = match socket2::SockRef::from(&stream)
@@ -296,7 +480,7 @@ impl BoundInbound {
                 {
                     Some(public) if self.config.wan.addresses.contains(public.ip()) => public,
                     _ => {
-                        self.relay_denied = self.relay_denied.saturating_add(1);
+                        self.reject_relay();
                         return Ok(());
                     }
                 };
@@ -305,7 +489,7 @@ impl BoundInbound {
                         && rule.destination().requires_relay()
                         && rule.public_port().get() == public.port()
                 }) else {
-                    self.relay_denied = self.relay_denied.saturating_add(1);
+                    self.reject_relay();
                     return Ok(());
                 };
                 let source = IpAddr::V6(*peer.ip());
@@ -318,7 +502,7 @@ impl BoundInbound {
                     || (on_lan && rule.access() != InboundAccess::WanAndLan)
                     || (!on_lan && !INBOUND_INTERNET_V6.contains(peer.ip()))
                 {
-                    self.relay_denied = self.relay_denied.saturating_add(1);
+                    self.reject_relay();
                     return Ok(());
                 }
                 let generation = *self
@@ -350,7 +534,7 @@ impl BoundInbound {
                 {
                     Ok(_) => {}
                     Err(crate::RelayError::Capacity | crate::RelayError::Io(_)) => {
-                        self.relay_denied = self.relay_denied.saturating_add(1);
+                        self.reject_relay();
                     }
                     Err(error) => return Err(error.into()),
                 }
@@ -365,9 +549,15 @@ impl BoundInbound {
         if self.relay_listener.is_some() != self.config.has_relays() {
             return Err(InboundRuntimeError::State.into());
         }
-        self.config.check_network_and_paths().await?;
+        self.config
+            .check_paths_with_writer(self.status_writer.is_some())
+            .await?;
         crate::port_guard::check(&self.config).await?;
-        InboundKernel::new(&self.config).validate_routes().await?;
+        let kernel = InboundKernel::new(&self.config);
+        kernel.validate_routes().await?;
+        if !self.ownership.admissions.is_empty() {
+            kernel.check_offload().await?;
+        }
         if crate::kernel::Kernel::table_handle_for(
             crate::inbound_kernel::TABLE,
             crate::inbound_kernel::OWNER,
@@ -403,12 +593,11 @@ impl BoundInbound {
             });
         }
         let saved = self.save();
-        let guarded = InboundKernel::new(&self.config)
-            .guard(&Admissions::new())
-            .await;
+        let guarded = InboundKernel::new(&self.config).close().await;
         match (saved, guarded) {
             (Err(storage), Err(guard)) => {
                 tracing::error!(
+                    target: "tunnel_detour::health",
                     code = storage.code(),
                     "inbound retirement intent could not be persisted"
                 );
@@ -423,11 +612,23 @@ impl BoundInbound {
     /// Validate live interfaces and private ownership before creating any kernel object.
     /// No DNS frontend, resolver or exception service is required.
     pub async fn bind(config: InboundConfig) -> Result<Self, ServiceError> {
-        config.check_network_and_paths().await?;
-        crate::port_guard::check(&config).await?;
-        firewall::no_pending_changes().await?;
+        tokio::task::block_in_place(|| {
+            InboundConfig::check_status_path(&config.status_file, config.from_uci)
+        })?;
+        let preflight = async {
+            config.check_network_and_paths().await?;
+            crate::port_guard::check(&config).await?;
+            firewall::no_pending_changes().await
+        }
+        .await;
+        if let Err(error) = preflight {
+            // A failed preflight must not create ownership state.
+            clear_prior_observations(&config);
+            return Err(error);
+        }
         let path = config.state_file.clone();
         let status_path = config.status_file.clone();
+        let from_uci = config.from_uci;
         let initial = Ownership {
             version: 1,
             next_generation: 1,
@@ -436,17 +637,43 @@ impl BoundInbound {
             owned: Sections::new(),
             pending: None,
         };
-        let (journal, ownership) = tokio::task::spawn_blocking(move || {
-            crate::runtime::prepare_parent(&path)?;
-            crate::runtime::prepare_parent(&status_path)?;
-            let journal = PrivateJournal::open(path).map_err(InboundRuntimeError::from)?;
-            let state = journal.load(initial).map_err(InboundRuntimeError::from)?;
-            Ok::<_, ServiceError>((journal, state))
-        })
-        .await??;
-        let previous = ownership.config()?;
+        let (journal, ownership, previous, status_writer) =
+            tokio::task::spawn_blocking(move || {
+                crate::runtime::prepare_parent(&path)?;
+                crate::runtime::prepare_parent(&status_path)?;
+                InboundConfig::check_status_path(&status_path, from_uci)?;
+                let status_writer = if from_uci {
+                    None
+                } else {
+                    let guard = InboundConfig::status_writer(&status_path, true)?;
+                    InboundConfig::check_json_status_snapshot(&status_path, &path)?;
+                    guard
+                };
+                let journal = PrivateJournal::open(path).map_err(InboundRuntimeError::from)?;
+                if !from_uci {
+                    let identity = journal.lock_identity()?;
+                    if crate::management::snapshot_owner(&status_path)?
+                        .is_some_and(|owner| owner != identity)
+                    {
+                        return Err(crate::InboundConfigError::Paths.into());
+                    }
+                }
+                let state = journal.load(initial).map_err(InboundRuntimeError::from)?;
+                let previous = state.config()?;
+                Ok::<_, ServiceError>((journal, state, previous, status_writer))
+            })
+            .await?
+            .inspect_err(|_| clear_prior_observations(&config))?;
         if !same_identity(&previous, &config) {
             return Err(InboundRuntimeError::IdentityChange.into());
+        }
+        crate::management::clear_snapshot(&config.status_file, true)?;
+        if ownership.pending.is_none() && !ownership.owned.is_empty() {
+            // A restart can replace the published generations. Check existing NAT
+            // before entering the path that can reload firewall4, including on failure.
+            let current = firewall::snapshot().await?;
+            let observed = ownership.observed(&current)?;
+            firewall::effective_nat_matches(&previous, &observed).await?;
         }
         tokio::task::block_in_place(|| journal.save(&ownership))
             .map_err(InboundRuntimeError::from)?;
@@ -456,14 +683,19 @@ impl BoundInbound {
             config: previous,
             ownership,
             journal,
+            status_writer,
             healthy: true,
             revision: 0,
+            guard_fingerprint: None,
             relay_listener: None,
             relay_sessions,
-            relay_notices: BTreeMap::new(),
-            relay_denied: 0,
+            relay_observation: None,
+            applied_consent: AppliedConsent::default(),
+            observability_log: crate::ObservabilityLog::default(),
             status_error: None,
             status_conflict: Value::Null,
+            published_transport_degradation: false,
+            status_publication: SnapshotPublication::default(),
         };
         if let Err(error) = service.reconfigure(config).await {
             if !service.ownership.admissions.is_empty() || service.ownership.pending.is_some() {
@@ -477,20 +709,54 @@ impl BoundInbound {
     /// Preserve unaffected admissions, while allocating never-reused generations for changes.
     /// Invalid candidates fail before changing active policy; apply failures retain a closed guard.
     pub async fn reconfigure(&mut self, config: InboundConfig) -> Result<(), ServiceError> {
+        if !config.observability_enabled() {
+            self.disable_observability()?;
+        }
         if !self.healthy {
             return Err(InboundRuntimeError::State.into());
         }
         if !same_identity(&self.config, &config) {
             return Err(InboundRuntimeError::IdentityChange.into());
         }
-        config.check_network_and_paths().await?;
+        config
+            .check_paths_with_writer(self.status_writer.is_some())
+            .await?;
         firewall::no_pending_changes().await?;
         crate::port_guard::check(&config).await?;
         self.recover().await?;
         let before = firewall::snapshot().await?;
         let observed = self.ownership.observed(&before)?;
-        InboundKernel::new(&self.config).validate_routes().await?;
+        let active_kernel = InboundKernel::new(&self.config);
+        let routes_applied = active_kernel.routes_applied().await?;
+        if config.rules.rules().iter().any(|rule| rule.enabled()) {
+            active_kernel.check_offload().await?;
+        }
         firewall::validate_frontend(&before, &observed, &config)?;
+        // Inspect the current policy even when the candidate changes a different
+        // publication. Reconciliation must preserve unverified live restrictions.
+        let nat_applied =
+            self.revision != 0 && firewall::effective_nat_matches(&self.config, &observed).await?;
+        // Reload triggers are package-wide. A live, unchanged publication policy
+        // does not require another guard installation or firewall reload.
+        if self.revision != 0
+            && self.ownership.pending.is_none()
+            && same_network(&self.config, &config)
+            && self.config.router_addresses == config.router_addresses
+            && self.config.relay == config.relay
+            && self.config.max_rules == config.max_rules
+            && self.config.rules.rules() == config.rules.rules()
+            && routes_applied
+            && self.guard_fingerprint.is_some()
+            && active_kernel
+                .guard_fingerprint()
+                .await
+                .is_ok_and(|fingerprint| self.guard_fingerprint.as_ref() == Some(&fingerprint))
+            && nat_applied
+        {
+            self.config = config;
+            self.apply_observability().await;
+            return self.report_status(None);
+        }
         let mut admissions = Admissions::new();
         let mut retained = Admissions::new();
         let mut next = self.ownership.next_generation;
@@ -529,6 +795,10 @@ impl BoundInbound {
             admissions.insert(rule.id().clone(), generation);
         }
         let desired = firewall::desired(&config, &admissions)?;
+        if observed != desired {
+            firewall::verify_nat_before_change(&[(&self.config, &observed), (&config, &desired)])
+                .await?;
+        }
         // Reject a name collision before changing either the guard or the durable journal.
         for name in desired.keys() {
             if before.values.contains_key(name) && !observed.contains_key(name) {
@@ -553,21 +823,26 @@ impl BoundInbound {
         self.save()?;
         // The old context is used for retained flows; a network change retains none.
         let previous_kernel = InboundKernel::new(&self.config);
-        if self.revision == 0
-            || !same_network(&self.config, &config)
-            || retained != self.ownership.admissions
-        {
-            previous_kernel.guard(&retained).await?;
+        if self.revision == 0 || !same_network(&self.config, &config) {
+            previous_kernel.close().await?;
         } else {
-            previous_kernel.admit(&retained).await?;
+            previous_kernel
+                .retire(&self.ownership.admissions, &retained)
+                .await?;
         }
         self.relay_sessions.retain(&retained).await?;
-        self.relay_notices.retain(|id, _| retained.contains_key(id));
+        if let Some(observation) = &mut self.relay_observation {
+            observation
+                .notices
+                .retain(|id, _| retained.contains_key(id));
+        }
         if self.config.relay != config.relay {
-            let transport = crate::transport_worker::TransportWorker::new()?;
+            let transport = self.relay_sessions.reopen_transport()?;
             self.relay_sessions.shutdown().await?;
             self.relay_sessions =
                 RelaySessions::new(config.relay.limits()?).with_transport(transport);
+            self.relay_sessions
+                .set_observability(self.applied_consent.consent.enabled());
         }
         if !reuse_listener {
             self.relay_listener = prepared_listener;
@@ -583,7 +858,17 @@ impl BoundInbound {
         let kernel = InboundKernel::new(&config);
         kernel.routes().await?;
         if observed != desired || self.ownership.pending.is_some() {
-            firewall::apply(&before, &observed, &desired).await?;
+            firewall::apply(
+                &before,
+                &observed,
+                &desired,
+                &[(&self.config, &observed)],
+                &config,
+            )
+            .await?;
+        }
+        if !firewall::effective_nat_matches(&config, &desired).await? {
+            return Err(ServiceError::KernelConflict);
         }
         let committed = Ownership {
             version: 1,
@@ -597,8 +882,21 @@ impl BoundInbound {
             .map_err(InboundRuntimeError::from)?;
         self.ownership = committed;
         self.config = config;
-        InboundKernel::new(&self.config).admit(&admissions).await?;
+        let kernel = InboundKernel::new(&self.config);
+        kernel.admit(&admissions).await?;
+        self.guard_fingerprint = match kernel.guard_fingerprint().await {
+            Ok(fingerprint) => Some(fingerprint),
+            Err(error) => {
+                tracing::warn!(
+                    target: "tunnel_detour::health",
+                    code = error.code(),
+                    "could not verify the applied inbound guard"
+                );
+                None
+            }
+        };
         self.healthy = true;
+        self.apply_observability().await;
         self.revision = self.revision.saturating_add(1);
         self.report_status(None)?;
         Ok(())
@@ -622,11 +920,26 @@ impl BoundInbound {
             .validate_route_contexts(Some(&pending_config))
             .await?;
         self.healthy = false;
-        kernel.guard(&Admissions::new()).await?;
+        kernel.close().await?;
+        firewall::verify_nat_before_change(&[
+            (&self.config, &self.ownership.owned),
+            (&pending_config, &pending.owned),
+        ])
+        .await?;
         // The original intent already permits every intermediate subset of old/new owned
         // sections. Complete their removal before recording another intent, so a second
         // interruption cannot lose ownership of a first candidate's partially applied rules.
-        firewall::apply(&before, &observed, &Sections::new()).await?;
+        firewall::apply(
+            &before,
+            &observed,
+            &Sections::new(),
+            &[
+                (&self.config, &self.ownership.owned),
+                (&pending_config, &pending.owned),
+            ],
+            &self.config,
+        )
+        .await?;
         crate::kernel::RoutingOwner::inbound(&self.config, true)
             .stop_routes()
             .await?;
@@ -641,20 +954,22 @@ impl BoundInbound {
     /// Withdraw native redirects and clear their NAT cache before removing the closed guard.
     /// Ownership conflicts leave the guard closed for administrator review and safe recovery.
     pub async fn stop(&mut self) -> Result<(), ServiceError> {
+        self.set_observability(AppliedConsent::default());
         self.relay_listener = None;
         self.relay_sessions.stop_admission();
         let cleaned = self.stop_owned().await;
         let drained = self.relay_sessions.shutdown().await;
-        cleaned?;
-        drained?;
-        Ok(())
+        let cleared = crate::management::clear_snapshot(&self.config.status_file, true);
+        cleaned
+            .and(drained.map_err(ServiceError::from))
+            .and(cleared)
     }
 
     async fn stop_owned(&mut self) -> Result<(), ServiceError> {
         self.recover().await?;
         self.healthy = false;
         let kernel = InboundKernel::new(&self.config);
-        kernel.guard(&Admissions::new()).await?;
+        kernel.close().await?;
         self.relay_sessions.shutdown().await?;
         let before = firewall::snapshot().await?;
         let observed = self.ownership.observed(&before)?;
@@ -667,14 +982,24 @@ impl BoundInbound {
         kernel
             .validate_route_contexts(pending_config.as_ref())
             .await?;
-        self.ownership.pending = Some(Pending {
-            control: serde_json::to_value(&self.config)?,
-            admissions: Admissions::new(),
-            owned: Sections::new(),
-        });
-        self.save()?;
-        firewall::apply(&before, &observed, &Sections::new()).await?;
-        clear_conntrack(self.config.wan.mark_prefix).await?;
+        if !observed.is_empty() {
+            firewall::verify_nat_before_change(&[(&self.config, &observed)]).await?;
+            self.ownership.pending = Some(Pending {
+                control: serde_json::to_value(&self.config)?,
+                admissions: Admissions::new(),
+                owned: Sections::new(),
+            });
+            self.save()?;
+            firewall::apply(
+                &before,
+                &observed,
+                &Sections::new(),
+                &[(&self.config, &observed)],
+                &self.config,
+            )
+            .await?;
+        }
+        kernel.clear_conntrack().await?;
         crate::kernel::RoutingOwner::inbound(&self.config, true)
             .stop_routes()
             .await?;
@@ -683,51 +1008,12 @@ impl BoundInbound {
         self.ownership.owned.clear();
         self.ownership.pending = None;
         self.save()?;
-        tokio::task::block_in_place(|| crate::integration_state::atomic_write(&self.config.status_file,
-            &serde_json::json!({"process_id":std::process::id(),"phase":"stopped","applied":false}))).map_err(InboundRuntimeError::from)?;
+        self.write_status(
+            serde_json::json!({"process_id":std::process::id(),"phase":"stopped","applied":false,"observability":false}),
+            false,
+        )?;
         Ok(())
     }
-}
-
-async fn clear_conntrack(prefix: u32) -> Result<(), ServiceError> {
-    // Deletion output can contain every client tuple. Discard it directly rather than
-    // collecting or logging private traffic, even if the kernel contains many flows.
-    let mut child = tokio::process::Command::new("conntrack")
-        .args([
-            "-D",
-            "--family",
-            "ipv6",
-            "--mark",
-            &format!("{prefix}/0xffff0000"),
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
-    let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
-        .await
-        .map_err(|_| ServiceError::Timeout)??;
-    // conntrack returns 1 for no matches. Verify the actual postcondition independently.
-    if !status.success() && status.code() != Some(1) {
-        return Err(InboundRuntimeError::Conntrack.into());
-    }
-    let output = crate::kernel::command(
-        "conntrack",
-        &[
-            "-L".into(),
-            "--family".into(),
-            "ipv6".into(),
-            "--mark".into(),
-            format!("{prefix}/0xffff0000"),
-        ],
-        None,
-    )
-    .await?;
-    if !output.success || !output.stdout.is_empty() {
-        return Err(InboundRuntimeError::Conntrack.into());
-    }
-    Ok(())
 }
 
 /// Read-only validation shared by local management and the native UCI configuration check.
@@ -753,6 +1039,9 @@ pub async fn check_inbound_config(config: &InboundConfig) -> Result<(), ServiceE
     let mut preview = Admissions::new();
     for rule in config.rules.rules().iter().filter(|rule| rule.enabled()) {
         preview.insert(rule.id().clone(), 1);
+    }
+    if !preview.is_empty() {
+        InboundKernel::new(config).check_offload().await?;
     }
     for name in firewall::desired(config, &preview)?.keys() {
         if current.values.contains_key(name) && !owned.contains_key(name) {
@@ -781,7 +1070,7 @@ pub async fn cleanup_inbound_uci() -> Result<(), ServiceError> {
         {
             return Err(ServiceError::KernelConflict);
         }
-        return Ok(());
+        return crate::management::finish_uci_cleanup(true);
     };
     let config = ownership.config()?;
     if config.state_file != std::path::Path::new(crate::inbound_uci::STATE)
@@ -823,22 +1112,27 @@ pub async fn cleanup_inbound_uci() -> Result<(), ServiceError> {
     {
         // An empty committed journal is written only after kernel cleanup. Do not claim
         // unrelated routing objects subsequently created while this feature is disabled.
-        return Ok(());
+        return crate::management::finish_uci_cleanup(true);
     }
     let relay_sessions = RelaySessions::new(actual.relay.limits()?);
-    BoundInbound {
+    let mut service = BoundInbound {
         config: actual,
         ownership,
         journal,
+        status_writer: None,
         healthy: false,
         revision: 0,
+        guard_fingerprint: None,
         relay_listener: None,
         relay_sessions,
-        relay_notices: BTreeMap::new(),
-        relay_denied: 0,
+        relay_observation: None,
+        applied_consent: AppliedConsent::default(),
+        observability_log: crate::ObservabilityLog::default(),
         status_error: None,
         status_conflict: Value::Null,
-    }
-    .stop()
-    .await
+        published_transport_degradation: false,
+        status_publication: SnapshotPublication::default(),
+    };
+    let stopped = service.stop().await;
+    stopped.and(crate::management::finish_uci_cleanup(true))
 }

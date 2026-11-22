@@ -99,6 +99,17 @@ impl FrontendManager {
             Self::Dnsmasq(manager) => manager.reconcile(selection).await,
         }
     }
+
+    pub(crate) async fn forwarding_applied(
+        &self,
+        config: &ServiceConfig,
+    ) -> Result<bool, ServiceError> {
+        match self {
+            Self::External => Ok(true),
+            Self::Adguard(manager) => manager.forwarding_applied(config).await,
+            Self::Dnsmasq(manager) => manager.forwarding_applied(config).await,
+        }
+    }
 }
 
 /// Preflight the selected integration without modifying either DNS frontend.

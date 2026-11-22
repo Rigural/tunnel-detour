@@ -43,7 +43,7 @@ pub enum StoreError {
 /// replacement and directory synchronization. Any write failure poisons admission until reopen.
 pub struct LeaseStore {
     path: PathBuf,
-    _lock: File,
+    lock: File,
     table: LeaseTable,
     available: bool,
 }
@@ -136,7 +136,7 @@ impl LeaseStore {
         };
         let store = Self {
             path,
-            _lock: lock,
+            lock,
             table,
             available: true,
         };
@@ -144,6 +144,16 @@ impl LeaseStore {
             store.persist(&store.table)?;
         }
         Ok(store)
+    }
+
+    /// Return the Unix device and inode of the held ownership lock. A caller
+    /// can use this identity to associate its private runtime snapshot with it.
+    #[cfg(unix)]
+    pub fn lock_identity(&self) -> io::Result<[u64; 2]> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = self.lock.metadata()?;
+        Ok([metadata.dev(), metadata.ino()])
     }
 
     pub fn table(&self) -> Result<&LeaseTable, StoreError> {

@@ -715,8 +715,16 @@ async fn measure(
     let activation_before = api.stats(&node).await?;
     let activation = Instant::now();
     exec(&node, &["uci", "set", "tunnel-detour.inbound.enabled=1"])?;
+    exec(
+        &node,
+        &["uci", "set", "tunnel-detour.inbound.observability=1"],
+    )?;
     if with_dns {
         exec(&node, &["uci", "set", "tunnel-detour.globals.enabled=1"])?;
+        exec(
+            &node,
+            &["uci", "set", "tunnel-detour.globals.observability=1"],
+        )?;
     }
     exec(&node, &["uci", "commit", "tunnel-detour"])?;
     if with_dns {

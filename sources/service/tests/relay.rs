@@ -36,11 +36,9 @@ fn admission(target: SocketAddr, publication: &str, generation: u16) -> TestResu
 }
 
 fn sessions(capacity: usize, idle: Duration) -> TestResult<RelaySessions> {
-    Ok(RelaySessions::new(RelayLimits::new(
-        capacity,
-        Duration::from_secs(2),
-        idle,
-    )?))
+    let mut relay = RelaySessions::new(RelayLimits::new(capacity, Duration::from_secs(2), idle)?);
+    relay.set_observability(true);
+    Ok(relay)
 }
 
 async fn echo(client: &mut TcpStream, server: &mut TcpStream, bytes: &[u8]) -> TestResult {
@@ -75,6 +73,63 @@ async fn closed(stream: &mut TcpStream) -> TestResult {
         }
         other => Err(format!("the retired endpoint did not close: {other:?}").into()),
     }
+}
+
+#[tokio::test]
+async fn r156b_relay_collection_is_absent_until_opt_in_and_revocation_drops_active_details()
+-> TestResult {
+    timeout(Duration::from_secs(10), async {
+        let origin = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let target = admission(origin.local_addr()?, "privacy", 1)?;
+        let mut relay = RelaySessions::new(RelayLimits::new(
+            3,
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+        )?);
+        let (mut original, incoming) = ingress().await?;
+        relay.admit(incoming, target.clone())?;
+        let (mut original_server, _) = origin.accept().await?;
+        assert!(relay.connections().is_empty());
+
+        relay.set_observability(true);
+        assert!(relay.connections().is_empty());
+        let (mut active, incoming) = ingress().await?;
+        relay.admit(incoming, target.clone())?;
+        let (mut active_server, _) = origin.accept().await?;
+        let active_view = relay.connections();
+        assert_eq!(active_view.len(), 1);
+        assert_eq!(active_view[0].id, 1, "off-period sessions leaked into IDs");
+        assert_eq!(SocketAddr::V6(active_view[0].client), active.local_addr()?);
+
+        relay.set_observability(false);
+        assert!(relay.connections().is_empty());
+        relay.set_observability(true);
+        assert!(relay.connections().is_empty());
+        echo(&mut original, &mut original_server, b"before consent").await?;
+        echo(&mut active, &mut active_server, b"after revocation").await?;
+        for stream in [
+            &mut original,
+            &mut original_server,
+            &mut active,
+            &mut active_server,
+        ] {
+            stream.shutdown().await?;
+        }
+        for _ in 0..2 {
+            let completion = relay.next_completion().await?;
+            assert_eq!(completion.outcome, RelayOutcome::Complete);
+            assert!(completion.connection.is_none() && completion.bytes.is_none());
+        }
+        let (fresh, incoming) = ingress().await?;
+        relay.admit(incoming, target)?;
+        let latest = relay.connections();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].id, 1);
+        assert_eq!(SocketAddr::V6(latest[0].client), fresh.local_addr()?);
+        relay.shutdown().await?;
+        Ok::<(), Box<dyn Error>>(())
+    })
+    .await?
 }
 
 #[tokio::test]

@@ -1,9 +1,15 @@
 //! Native inbound packet policy. Redirects themselves belong to firewall4/UCI.
 
-use std::{collections::BTreeMap, fs::OpenOptions, os::unix::fs::OpenOptionsExt, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::OpenOptions,
+    os::unix::fs::OpenOptionsExt,
+    process::Stdio,
+    time::Duration,
+};
 
 use crate::{
-    InboundConfig, ServiceError,
+    InboundConfig, InboundRuntimeError, ServiceError,
     kernel::{Kernel, RoutingOwner, checked, command},
 };
 use tunnel_detour_core::{INBOUND_INTERNET_V6, InboundAccess, InboundId};
@@ -20,6 +26,153 @@ fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).into()).collect()
 }
 
+async fn purge_conntrack(mark: String) -> Result<(), ServiceError> {
+    // Tuples can contain private traffic. Discard deletion output at the source.
+    let mut child = tokio::process::Command::new("conntrack")
+        .args(["-D", "--family", "ipv6", "--mark", &mark])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .map_err(|_| ServiceError::Timeout)??;
+    // conntrack may report no matches with exit 1; verify the postcondition.
+    if !status.success() && status.code() != Some(1) {
+        return Err(InboundRuntimeError::Conntrack.into());
+    }
+    let listing = command(
+        "conntrack",
+        &args(&["-L", "--family", "ipv6", "--mark", &mark]),
+        None,
+    )
+    .await?;
+    if !listing.success || !listing.stdout.is_empty() {
+        return Err(InboundRuntimeError::Conntrack.into());
+    }
+    Ok(())
+}
+
+async fn nft_listing(options: &[&str]) -> Result<Vec<u8>, ServiceError> {
+    let output =
+        crate::kernel::command_with_limit("nft", &args(options), None, 4 * 1024 * 1024).await?;
+    if !output.success {
+        return Err(ServiceError::KernelConflict);
+    }
+    Ok(output.stdout)
+}
+
+/// Read only the pinned firewall4 software flowtable and its canonical user.
+/// Kernel validation refuses deletion if another live rule references the table.
+async fn replace_software_flowtable() -> Result<String, ServiceError> {
+    let definition =
+        String::from_utf8(nft_listing(&["-s", "list", "flowtable", "inet", "fw4", "ft"]).await?)
+            .map_err(|_| ServiceError::KernelConflict)?;
+    let mut definition = definition.lines().map(str::trim);
+    if !definition.any(|line| line == "flowtable ft {") {
+        return Err(ServiceError::KernelConflict);
+    }
+    let mut flowtable = String::from("delete flowtable inet fw4 ft\nadd flowtable inet fw4 ft {\n");
+    loop {
+        let line = definition.next().ok_or(ServiceError::KernelConflict)?;
+        if line.starts_with("flags ") {
+            return Err(ServiceError::KernelConflict);
+        }
+        flowtable.push_str(line);
+        flowtable.push('\n');
+        if line == "}" {
+            break;
+        }
+    }
+    let rules: serde_json::Value = serde_json::from_slice(
+        &nft_listing(&["-j", "-s", "-a", "list", "chain", "inet", "fw4", "forward"]).await?,
+    )
+    .map_err(|_| ServiceError::KernelConflict)?;
+    let objects = rules["nftables"]
+        .as_array()
+        .ok_or(ServiceError::KernelConflict)?;
+    let mut rules = objects.iter().filter_map(|object| object.get("rule"));
+    // In the pinned template offload is the first rule. An administrator may
+    // prepend a rule, but only the unmodified native expression can be replaced.
+    let canonical = |rule: &serde_json::Value| {
+        let Some([filter, action]) = rule["expr"].as_array().map(Vec::as_slice) else {
+            return false;
+        };
+        let filter = &filter["match"];
+        rule.get("comment").is_none()
+            && filter["op"] == "=="
+            && filter["left"]["meta"]["key"] == "l4proto"
+            && filter["right"]["set"].as_array().is_some_and(|set| {
+                set.len() == 2
+                    && set.contains(&serde_json::json!("tcp"))
+                    && set.contains(&serde_json::json!("udp"))
+            })
+            && action["flow"]["flowtable"] == "@ft"
+    };
+    let rule = rules
+        .find(|rule| canonical(rule))
+        .ok_or(ServiceError::KernelConflict)?;
+    let next = rules.next();
+    let handle = rule["handle"]
+        .as_u64()
+        .ok_or(ServiceError::KernelConflict)?;
+    let mut transaction = format!("delete rule inet fw4 forward handle {handle}\n{flowtable}");
+    let expr = "meta l4proto { tcp, udp } flow offload @ft";
+    if let Some(next) = next {
+        let anchor = next["handle"]
+            .as_u64()
+            .ok_or(ServiceError::KernelConflict)?;
+        transaction.push_str(&format!(
+            "insert rule inet fw4 forward position {anchor} {expr}\n"
+        ));
+    } else {
+        transaction.push_str(&format!("add rule inet fw4 forward {expr}\n"));
+    }
+    Ok(transaction)
+}
+
+pub(crate) async fn lock_firewall() -> Result<std::fs::File, ServiceError> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(
+            i32::try_from((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits())
+                .map_err(|_| ServiceError::KernelConflict)?,
+        )
+        .open("/var/run/fw4.lock")?;
+    if !lock.metadata()?.is_file() {
+        return Err(ServiceError::KernelConflict);
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match lock.try_lock() {
+                Ok(()) => return Ok::<(), std::io::Error>(()),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            }
+        }
+    })
+    .await
+    .map_err(|_| ServiceError::Timeout)??;
+    Ok(lock)
+}
+
+async fn apply_nft(rules: &str) -> Result<(), ServiceError> {
+    checked(
+        "nft",
+        args(&["--check", "--file", "-"]),
+        Some(rules.as_bytes()),
+    )
+    .await?;
+    checked("nft", args(&["--file", "-"]), Some(rules.as_bytes())).await
+}
+
 fn route_type(value: Option<&serde_json::Value>, number: u64, name: &str) -> bool {
     // ip -N emits Linux rtnetlink RTN_* values, including string-valued "7" for
     // RTN_UNREACHABLE. Older listings use names; absent type means RTN_UNICAST (1).
@@ -30,6 +183,64 @@ fn route_type(value: Option<&serde_json::Value>, number: u64, name: &str) -> boo
                 .as_str()
                 .is_some_and(|value| value.parse::<u64>().ok() == Some(number))
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum OwnedRoute {
+    ClosedDefault,
+    WanDefault,
+    WanGateway,
+    Lan(ipnet::IpNet),
+}
+
+fn owned_route(
+    route: &serde_json::Value,
+    config: &InboundConfig,
+) -> Result<Option<OwnedRoute>, ServiceError> {
+    let destination = route["dst"].as_str().ok_or(ServiceError::KernelConflict)?;
+    let device = route["dev"].as_str();
+    let gateway = route["gateway"].as_str();
+    let metric = route["metric"].as_u64();
+    let unicast = route_type(route.get("type"), 1, "unicast");
+    if destination == "default" {
+        if route_type(route.get("type"), 7, "unreachable")
+            && gateway.is_none()
+            && metric == Some(32767)
+        {
+            return Ok(Some(OwnedRoute::ClosedDefault));
+        }
+        return Ok((unicast
+            && device == Some(config.wan.device.as_str())
+            && gateway == Some(config.wan.gateway.to_string().as_str())
+            && metric == Some(10))
+        .then_some(OwnedRoute::WanDefault));
+    }
+    let network: ipnet::IpNet = if destination.contains('/') {
+        destination
+            .parse()
+            .map_err(|_| ServiceError::KernelConflict)?
+    } else {
+        ipnet::IpNet::new(
+            destination
+                .parse()
+                .map_err(|_| ServiceError::KernelConflict)?,
+            128,
+        )
+        .map_err(|_| ServiceError::KernelConflict)?
+    };
+    if !unicast || gateway.is_some() || metric != Some(1024) {
+        return Ok(None);
+    }
+    if network.addr() == config.wan.gateway
+        && network.prefix_len() == 128
+        && device == Some(config.wan.device.as_str())
+    {
+        return Ok(Some(OwnedRoute::WanGateway));
+    }
+    Ok(
+        (config.lan_networks.contains(&network) && device == Some(config.lan_device.as_str()))
+            .then_some(OwnedRoute::Lan(network)),
+    )
 }
 
 impl<'a> InboundKernel<'a> {
@@ -47,165 +258,166 @@ impl<'a> InboundKernel<'a> {
         &self,
         pending: Option<&InboundConfig>,
     ) -> Result<(), ServiceError> {
-        RoutingOwner::inbound(self.config, true)
-            .validate_routing_ownership()
-            .await?;
-        let output = command(
-            "ip",
-            &args(&[
-                "-j",
-                "-N",
-                "-6",
-                "route",
-                "show",
-                "table",
-                &self.config.wan.route_table.to_string(),
-            ]),
+        self.inspect_routes(pending).await.map(|_| ())
+    }
+
+    /// Check that every route and the selecting rule are installed, without repairing loss.
+    pub(crate) async fn routes_applied(&self) -> Result<bool, ServiceError> {
+        self.inspect_routes(None).await
+    }
+
+    async fn inspect_routes(&self, pending: Option<&InboundConfig>) -> Result<bool, ServiceError> {
+        let owner = RoutingOwner::inbound(self.config, true);
+        let rule = owner.owned_rule_exists().await?;
+        let mut expected = BTreeSet::from([
+            OwnedRoute::ClosedDefault,
+            OwnedRoute::WanDefault,
+            OwnedRoute::WanGateway,
+        ]);
+        expected.extend(self.config.lan_networks.iter().filter_map(|network| {
+            matches!(network, ipnet::IpNet::V6(_)).then_some(OwnedRoute::Lan(*network))
+        }));
+        for route in owner.routing_routes().await? {
+            if crate::kernel::number(&route["protocol"]) != Some(242) {
+                return Err(ServiceError::KernelConflict);
+            }
+            if let Some(kind) = owned_route(&route, self.config)? {
+                expected.remove(&kind);
+            } else if let Some(config) = pending
+                && owned_route(&route, config)?.is_some()
+            {
+                continue;
+            } else {
+                return Err(ServiceError::KernelConflict);
+            }
+        }
+        Ok(rule && expected.is_empty())
+    }
+
+    /// Fingerprint only the stateless owned policy, including the kernel object handles.
+    pub(crate) async fn guard_fingerprint(&self) -> Result<String, ServiceError> {
+        if Kernel::table_handle_for(TABLE, OWNER).await?.is_none() {
+            return Err(ServiceError::KernelConflict);
+        }
+        let output = crate::kernel::command_with_limit(
+            "nft",
+            &args(&["--stateless", "--handle", "list", "table", "inet", TABLE]),
             None,
+            4 * 1024 * 1024,
         )
         .await?;
         if !output.success {
-            if String::from_utf8_lossy(&output.stderr).contains("FIB table does not exist") {
-                return Ok(());
-            }
             return Err(ServiceError::KernelConflict);
         }
-        let routes: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
-        for route in routes {
-            let mut recognized = false;
-            for config in std::iter::once(self.config).chain(pending) {
-                let destination = route["dst"].as_str().ok_or(ServiceError::KernelConflict)?;
-                let device = route["dev"].as_str();
-                let gateway = route["gateway"].as_str();
-                let metric = route["metric"].as_u64();
-                let expected = if destination == "default" {
-                    (route_type(route.get("type"), 7, "unreachable")
-                        && gateway.is_none()
-                        && metric == Some(32767))
-                        || (route_type(route.get("type"), 1, "unicast")
-                            && device == Some(config.wan.device.as_str())
-                            && gateway == Some(config.wan.gateway.to_string().as_str())
-                            && metric == Some(10))
-                } else {
-                    let network: ipnet::IpNet = if destination.contains('/') {
-                        destination
-                            .parse()
-                            .map_err(|_| ServiceError::KernelConflict)?
-                    } else {
-                        ipnet::IpNet::new(
-                            destination
-                                .parse()
-                                .map_err(|_| ServiceError::KernelConflict)?,
-                            128,
-                        )
-                        .map_err(|_| ServiceError::KernelConflict)?
-                    };
-                    gateway.is_none()
-                        && metric == Some(1024)
-                        && route_type(route.get("type"), 1, "unicast")
-                        && ((network.addr() == config.wan.gateway
-                            && network.prefix_len() == 128
-                            && device == Some(config.wan.device.as_str()))
-                            || (config.lan_networks.contains(&network)
-                                && device == Some(config.lan_device.as_str())))
-                };
-                recognized |= expected;
+        let digest = command("sha256sum", &[], Some(&output.stdout)).await?;
+        let digest = std::str::from_utf8(&digest.stdout)
+            .ok()
+            .filter(|_| digest.success)
+            .and_then(|text| text.split_whitespace().next())
+            .filter(|text| text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or(ServiceError::KernelConflict)?;
+        Ok(digest.to_owned())
+    }
+
+    /// Close admissions and invalidate accelerated shortcuts without erasing the
+    /// retained conntrack marks that keep retired tuples from being reused.
+    pub(crate) async fn close(&self) -> Result<(), ServiceError> {
+        self.retire_guard(&Admissions::new()).await
+    }
+
+    /// Retire affected generations without changing the surviving connections.
+    pub(crate) async fn retire(
+        &self,
+        current: &Admissions,
+        retained: &Admissions,
+    ) -> Result<(), ServiceError> {
+        if current == retained {
+            return self.update_guard(retained).await;
+        }
+        self.retire_guard(retained).await
+    }
+
+    async fn retire_guard(&self, admissions: &Admissions) -> Result<(), ServiceError> {
+        let attempt = async {
+            let _lock = lock_firewall().await?;
+            let mut rules = self.guard_rules(admissions).await?;
+            if self.software_offload().await? {
+                rules.push_str(&replace_software_flowtable().await?);
             }
-            if !recognized {
-                return Err(ServiceError::KernelConflict);
+            apply_nft(&rules).await
+        }
+        .await;
+        if let Err(error) = attempt {
+            // Attempt both independent containment measures even if the
+            // first fails. Preserve the initiating error and do not expose
+            // kernel output in diagnostics.
+            let guard = self.update_guard(&Admissions::new()).await;
+            let conntrack = self.clear_conntrack().await;
+            if guard.is_err() || conntrack.is_err() {
+                tracing::error!(
+                    target: "tunnel_detour::health",
+                    initial = error.code(),
+                    guard = guard.as_ref().err().map_or("closed", ServiceError::code),
+                    conntrack = conntrack.as_ref().err().map_or("purged", ServiceError::code),
+                    "inbound emergency containment could not be fully verified"
+                );
             }
+            return Err(error);
         }
         Ok(())
     }
 
-    /// One nft transaction closes retired generations before any native redirect is changed.
-    pub(crate) async fn guard(&self, admissions: &Admissions) -> Result<(), ServiceError> {
-        self.update_guard(admissions, true).await
+    pub(crate) async fn clear_conntrack(&self) -> Result<(), ServiceError> {
+        purge_conntrack(format!("{}/0xffff0000", self.config.wan.mark_prefix)).await
     }
 
-    /// Widen a guard only after retired shortcuts were removed and redirects committed.
-    /// Cached retained generations remain valid and do not need another global reset.
+    /// Widen only after retired marks have been purged and redirects committed.
     pub(crate) async fn admit(&self, admissions: &Admissions) -> Result<(), ServiceError> {
-        self.update_guard(admissions, false).await
+        if !admissions.is_empty() {
+            self.check_offload().await?;
+        }
+        self.update_guard(admissions).await
     }
 
-    async fn update_guard(
-        &self,
-        admissions: &Admissions,
-        invalidate_shortcuts: bool,
-    ) -> Result<(), ServiceError> {
-        // Serialize with native firewall4. A flowtable hit bypasses this forward guard;
-        // when acceleration is present its retirement must share the same nft transaction.
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(
-                i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits())
-                    .map_err(|_| ServiceError::KernelConflict)?,
-            )
-            .open("/var/run/fw4.lock")?;
-        if !lock.metadata()?.is_file() {
-            return Err(ServiceError::KernelConflict);
-        }
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match lock.try_lock() {
-                    Ok(()) => return Ok::<(), std::io::Error>(()),
-                    Err(std::fs::TryLockError::WouldBlock) => {
-                        tokio::time::sleep(Duration::from_millis(25)).await
-                    }
-                    Err(std::fs::TryLockError::Error(error)) => return Err(error),
-                }
-            }
-        })
-        .await
-        .map_err(|_| ServiceError::Timeout)??;
-        let previous = Kernel::table_handle_for(TABLE, OWNER).await?;
-        let mut rules = self.rules(admissions, previous)?;
+    pub(crate) async fn check_offload(&self) -> Result<(), ServiceError> {
+        self.software_offload().await.map(|_| ())
+    }
+
+    async fn software_offload(&self) -> Result<bool, ServiceError> {
         let tables = command("nft", &args(&["--json", "list", "flowtables"]), None).await?;
         if !tables.success {
             return Err(ServiceError::KernelConflict);
         }
-        let tables: serde_json::Value = serde_json::from_slice(&tables.stdout)?;
-        let mut accelerated = false;
+        let tables: serde_json::Value =
+            serde_json::from_slice(&tables.stdout).map_err(|_| ServiceError::KernelConflict)?;
+        let mut enabled = false;
         for item in tables["nftables"]
             .as_array()
             .ok_or(ServiceError::KernelConflict)?
         {
             if let Some(table) = item.get("flowtable") {
-                if table["family"] != "inet" || table["table"] != "fw4" || table["name"] != "ft" {
+                if table["family"] != "inet"
+                    || table["table"] != "fw4"
+                    || table["name"] != "ft"
+                    || table["flags"]
+                        .as_array()
+                        .is_some_and(|flags| flags.iter().any(|flag| flag == "offload"))
+                {
                     return Err(ServiceError::KernelConflict);
                 }
-                accelerated = true;
+                enabled = true;
             }
         }
-        if accelerated && invalidate_shortcuts {
-            let native =
-                crate::kernel::command_with_limit("fw4", &args(&["print"]), None, 2 * 1024 * 1024)
-                    .await?;
-            if !native.success {
-                return Err(ServiceError::KernelConflict);
-            }
-            let native =
-                String::from_utf8(native.stdout).map_err(|_| ServiceError::KernelConflict)?;
-            if !native
-                .lines()
-                .any(|line| line.trim() == "delete flowtable inet fw4 ft")
-            {
-                return Err(ServiceError::KernelConflict);
-            }
-            rules.push_str(&native);
-        }
-        checked(
-            "nft",
-            args(&["--check", "--file", "-"]),
-            Some(rules.as_bytes()),
-        )
-        .await?;
-        checked("nft", args(&["--file", "-"]), Some(rules.as_bytes())).await
+        Ok(enabled)
+    }
+
+    async fn update_guard(&self, admissions: &Admissions) -> Result<(), ServiceError> {
+        apply_nft(&self.guard_rules(admissions).await?).await
+    }
+
+    async fn guard_rules(&self, admissions: &Admissions) -> Result<String, ServiceError> {
+        let previous = Kernel::table_handle_for(TABLE, OWNER).await?;
+        self.rules(admissions, previous)
     }
 
     fn rules(
@@ -324,14 +536,14 @@ impl<'a> InboundKernel<'a> {
                 native_wan_egress.push_str(&format!("  {original} ct state related meta l4proto ipv6-icmp oifname \"{wan}\" ct original ip6 saddr != @lan_v6 return\n"));
                 // Match post-DNAT endpoints as well as the original tuple: an existing NAT
                 // mapping must not authorize another host, helper port or changed publication.
-                rules.push_str(&format!("  {original} ct direction original iifname \"{wan}\" oifname \"{lan}\" ip6 daddr {} {transport} dport {} counter return comment \"{}:original\"\n", destination.ip(), destination.port(), rule.id().as_str()));
-                rules.push_str(&format!("  {original} ct direction reply iifname \"{lan}\" oifname \"{wan}\" ip6 saddr {} {transport} sport {} counter return comment \"{}:reply\"\n", destination.ip(), destination.port(), rule.id().as_str()));
+                rules.push_str(&format!("  {original} ct direction original iifname \"{wan}\" oifname \"{lan}\" ip6 daddr {} {transport} dport {} return comment \"{}:original\"\n", destination.ip(), destination.port(), rule.id().as_str()));
+                rules.push_str(&format!("  {original} ct direction reply iifname \"{lan}\" oifname \"{wan}\" ip6 saddr {} {transport} sport {} return comment \"{}:reply\"\n", destination.ip(), destination.port(), rule.id().as_str()));
                 // PMTU and other related ICMPv6 errors carry the admitted flow's tuple.
                 rules.push_str(&format!("  {original} ct state related meta l4proto ipv6-icmp iifname \"{wan}\" oifname \"{lan}\" ip6 daddr {} return\n", destination.ip()));
                 rules.push_str(&format!("  {original} ct state related meta l4proto ipv6-icmp iifname \"{lan}\" oifname \"{wan}\" return\n"));
                 if rule.access() == InboundAccess::WanAndLan {
-                    rules.push_str(&format!("  {original} ct direction original iifname \"{lan}\" oifname \"{lan}\" ip6 daddr {} {transport} dport {} counter return comment \"{}:lan-original\"\n", destination.ip(), destination.port(), rule.id().as_str()));
-                    rules.push_str(&format!("  {original} ct direction reply iifname \"{lan}\" oifname \"{lan}\" ip6 saddr {} {transport} sport {} counter return comment \"{}:lan-reply\"\n", destination.ip(), destination.port(), rule.id().as_str()));
+                    rules.push_str(&format!("  {original} ct direction original iifname \"{lan}\" oifname \"{lan}\" ip6 daddr {} {transport} dport {} return comment \"{}:lan-original\"\n", destination.ip(), destination.port(), rule.id().as_str()));
+                    rules.push_str(&format!("  {original} ct direction reply iifname \"{lan}\" oifname \"{lan}\" ip6 saddr {} {transport} sport {} return comment \"{}:lan-reply\"\n", destination.ip(), destination.port(), rule.id().as_str()));
                     rules.push_str(&format!("  {original} ct state related meta l4proto ipv6-icmp iifname \"{lan}\" oifname \"{lan}\" ip6 daddr @lan_v6 return\n"));
                     lan_egress.push_str(&format!("  {original} ct direction reply oifname \"{lan}\" ip6 daddr @lan_v6 return\n"));
                 }

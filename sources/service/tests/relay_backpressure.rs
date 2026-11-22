@@ -88,6 +88,7 @@ async fn r074_stopped_readers_apply_backpressure_in_each_direction_and_resuming_
                 Duration::from_secs(2),
                 Duration::from_secs(10),
             )?);
+            relay.set_observability(true);
             relay.admit(
                 incoming,
                 RelayAdmission {

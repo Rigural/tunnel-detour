@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     net::{IpAddr, Ipv6Addr},
     num::NonZeroUsize,
-    path::{Component, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 use thiserror::Error;
 use tunnel_detour_core::{
@@ -105,6 +105,8 @@ struct RawInbound {
     relay: InboundRelay,
     state_file: PathBuf,
     status_file: PathBuf,
+    #[serde(default)]
+    observability: bool,
     rules: Vec<InboundRuleSpec>,
     #[serde(default = "default_capacity")]
     max_rules: usize,
@@ -135,11 +137,70 @@ pub struct InboundConfig {
     pub(crate) relay: InboundRelay,
     pub(crate) state_file: PathBuf,
     pub(crate) status_file: PathBuf,
+    // Consent belongs to saved settings, never to the firewall recovery journal.
+    #[serde(skip)]
+    pub(crate) observability: crate::observability::Consent,
+    #[serde(skip)]
+    pub(crate) from_uci: bool,
     pub(crate) rules: InboundRules,
-    max_rules: usize,
+    pub(crate) max_rules: usize,
 }
 
 impl InboundConfig {
+    /// Read one bounded JSON file. Reload refuses special files without waiting for input.
+    pub fn load_file(path: &Path) -> Result<Self, crate::ServiceError> {
+        Ok(Self::from_json(&crate::config::read_config_file(path)?)?)
+    }
+
+    /// Whether the operator explicitly enabled local diagnostics.
+    pub fn observability_enabled(&self) -> bool {
+        self.observability.enabled()
+    }
+
+    pub(crate) fn check_status_path(path: &Path, from_uci: bool) -> Result<(), InboundConfigError> {
+        if !from_uci
+            && crate::management::is_uci_status_path(path).map_err(|_| InboundConfigError::Paths)?
+        {
+            return Err(InboundConfigError::Paths);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn status_writer(
+        path: &Path,
+        create: bool,
+    ) -> Result<Option<std::fs::File>, crate::ServiceError> {
+        crate::management::status_writer(path, create, || InboundConfigError::Paths.into())
+    }
+
+    pub(crate) fn check_json_status_snapshot(
+        status_path: &Path,
+        state_path: &Path,
+    ) -> Result<bool, crate::ServiceError> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let Some(owner) = crate::management::snapshot_owner(status_path)? else {
+            return Ok(false);
+        };
+        let state_lock = crate::integration_state::appended_path(state_path, ".lock");
+        match std::fs::symlink_metadata(state_lock) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && [metadata.dev(), metadata.ino()] == owner
+                    && metadata.uid() == rustix::process::geteuid().as_raw()
+                    && metadata.nlink() == 1
+                    && metadata.permissions().mode() & 0o077 == 0 =>
+            {
+                Ok(true)
+            }
+            Ok(_) => Err(InboundConfigError::Paths.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(InboundConfigError::Paths.into())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Validate the complete candidate without binding, changing routes, or contacting DNS.
     pub fn from_json(bytes: &[u8]) -> Result<Self, InboundConfigError> {
         if bytes.len() > 1_048_576 {
@@ -265,6 +326,8 @@ impl InboundConfig {
             relay: raw.relay,
             state_file: raw.state_file,
             status_file: raw.status_file,
+            observability: crate::observability::Consent::from_flag(raw.observability),
+            from_uci: false,
             rules,
             max_rules: raw.max_rules,
         };
@@ -314,6 +377,13 @@ impl InboundConfig {
     /// Check live address ownership, LAN containment, the WAN gateway and existing file safety.
     /// This read-only preflight does not install or prove the firewall publication itself.
     pub async fn check_network_and_paths(&self) -> Result<(), crate::ServiceError> {
+        self.check_paths_with_writer(false).await
+    }
+
+    pub(crate) async fn check_paths_with_writer(
+        &self,
+        owns_status_writer: bool,
+    ) -> Result<(), crate::ServiceError> {
         use std::collections::BTreeSet;
         #[derive(Deserialize)]
         struct Address {
@@ -409,8 +479,16 @@ impl InboundConfig {
         }
         let state = self.state_file.clone();
         let status = self.status_file.clone();
-        let existing = tokio::task::spawn_blocking(move || {
+        let from_uci = self.from_uci;
+        let existing = tokio::task::spawn_blocking(move || -> Result<_, crate::ServiceError> {
             use std::os::unix::fs::PermissionsExt;
+            Self::check_status_path(&status, from_uci)?;
+            if !from_uci
+                && !Self::check_json_status_snapshot(&status, &state)?
+                && !owns_status_writer
+            {
+                Self::status_writer(&status, false)?;
+            }
             for path in [
                 &state,
                 &status,
@@ -420,21 +498,21 @@ impl InboundConfig {
                     Ok(metadata)
                         if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 =>
                     {
-                        return Err(InboundConfigError::Paths);
+                        return Err(InboundConfigError::Paths.into());
                     }
                     Ok(_) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => return Err(InboundConfigError::Paths),
+                    Err(_) => return Err(InboundConfigError::Paths.into()),
                 }
                 match std::fs::symlink_metadata(path.parent().ok_or(InboundConfigError::Paths)?) {
                     Ok(metadata)
                         if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 =>
                     {
-                        return Err(InboundConfigError::Paths);
+                        return Err(InboundConfigError::Paths.into());
                     }
                     Ok(_) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => return Err(InboundConfigError::Paths),
+                    Err(_) => return Err(InboundConfigError::Paths.into()),
                 }
             }
             if let (Ok(state_parent), Ok(status_parent)) = (
@@ -443,17 +521,21 @@ impl InboundConfig {
             ) {
                 let state_file = state.file_name().ok_or(InboundConfigError::Paths)?;
                 let status_file = status.file_name().ok_or(InboundConfigError::Paths)?;
+                let writer = crate::integration_state::status_writer_path(&status);
+                let writer_name = writer.file_name().ok_or(InboundConfigError::Paths)?;
                 for suffix in ["", ".lock"] {
                     let mut reserved = state_file.to_os_string();
                     reserved.push(suffix);
-                    if state_parent == status_parent && reserved == status_file {
-                        return Err(InboundConfigError::Paths);
+                    if state_parent == status_parent
+                        && (reserved == status_file || (!from_uci && reserved == writer_name))
+                    {
+                        return Err(InboundConfigError::Paths.into());
                     }
                 }
             }
             crate::integration_state::existing::<serde_json::Value>(&state)
                 .map(|value| value.is_some())
-                .map_err(InboundConfigError::State)
+                .map_err(|error| InboundConfigError::State(error).into())
         })
         .await??;
         crate::kernel::RoutingOwner::inbound(self, existing)

@@ -22,6 +22,8 @@ pub(crate) const RULE_PRIORITY: u32 = 100;
 #[serde(deny_unknown_fields)]
 struct Globals {
     enabled: String,
+    observability: Option<String>,
+    observability_epoch: Option<String>,
     lan_network: String,
     wan_network: String,
     relay_port: Option<String>,
@@ -184,7 +186,13 @@ struct Interface {
 pub async fn load_inbound_uci(
     validate_disabled: bool,
 ) -> Result<Option<InboundConfig>, ServiceError> {
-    let mut sections = uci::read_sections().await?;
+    load_inbound_sections(uci::read_sections().await?, validate_disabled).await
+}
+
+pub(crate) async fn load_inbound_sections(
+    mut sections: uci::UciResponse,
+    validate_disabled: bool,
+) -> Result<Option<InboundConfig>, ServiceError> {
     let Some(section) = sections.values.remove("inbound") else {
         return Ok(None);
     };
@@ -192,11 +200,18 @@ pub async fn load_inbound_uci(
         return Err(UciError::Sections.into());
     }
     let value = uci::section_options(section)?;
-    if !uci::enabled(value["enabled"].as_str().ok_or(UciError::Options)?)? && !validate_disabled {
+    if !uci::service_enabled(value["enabled"].as_str().ok_or(UciError::Options)?)?
+        && !validate_disabled
+    {
         return Ok(None);
     }
-    let globals: Globals = serde_json::from_value(value)?;
-    uci::enabled(&globals.enabled)?;
+    let globals: Globals =
+        serde_json::from_value(value).map_err(crate::InboundConfigError::from)?;
+    uci::service_enabled(&globals.enabled)?;
+    let consent = uci::parse_consent(
+        globals.observability.as_deref(),
+        globals.observability_epoch.as_deref(),
+    )?;
     let mut relay = crate::inbound_config::InboundRelay::default();
     if let Some(value) = &globals.relay_port {
         relay.listen_port = value.parse().map_err(|_| UciError::Options)?;
@@ -257,7 +272,8 @@ pub async fn load_inbound_uci(
             "inbound_port" => {}
             _ => return Err(UciError::Sections.into()),
         }
-        let entry: Entry = serde_json::from_value(uci::section_options(section)?)?;
+        let entry: Entry = serde_json::from_value(uci::section_options(section)?)
+            .map_err(crate::InboundConfigError::from)?;
         rules.push(InboundRuleSpec {
             id: id.parse()?,
             name: entry.name,
@@ -277,9 +293,10 @@ pub async fn load_inbound_uci(
     let value = json!({"lan_device":lan,"lan_zone":zone(&globals.lan_network).await?,"lan_networks":networks,"router_addresses":router,"lan_router_addresses":lan_router,
         "wan_zone":zone(&globals.wan_network).await?,"wan":{"device":wan,"addresses":public,"gateway":gateway,"route_table":ROUTE_TABLE,"mark_prefix":MARK_PREFIX,"rule_priority":RULE_PRIORITY},
         "state_file":STATE,"status_file":STATUS,"rules":rules,"relay":relay});
-    Ok(Some(InboundConfig::from_json(&serde_json::to_vec(
-        &value,
-    )?)?))
+    let mut config = InboundConfig::from_json(&serde_json::to_vec(&value)?)?;
+    config.from_uci = true;
+    config.observability = consent;
+    Ok(Some(config))
 }
 
 pub(crate) async fn is_enabled() -> Result<bool, ServiceError> {
@@ -290,7 +307,7 @@ pub(crate) async fn is_enabled() -> Result<bool, ServiceError> {
     if section.kind != "inbound" {
         return Err(UciError::Sections.into());
     }
-    uci::enabled(
+    uci::service_enabled(
         section
             .options
             .get("enabled")

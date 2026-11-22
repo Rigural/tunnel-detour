@@ -21,15 +21,21 @@ start_service() {
 }
 
 reload_service() {
-	local enabled
+	local enabled revocation_status=0
 	config_load tunnel-detour
-	config_get_bool enabled inbound enabled 0
-	if [ "$enabled" -eq 0 ]; then
+	config_get enabled inbound enabled ''
+	[ -z "$enabled" ] || config_get_bool enabled inbound enabled 1
+	if procd_running tunnel-detour-inbound inbound; then
+		/usr/bin/tunnel-detour --queue-inbound-revocation || revocation_status=$?
+	fi
+	if [ "$enabled" = 0 ]; then
 		stop
 		# Keep configuration triggers registered so a later UCI enable can start us.
-		start
+		start || return $?
+		return "$revocation_status"
 	elif procd_running tunnel-detour-inbound inbound; then
-		procd_send_signal tunnel-detour-inbound inbound HUP
+		procd_send_signal tunnel-detour-inbound inbound HUP || return $?
+		return "$revocation_status"
 	else
 		start
 	fi
@@ -40,10 +46,15 @@ service_stopped() {
 }
 
 service_triggers() {
-	local lan wan
+	local enabled lan wan
 	config_load tunnel-detour
+	config_get_bool enabled inbound enabled 0
 	config_get lan inbound lan_network lan
 	config_get wan inbound wan_network wan
+	if [ "$enabled" -eq 1 ]; then
+		# Keep revocation independent of the debounced policy reload.
+		PROCD_RELOAD_DELAY=0 procd_add_config_trigger "config.change" tunnel-detour /usr/bin/tunnel-detour --queue-inbound-revocation
+	fi
 	procd_add_reload_trigger tunnel-detour
 	procd_add_interface_trigger "interface.*" "$lan" /etc/init.d/tunnel-detour-inbound reload
 	procd_add_interface_trigger "interface.*" "$wan" /etc/init.d/tunnel-detour-inbound reload

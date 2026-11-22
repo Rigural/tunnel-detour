@@ -1,6 +1,6 @@
 # Tunnel Detour
 
-Current source version: **0.2.0**. See [CHANGELOG.md](CHANGELOG.md) for the version notes.
+Current source version: **0.3.0**. See [CHANGELOG.md](CHANGELOG.md) for the version notes.
 
 Domain-based VPN exceptions for OpenWrt, implemented in Rust, with optional AdGuard Home integration. Selected HTTP and
 HTTPS connections use WAN through DNS Fake-IP mappings and a transparent TCP relay. Other traffic
@@ -19,7 +19,8 @@ clients** to IPv4/IPv6 CIDRs within it. This is not a boundary against a malicio
 
 ## LuCI interface
 
-Status shows service health and active connections. Exceptions provides per-rule validation, match
+Status shows service health and adds live connections when traffic diagnostics are enabled.
+Exceptions provides per-rule validation, match
 examples and undo before saving. Settings groups network selection and the DNS integration;
 AdGuard credentials and its connection test appear only when that integration is selected.
 Credentials are write-only in LuCI and stored outside UCI in a root-owned private file.
@@ -79,9 +80,20 @@ settings; applying changes closes affected connections.
 
 Back up existing manual forwarding and routing settings before migrating them. Conflicting
 redirects require explicit migration; Tunnel Detour does not automatically adopt unrelated rules.
+The package writes its generated redirects to UCI and updates their live rules without reloading
+the entire firewall. Runtime-only administrator rules retain their order and handles; new
+package dispatch rules do not copy administrator logging or counters. Avoid editing the same
+live rules directly with `nft` during Apply: raw edits do not acquire the firewall4 lock and
+can race the final check.
 Applied state and successful LAN access do not prove Internet reachability. Software flow
-offloading remains enabled across edits; hardware acceleration and full device acceptance
-remain separate validation work.
+offloading through OpenWrt's `inet fw4 ft` is supported. Retiring a publication refreshes that
+table and its native rule, so other accelerated flows may briefly use ordinary forwarding.
+If that update fails, the service attempts both to close new admissions and to purge IPv6
+conntrack entries for all package publications. If either operation fails, the system log
+reports both outcomes separately. A successful purge does not mean new admissions were
+blocked if the guard could not be written. A foreign flowtable or hardware
+offloading makes inbound admission fail with `kernel_conflict`. Hardware acceleration and
+full device acceptance remain separate validation work.
 
 ## Domain rules
 
@@ -160,6 +172,64 @@ wakeup mechanism. Both independent features reuse one empty runtime root, avoidi
 growth after hard crashes; uninstall removes it. This isolates copying; DNS parsing and policy
 remain in the privileged controller.
 
+## Local diagnostics
+
+DNS and inbound traffic diagnostics are off by default, including on upgraded configurations
+without an `observability` option. Enable them independently in LuCI under **Settings** and
+**Inbound ports**. The UCI flags are `tunnel-detour.globals.observability` and
+`tunnel-detour.inbound.observability` (`0` or `1`). JSON daemon configurations use the top-level
+Boolean `observability`, which defaults to `false`.
+For a running JSON DNS daemon, send SIGHUP after editing the file to apply diagnostics consent.
+The status field `restart_required` indicates other settings that will take effect on restart.
+The JSON inbound daemon applies both consent and publication configuration on SIGHUP. Use a
+separate status path for each JSON daemon. An operational JSON snapshot identifies its owner
+even with diagnostics off. Startup and inbound configuration validation reject a snapshot from
+a different owner. Each running JSON daemon also locks its status path while publication is
+unavailable. The OpenWrt UCI status paths are reserved.
+
+Opting in shows live connection addresses and aggregate request and session counters to authorized
+Status readers, including users with read-only access.
+DNS diagnostics also show exception hostnames and Fake-IP pool occupancy. OpenWrt status snapshots
+live in `/var/run`. They keep active details and bounded counters for the current opt-in period.
+The local OpenWrt system log receives operational warnings and errors with stable codes and with
+traffic details omitted. Optional diagnostics events require opt-in. Log retention and forwarding
+follow the router's logging configuration. On Apply, revocation hides optional data immediately.
+Status shows that revocation is pending until the daemon discards it. LuCI assigns a new consent
+period on each activation and saves it with the option. Every subsequent activation starts a
+fresh period even when procd handles multiple applied changes together. If LuCI rolls back an
+applied withdrawal and restores consent, the previous period remains hidden and the service
+collects only fresh diagnostics. Withdrawing consent removes an existing grant and needs no
+new file allocation. If storage prevents a new grant, diagnostics stay off. If the applied
+status cannot be published after a purge, LuCI reports it as temporarily unavailable. The
+service keeps traffic running and retries publication. If a saved UCI resolver or publication
+change is rejected while the previous policy remains active, diagnostics pause. Applying a
+valid configuration with consent enabled opens a fresh period.
+When editing UCI directly,
+invoke the service's `reload` successfully after each commit. Existing system-log entries and the
+independent logging settings of AdGuard Home or dnsmasq follow those services' policies.
+
+For an inbound `kernel_conflict`, look for `nat_stage` in the system log. `inspection` means
+nftables could not be read. `dispatch`, `rule_order` and `owned_rule` identify a zone jump, an
+earlier rule or a changed redirect that prevents verification. `concurrent_change` means the
+live rules could still be verified after the UCI commit, but the resulting plan differs
+from the one prepared before it. Review firewall4 zone family,
+source selectors and earlier rules before applying the corrected configuration. These messages
+contain no addresses, ports or rule contents.
+For `transport_worker_failed`, the system log reports a fixed startup stage, such as
+`worker_root` or `sandbox`, even with traffic diagnostics off. It does not include
+connection information. At `inherited_descriptors`, a fixed reason distinguishes
+inspection errors from an unexpected descriptor. Only opt-in diagnostics can show
+the descriptor type, its close-on-exec flag, or a system error number; they never show descriptor
+numbers, paths, or contents. A verified later worker can clear the degradation without
+restarting or reconfiguring the service.
+
+Tunnel Detour keeps the configuration, Fake-IP hostname assignments and lease timestamps it needs
+to route cached addresses safely, along with ownership journals for cleanup and recovery. The
+basic Status view and explicit configuration checks remain available with diagnostics off.
+Configuration commands return stable error codes for service failures. Remove `observability` and
+`observability_epoch` from both UCI sections before installing a version that predates diagnostics
+consent. The benchmark fixtures explicitly enable diagnostics when they measure request and relay totals.
+
 ## Development
 
 Use Rust 1.96. Network laboratories require Linux and Docker; APK builds require the
@@ -173,9 +243,43 @@ cargo xtask package --sdk /path/to/openwrt-sdk
 ```
 
 APKs, source SBOM, build metadata and checksums are written to
-`target/packages/mediatek-filogic/`. Run `cargo xtask` for laboratory and benchmark commands.
-Network tests use isolated laboratories; real-router tests require separate SSH authorization.
-The [requirement coverage map](sources/tests/requirements.md) identifies the owning tests.
+`target/packages/mediatek-filogic/`. Use the [requirement coverage map](sources/tests/requirements.md)
+to select the local laboratory:
+
+- `cargo xtask test-network` runs the isolated Linux network tests in Docker.
+- `cargo xtask test-openwrt` runs the native OpenWrt 25.12.6 scenarios in Docker.
+- `cargo xtask test-openwrt-flow r054` runs a scenario on the pinned OpenWrt x86 kernel in
+  a QEMU guest inside Docker. The driver uses software emulation, so it does not require KVM.
+  The first run needs the Docker image inputs and the pinned kernel; subsequent runs can reuse
+  the cached inputs. These commands report test results on standard output.
+
+Real-router tests require separate SSH authorization.
+`cargo xtask test-openwrt` uses a reserved Docker management subnet. If an interrupted run
+left its network behind, the runner reports the network before starting any scenario. Use
+`docker network inspect <reported-network>` to verify it is empty and no run is using it
+before removing that network with `docker network rm <reported-network>`. The harness never
+removes a pre-existing network. It retries a published HTTP connection failure once, only
+when the management endpoint responds inside the guest but the host connection is refused.
+
+### Local Rust builds and caches
+
+Development builds and tests use incremental compilation and keep source line information for
+workspace crates. Dependencies omit debug information. For full debugger symbols in both the
+workspace and its dependencies, use `cargo build --locked --profile debugging`. Use `--timings`
+to measure builds. Each checkout uses its own `target/` by default.
+
+On a host with the optional `foundation-build-cache` tool, run direct Cargo commands through it
+to record successful build artifacts. Use a stable flow name for each command and target scope.
+
+```sh
+foundation-build-cache run --flow tunnel-detour.check.core -- check --locked -p tunnel-detour-core
+foundation-build-cache run --flow tunnel-detour.test.workspace -- test --locked --workspace
+```
+
+Use plain Cargo on other hosts and run `cargo xtask` directly for packaging and laboratory work.
+When enabled for this checkout, the Foundation collector prunes inactive native artifacts. An
+optional `sccache` wrapper shares eligible compiler outputs across builds. Configure the wrapper,
+its cache size, and any Cargo job limit in your user-level configuration.
 
 ## License
 

@@ -100,28 +100,16 @@ async fn lock() -> Result<File, ServiceError> {
 }
 
 async fn owned_chains() -> Result<Vec<&'static str>, ServiceError> {
+    // Only chain identities matter; do not read unrelated sets or rules.
     let listing = kernel::command_with_limit(
         "nft",
-        &strings(&["-j", "list", "table", "inet", "fw4"]),
+        &strings(&["-j", "list", "chains", "inet"]),
         None,
         4 * 1_048_576,
     )
     .await?;
     if !listing.success {
-        let tables = kernel::command("nft", &strings(&["-j", "list", "tables"]), None).await?;
-        if !tables.success {
-            return Err(ServiceError::KernelConflict);
-        }
-        let tables: Value = serde_json::from_slice(&tables.stdout)?;
-        if tables["nftables"]
-            .as_array()
-            .ok_or(ServiceError::Protocol)?
-            .iter()
-            .any(|object| object["table"]["family"] == "inet" && object["table"]["name"] == "fw4")
-        {
-            return Err(ServiceError::KernelConflict);
-        }
-        return Ok(Vec::new());
+        return Err(ServiceError::KernelConflict);
     }
     let listing: Value = serde_json::from_slice(&listing.stdout)?;
     let objects = listing["nftables"]
@@ -131,9 +119,12 @@ async fn owned_chains() -> Result<Vec<&'static str>, ServiceError> {
     for name in CHAINS {
         if let Some(chain) = objects
             .iter()
-            .find_map(|object| (object["chain"]["name"] == name).then_some(&object["chain"]))
+            .filter_map(|object| object.get("chain"))
+            .find(|chain| {
+                chain["name"] == name && chain["family"] == "inet" && chain["table"] == "fw4"
+            })
         {
-            if chain["family"] != "inet" || chain["table"] != "fw4" || chain["comment"] != OWNER {
+            if chain["comment"] != OWNER {
                 return Err(ServiceError::KernelConflict);
             }
             owned.push(name);

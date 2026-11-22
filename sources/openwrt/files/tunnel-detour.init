@@ -26,10 +26,21 @@ start_service() {
 }
 
 reload_service() {
+	local enabled revocation_status=0
 	if procd_running tunnel-detour main; then
+		/usr/bin/tunnel-detour --queue-dns-revocation || revocation_status=$?
 		procd_send_signal tunnel-detour main HUP || return $?
+		config_load tunnel-detour
+		config_get enabled globals enabled ''
+		[ -z "$enabled" ] || config_get_bool enabled globals enabled 1
+		# rc.common still submits a procd update when start_service fails.
+		# Refuse an invalid saved candidate before replacing the active instance.
+		if [ "$enabled" != 0 ]; then
+			/usr/bin/tunnel-detour --check-uci >/dev/null || return $?
+		fi
 	fi
-	start
+	start || return $?
+	return "$revocation_status"
 }
 
 service_started() {
@@ -40,10 +51,15 @@ service_started() {
 }
 
 service_triggers() {
-	local lan wan ipv6 wan6
+	local enabled lan wan ipv6 wan6
 	config_load tunnel-detour
+	config_get_bool enabled globals enabled 0
 	config_get lan globals lan_network lan
 	config_get wan globals wan_network wan
+	if [ "$enabled" -eq 1 ]; then
+		# A privacy withdrawal must survive rpcd rolling back the applied config.
+		PROCD_RELOAD_DELAY=0 procd_add_config_trigger "config.change" tunnel-detour /usr/bin/tunnel-detour --queue-dns-revocation
+	fi
 	procd_add_reload_trigger tunnel-detour
 	procd_add_interface_trigger "interface.*" "$lan" /etc/init.d/tunnel-detour reload
 	procd_add_interface_trigger "interface.*" "$wan" /etc/init.d/tunnel-detour reload

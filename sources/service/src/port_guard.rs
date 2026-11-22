@@ -326,8 +326,13 @@ pub(crate) async fn inspect(
     match tokio::task::spawn_blocking(move || snapshot(&ports)).await? {
         Ok(uses) => Ok(uses),
         Err(error) => {
-            tracing::warn!(error=%error, "router socket ownership inspection failed");
-            Err(error.into())
+            let error = ServiceError::from(error);
+            tracing::warn!(
+                target: "tunnel_detour::health",
+                code = error.code(),
+                "router socket ownership inspection failed"
+            );
+            Err(error)
         }
     }
 }

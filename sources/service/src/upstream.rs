@@ -212,7 +212,9 @@ impl RealResolver {
                 .await?;
             let answer = Message::from_vec(&bytes).map_err(|_| ServiceError::Protocol)?;
             if answer.metadata.response_code != ResponseCode::NoError {
-                return Err(ServiceError::NoAddress);
+                return Err(ServiceError::UpstreamResponse(
+                    answer.metadata.response_code,
+                ));
             }
             // Follow only owner-matching CNAMEs. Unrelated additional records cannot select an egress target.
             let mut followed_in_packet = false;
@@ -226,23 +228,21 @@ impl RealResolver {
                         crate::dnsmasq::validate_alias(config, owned, &current).await?;
                     }
                     if let Some(filtering) = filtering {
-                        filtering
-                            .check_host(
-                                current.as_str(),
-                                if kind == RecordType::AAAA {
-                                    "AAAA"
-                                } else {
-                                    "A"
-                                },
-                                client,
-                            )
-                            .await?;
-                        if &current != domain {
-                            // The pinned AdGuard version also filters aliases
-                            // using the query type, not just the CNAME RR type.
-                            filtering
-                                .check_host(current.as_str(), "CNAME", client)
-                                .await?;
+                        let qtype = if kind == RecordType::AAAA {
+                            "AAAA"
+                        } else {
+                            "A"
+                        };
+                        let address_check = filtering.check_host(current.as_str(), qtype, client);
+                        if &current == domain {
+                            address_check.await?;
+                        } else {
+                            // The pinned AdGuard version applies both checks to aliases.
+                            // Both read-only results are required before a WAN dial.
+                            tokio::try_join!(
+                                address_check,
+                                filtering.check_host(current.as_str(), "CNAME", client)
+                            )?;
                         }
                     }
                 }
@@ -315,7 +315,25 @@ impl RealResolver {
                         current = target;
                         followed_in_packet = true;
                     }
-                    None if !followed_in_packet => return Err(ServiceError::NoAddress),
+                    None if !followed_in_packet => {
+                        // A referral is unfinished resolution. A negative answer may
+                        // include both an SOA and NS records for its enclosing zone.
+                        let authority = |record: &&hickory_proto::rr::Record| {
+                            record.dns_class == DNSClass::IN && record.name.zone_of(&current_name)
+                        };
+                        let records = answer.authorities.iter().filter(authority);
+                        let soa = records
+                            .clone()
+                            .filter(|record| matches!(record.data, RData::SOA(_)))
+                            .max_by_key(|record| record.name.num_labels());
+                        if records.clone().any(|record| {
+                            matches!(record.data, RData::NS(_))
+                                && soa.is_none_or(|soa| !record.name.zone_of(&soa.name))
+                        }) {
+                            return Err(ServiceError::Protocol);
+                        }
+                        return Err(ServiceError::NoAddress);
+                    }
                     None => break,
                 }
             }

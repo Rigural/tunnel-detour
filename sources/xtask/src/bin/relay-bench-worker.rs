@@ -268,6 +268,7 @@ async fn relay(listen: SocketAddr, target: SocketAddr, lan: String, reply: Strin
     let listener = socket.listen(u32::try_from(tunnel_detour_service::RELAY_LISTEN_BACKLOG)?)?;
     std::fs::create_dir_all("/var/run")?;
     let mut sessions = RelaySessions::new(limits).with_isolated_transport()?;
+    sessions.set_observability(true);
     let mut capacity_denials = 0_u64;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     println!("{}", serde_json::json!({"ready":true,"role":"relay"}));

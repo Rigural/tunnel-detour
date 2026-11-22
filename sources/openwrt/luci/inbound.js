@@ -49,7 +49,26 @@ function copyControl(value, label) {
 }
 
 return baseclass.extend({
-	load: () => Promise.all([callStatus().catch(() => ({ unavailable: true })), Promise.all([callLeases(6).catch(() => []), callLeases4(4).catch(() => [])])]),
+	load: () => callStatus().catch(() => ({ unavailable: true })),
+
+	diagnosticsFlag(section, title, description) {
+		const option = section.option(form.Flag, 'observability', title, description);
+		option.default = '0';
+		option.rmempty = false;
+		const write = option.write.bind(option);
+		option.write = function(sectionId, value) {
+			if ((this.cfgvalue(sectionId) ?? this.default) === value) return;
+			if (value === this.enabled) {
+				const bytes = crypto.getRandomValues(new Uint8Array(16));
+				const epoch = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+				uci.set('tunnel-detour', sectionId, 'observability_epoch', epoch);
+			} else {
+				uci.unset('tunnel-detour', sectionId, 'observability_epoch');
+			}
+			return write(sectionId, value);
+		};
+		return option;
+	},
 
 	attach(map, networks, initial, busy, errorMessage) {
 		const issue = code => ({
@@ -60,19 +79,24 @@ return baseclass.extend({
 			inbound_operation_failed: _('Inbound state could not be applied safely. Review the service log and any conflicting firewall changes.'),
 			uci_configuration_failed: _('Select active LAN and WAN networks. WAN needs a global IPv6 address and a gateway; the destination must belong to LAN.')
 		}[code] || errorMessage(code));
-		let current = initial[0];
+		let current = initial;
 		let renderedState;
 		let renderedRelay;
 		const status = E('div', { 'class': 'td-inbound-status', 'aria-live': 'polite' });
 		const relayStatus = E('div', { 'class': 'td-inbound-relay', 'aria-live': 'off', 'aria-label': _('Active IPv4 relay connections') });
 		const updateRelay = state => {
 			const relay = state.relay || {};
-			const signature = JSON.stringify({ relay, publications: state.publications });
+			const signature = JSON.stringify({ relay, phase: state.phase, observing: state.observability, observabilityRequested: current.observability_requested, revocationPending: current.observability_revocation_pending, publications: state.publications });
 			if (signature === renderedRelay) return;
 			renderedRelay = signature;
 			const rules = new Map((state.publications || []).map(rule => [rule.id, rule.name]));
 			const active = relay.connections || [];
 			relayStatus.replaceChildren();
+			if (state.observability !== true) {
+				if (current.observability_revocation_pending) relayStatus.appendChild(E('p', {}, [_('Revocation pending. Diagnostics are hidden while the service discards them.')]));
+				else if (state.phase) relayStatus.appendChild(E('p', {}, [current.observability_requested ? _('Inbound traffic diagnostics are paused until the saved configuration can be applied.') : _('Inbound traffic diagnostics are off.')]));
+				return;
+			}
 			if (!active.length && !relay.rejected && !(relay.notices || []).length && !(state.publications || []).some(rule => rule.enabled && !rule.destination.startsWith('['))) return;
 			relayStatus.appendChild(E('h4', {}, [_('IPv4 relay connections (%s)').format(active.length)]));
 			relayStatus.appendChild(E('p', {}, [_('The IPv4 server sees the router as its source. The original IPv6 client is shown below. Connection state does not prove that application login or gameplay succeeds.')]));
@@ -82,7 +106,7 @@ return baseclass.extend({
 				...active.map(connection => E('tr', { 'class': 'tr' }, [rules.get(connection.publication) || connection.publication, connection.client, connection.target, connection.queued ? _('Waiting for capacity') : connection.connected ? _('Connected') : _('Connecting'), _('%s s').format(connection.age_seconds)].map((value,index) => E('td', { 'class': 'td', 'data-title':columns[index] }, [value]))))
 			]) ]));
 			else relayStatus.appendChild(E('p', {}, [_('No active IPv4 relay connections.')]));
-			if (relay.rejected) relayStatus.appendChild(E('p', {}, [_('Rejected connections since start: %s. Possible causes include capacity limits or a retired publication.').format(relay.rejected)]));
+			relayStatus.appendChild(E('p', {}, [_('Current diagnostic totals: %s completed · %s rejected').format(relay.completed, relay.rejected)]));
 			for (const notice of relay.notices || []) relayStatus.appendChild(E('p', { 'class': 'alert-message warning' }, [
 				(rules.get(notice.publication) || notice.publication) + ': ' + ({ admission_timeout: _('The relay stayed busy for 250 ms. Retry or review the connection limit.'), admission_failed: _('The waiting connection could not be admitted. Retry and check the network if it persists.'), connect_timeout: _('The LAN server did not respond in time. Check its address, port and host firewall.'), connect_failed: _('The LAN connection failed. Check that the server is running on the configured address and port.'), transfer_failed: _('The connection was interrupted. Check the server and network path.') }[notice.outcome] || _('The connection could not be completed.'))
 			]));
@@ -99,14 +123,25 @@ return baseclass.extend({
 				return;
 			}
 			const state = current.status || {};
-			const applied = current.enabled && current.running && state.phase === 'ready' && state.applied === true;
-			const retained = current.enabled && current.running && state.phase === 'ready' && state.last_error;
+			if (current.running && !state.phase) {
+				status.replaceChildren(E('p', { 'class': 'alert-message warning' }, [_('The inbound process is running. Its applied status is temporarily unavailable. Form edits have been preserved.')]), relayStatus);
+				return;
+			}
+			const ready = current.enabled !== false && current.running && state.phase === 'ready';
+			const applied = ready && state.applied === true && current.enabled === true;
+			const retained = ready && (state.last_error || current.enabled !== true);
+			const summary = applied ? _('Configuration applied')
+				: retained ? _('Saved changes not applied — previous configuration remains active')
+				: current.enabled === false ? _('Inbound ports disabled')
+				: current.enabled === true ? _('Enabled — configuration not confirmed')
+				: _('Saved inbound configuration is unavailable');
 			const expanded = new Set(Array.from(status.querySelectorAll('details[data-publication][open]')).map(row => row.dataset.publication));
 			status.replaceChildren(
-				E('p', {}, [E('strong', {}, [current.enabled ? applied ? _('Configuration applied') : retained ? _('Saved changes not applied — previous configuration remains active') : _('Enabled — configuration not confirmed') : _('Inbound ports disabled')])]),
+				E('p', {}, [E('strong', {}, [summary])]),
 				E('p', {}, [_('LAN reachability: not verified. Internet reachability: not verified. A stopped server or its host firewall can prevent connections even when the router configuration is correct.')])
 			);
 			if (state.last_error) status.appendChild(E('p', { 'class': 'alert-message warning' }, [issue(state.last_error)]));
+			for (const code of state.degraded || []) status.appendChild(E('p', { 'class': 'alert-message warning' }, [issue(code)]));
 			if (state.port_conflict) status.appendChild(E('div', { 'class': 'alert-message warning', 'role': 'alert' }, [
 				E('strong', {}, [(state.port_conflict.location === 'relay_listener' ? _('Internal relay port %s is reserved by another router service.') : _('Port %s is reserved by another router service.')).format(state.port_conflict.port)]),
 				portUses(state.port_conflict.uses)
@@ -149,6 +184,8 @@ return baseclass.extend({
 		const flags = [option];
 		let lanOption;
 		option.default = '0'; option.rmempty = false;
+		option = this.diagnosticsFlag(section, _('Enable inbound traffic diagnostics'), _('Show active relay client addresses and totals to administrators with Status access. Diagnostics reset when disabled. Service messages use the OpenWrt system log.'));
+		flags.push(option);
 		for (const [key, label, fallback] of [['lan_network', _('LAN network'), 'lan'], ['wan_network', _('WAN network'), 'wan']]) {
 			option = section.option(form.ListValue, key, label);
 			option.default = fallback; option.rmempty = false;
@@ -224,13 +261,17 @@ return baseclass.extend({
 		const renderPublication = publications.renderMoreOptionsModal;
 		publications.renderMoreOptionsModal = async function(...args) {
 			const selected = lanOption.formvalue('inbound') || lanOption.cfgvalue('inbound');
-			const result = await callDevices(selected).catch(() => ({ devices: [], error: 'unavailable' }));
+			const [result, leases6, leases4] = await Promise.all([
+				callDevices(selected).catch(() => ({ devices: [], error: 'unavailable' })),
+				callLeases(6).catch(() => []),
+				callLeases4(4).catch(() => [])
+			]);
 			destinationOption.keylist = []; destinationOption.vallist = [];
 			const names = new Map();
-			for (const lease of initial[1][0]) for (const address of lease.ip6addrs || (lease.ip6addr ? [lease.ip6addr] : [])) {
+			for (const lease of leases6) for (const address of lease.ip6addrs || (lease.ip6addr ? [lease.ip6addr] : [])) {
 				if (typeof address === 'string' && lease.hostname) names.set(address.split('/')[0], lease.hostname);
 			}
-			for (const lease of initial[1][1]) if (lease.ipaddr && lease.hostname) names.set(lease.ipaddr, lease.hostname);
+			for (const lease of leases4) if (lease.ipaddr && lease.hostname) names.set(lease.ipaddr, lease.hostname);
 			for (const device of result.devices || []) destinationOption.value(device.address, (names.get(device.address) || device.mac) + ' · ' + device.address);
 			if (result.error) ui.addNotification(null, E('p', {}, [_('Known device addresses are unavailable for the selected LAN. Enter a verified stable LAN address manually.')]));
 			return renderPublication.apply(this, args);

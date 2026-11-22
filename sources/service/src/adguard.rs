@@ -345,6 +345,10 @@ impl AdguardManager {
 
     /// Check the selected endpoint and foreign forwarding before changing integrations.
     pub(crate) async fn check(config: &ServiceConfig) -> Result<(), ServiceError> {
+        Self::checked_dns_info(config).await.map(|_| ())
+    }
+
+    async fn checked_dns_info(config: &ServiceConfig) -> Result<DnsInfo, ServiceError> {
         let settings = config.adguard.clone().ok_or(AdguardError::State)?;
         let control = AdguardControl::new(settings.clone())?;
         let saved: Option<Ownership> = tokio::task::block_in_place(|| {
@@ -414,7 +418,29 @@ impl AdguardManager {
             return Err(AdguardError::DnsStopped.into());
         }
         Self::validate_resolver(&control, config.real_upstream).await?;
-        Ok(())
+        Ok(current)
+    }
+
+    /// Verify the active conditional forwards and any managed resolver without writing.
+    pub(crate) async fn forwarding_applied(
+        &self,
+        config: &ServiceConfig,
+    ) -> Result<bool, ServiceError> {
+        let current = Self::checked_dns_info(config).await?;
+        let mut seen = BTreeSet::new();
+        let forwards_present = current
+            .upstream_dns
+            .iter()
+            .filter(|line| self.owned.contains(*line))
+            .all(|line| seen.insert(line))
+            && seen.len() == self.owned.len();
+        let upstream_applied = match self.desired_upstream {
+            Some(resolver) => self.managed_upstream.as_ref().is_some_and(|owned| {
+                owned.applied_matches(&upstream::general(&current.upstream_dns), resolver)
+            }),
+            None => self.managed_upstream.is_none(),
+        };
+        Ok(forwards_present && upstream_applied)
     }
 
     /// Recover the previous endpoint even after UCI selects a different frontend.
@@ -865,6 +891,8 @@ impl AdguardManager {
         self.managed_upstream = upstream_plan.after;
         if upstream_plan.foreign_change_preserved {
             tracing::warn!(
+                target: "tunnel_detour::health",
+                code = "adguard_foreign_upstream_preserved",
                 "general upstream management released without restoring a setting changed by another editor"
             );
         }

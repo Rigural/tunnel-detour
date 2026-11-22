@@ -187,17 +187,31 @@ fn thread_lifetime(root: std::ffi::OsString, scenario: Scenario) -> Result<(), B
             client.write_all(b"scope")?;
             backend.write_all(b"reply")?;
             for endpoint in [&mut backend, &mut client] {
-                match endpoint.read(&mut [0; 1]) {
-                    Ok(0) => {}
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock
-                                | std::io::ErrorKind::TimedOut
-                                | std::io::ErrorKind::ConnectionReset
-                                | std::io::ErrorKind::ConnectionAborted
-                        ) => {}
-                    other => return Err(format!("refused worker copied a byte: {other:?}").into()),
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err("socket observation was interrupted until its deadline".into());
+                    }
+                    endpoint.set_read_timeout(Some(remaining))?;
+                    match endpoint.read(&mut [0; 1]) {
+                        Ok(0) => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::TimedOut
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                            ) =>
+                        {
+                            break;
+                        }
+                        other => {
+                            return Err(format!("refused worker socket read: {other:?}").into());
+                        }
+                    }
                 }
             }
             Ok(())
@@ -228,16 +242,26 @@ fn thread_lifetime(root: std::ffi::OsString, scenario: Scenario) -> Result<(), B
             .stderr
             .take()
             .ok_or("missing worker failure report")?
-            .take(26)
+            .take(10)
             .read_to_end(&mut report)?;
-        if report.len() != 25 || report.first() != Some(&3) {
+        if report.len() != 9 || report.first() != Some(&3) {
             return Err("missing worker initialization refusal".into());
         }
         match scenario {
             Scenario::FilterUnavailable => {
                 println!("unavailable syscall filter refused before copying in either direction")
             }
-            _ => println!("unexpected inherited descriptor refused before copying"),
+            Scenario::InheritedDescriptor => {
+                // Refusal, inherited-descriptor stage, no errno, unexpected
+                // descriptor, regular file, no CLOEXEC. No path or fd number.
+                if report != [3, 4, 0, 0, 0, 0, 6, 4, 2] {
+                    return Err(
+                        "unexpected inherited descriptor was not classified as a file".into(),
+                    );
+                }
+                println!("unexpected inherited descriptor refused before copying")
+            }
+            Scenario::CreatorThread => return Err("unexpected refusal scenario".into()),
         }
         return Ok(());
     }

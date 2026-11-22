@@ -24,7 +24,7 @@ pub(crate) struct DnsHandler {
 
 impl DnsHandler {
     async fn process(&self, request: Vec<u8>) -> Result<Vec<u8>, ServiceError> {
-        self.status.dns_query()?;
+        let observation = self.status.dns_query()?;
         let decision = tokio::task::block_in_place(|| {
             self.resolver.snapshot()?;
             let mut policy = self.policy.lock().map_err(|_| ServiceError::Poisoned)?;
@@ -43,7 +43,7 @@ impl DnsHandler {
                 })
             }
             Err(error) if !error.is_critical() => {
-                self.status.failure(&error)?;
+                self.status.request_failure(&observation, &error)?;
                 let query = Message::from_vec(&request).map_err(|_| ServiceError::Protocol)?;
                 if query.metadata.message_type != MessageType::Query {
                     return Err(error);

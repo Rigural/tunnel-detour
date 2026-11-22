@@ -41,6 +41,9 @@ function errorMessage(code) {
 		adguard_endpoint_invalid: _('The AdGuard address must point to an HTTP endpoint on this router. Review it in Settings.'),
 		adguard_response_invalid: _('The server did not return a compatible AdGuard response. Check the AdGuard address and version.'),
 		adguard_integration_failed: _('AdGuard integration failed. Test its connection in Settings and check the service log.'),
+		adguard_endpoint_not_local: _('The AdGuard control endpoint must belong to this router.'),
+		upstream_dns_rejected: _('The real DNS resolver returned an error. Check its configuration and availability.'),
+		mapping_pool_exhausted: _('The permanent Fake-IP pool is exhausted. Existing identities remain reserved.'),
 		adguard_integration_disabled: _('AdGuard Home is not the selected DNS integration.'),
 		adguard_upstream_approval_required: _('AdGuard upstream management needs a fresh preview. In Settings, preview the change and explicitly accept it before Save & Apply.'),
 		adguard_upstream_conflict: _('AdGuard upstreams changed outside Tunnel Detour. Review Settings and explicitly preview importing or reapplying the resolver.'),
@@ -67,6 +70,7 @@ function errorMessage(code) {
 		adguard_ipv6_disabled: _('AdGuard blocks IPv6 resolution. Review its IPv6 setting before enabling IPv6 exceptions.'),
 		connection_rejected: _('An exception connection was rejected. Check the rule and try the website again.'),
 		capacity_exhausted: _('The service reached its resource limit. Close unused connections and try again.'),
+		transport_worker_failed: _('Isolated TCP transport could not start. Check the service log for transport errors.'),
 		state_unavailable: _('The service cannot safely use its state. Check the service log before restarting it.'),
 		kernel_conflict: _('Routing or firewall rules conflict with another configuration. Check the service log.'),
 		kernel_command_failed: _('Routing or firewall configuration failed. Check the selected networks and the service log.'),
@@ -93,6 +97,11 @@ function serviceState(result) {
 		description = _('The service is enabled but is not serving exceptions. Review Settings and restart the service.');
 		severity = 'warning';
 	}
+	else if (!status.phase) {
+		state = _('Status temporarily unavailable');
+		description = _('The DNS process is running. Its applied status is temporarily unavailable.');
+		severity = 'warning';
+	}
 	else if (status.phase === 'ready') {
 		state = status.configuration_applied === false ? _('Running previous configuration') : _('Running');
 		description = status.configuration_applied === false ? _('The saved DNS change was not applied. Established connections and the last applied resolver remain active. Review the reported issue in Settings.') : _('The service is ready to handle exception traffic.');
@@ -114,7 +123,9 @@ function duration(seconds) {
 
 function displayStatus(node, result, devices) {
 	const status = result.status || {};
-	const connections = Object.values(status.connections || {});
+	const observing = status.observability === true;
+	const diagnosticsMessage = result.observability_revocation_pending ? _('Revocation pending. Diagnostics are hidden while the service discards them.') : result.unavailable || result.running && !status.phase ? _('Traffic diagnostics unavailable.') : !result.running ? _('Traffic diagnostics are inactive while the service is stopped.') : result.observability_requested ? _('Traffic diagnostics are paused until the saved configuration can be applied.') : _('Traffic diagnostics are off.');
+	const connections = observing ? Object.values(status.connections || {}) : [];
 	const state = serviceState(result);
 	const rows = connections.map(connection => {
 		const ip = connection.client.startsWith('[') ? connection.client.slice(1, connection.client.indexOf(']')) : connection.client.split(':')[0];
@@ -141,12 +152,14 @@ function displayStatus(node, result, devices) {
 		status.mapping_usage ? E('p', { 'class': status.mapping_usage.allocated * 5 >= status.mapping_usage.capacity * 4 ? 'td-error' : 'td-help' }, [
 			_('Permanent Fake-IP identities: %s / %s · Per-rule limit: %s').format(status.mapping_usage.allocated, status.mapping_usage.capacity, status.mapping_usage.per_rule_limit)
 		]) : [],
-		E('p', {}, [_('Active connections: %s · DNS queries: %s · Completed connections: %s').format(connections.length, status.dns_queries || 0, status.completed_connections || 0)]),
-		E('table', { 'class': 'table td-connections' }, [
+		...(Array.isArray(status.degraded) ? status.degraded : []).map(code => E('p', { 'class': 'alert-message warning' }, [errorMessage(code)])),
+		observing ? E('p', {}, [_('Active connections: %s · DNS queries: %s · Completed connections: %s · Request failures: %s').format(connections.length, status.dns_queries, status.completed_connections, status.failures)]) : E('p', {}, [diagnosticsMessage]),
+		observing && status.last_request_error ? E('p', {}, [_('Latest request failure: %s').format(errorMessage(status.last_request_error))]) : [],
+		observing ? E('table', { 'class': 'table td-connections' }, [
 			E('tr', { 'class': 'tr table-titles' }, [_('Hostname'), _('Device'), _('Duration'), _('WAN destination')].map(label => E('th', { 'class': 'th' }, [label]))),
 			...rows
-		]),
-		E('p', { 'class': 'td-help' }, [_('Device names come from local DHCP leases. Devices without a known name show their IP address.')])
+		]) : [],
+		observing ? E('p', { 'class': 'td-help' }, [_('Device names come from local DHCP leases. Devices without a known name show their IP address.')]) : []
 	);
 }
 
@@ -174,7 +187,9 @@ function scopeExamples(domain, scope) {
 
 return view.extend({
 	load() {
-        return Promise.all([uci.load('tunnel-detour'), callStatus(), callNetworks(), callDevices(4).catch(() => []), uci.changes(), inbound.load(), callCredentialsStatus()]);
+		const status = callStatus();
+		const devices = status.then(result => result.status?.observability === true ? callDevices(4).catch(() => []) : []);
+		return Promise.all([uci.load('tunnel-detour'), status, callNetworks(), devices, uci.changes(), inbound.load(), callCredentialsStatus()]);
 	},
 
 	render(data) {
@@ -246,6 +261,7 @@ return view.extend({
 		const serviceEnabled = section.option(form.Flag, 'enabled', _('Enable service'));
 		let option = serviceEnabled;
 		option.rmempty = false;
+		const observability = inbound.diagnosticsFlag(section, _('Enable DNS traffic diagnostics'), _('Show live domains, client addresses and totals to administrators with Status access. Diagnostics reset when disabled. Service messages use the OpenWrt system log. Fake-IP identities are stored for routing and recovery.'));
 		const networks = [...new Set(data[2].map(network => network.interface).filter(name => typeof name === 'string' && name !== 'loopback'))].sort(L.naturalCompare);
 		for (const field of [
 			['lan_network', _('LAN network')],
@@ -587,14 +603,14 @@ return view.extend({
 		checkSection.render = () => Promise.resolve(checks);
 		inboundView = inbound.attach(map, networks, data[5], () => map.readonly === true || dirty || pending, errorMessage);
 		statusSection.render = () => Promise.resolve(E('div', { 'class': 'cbi-section', 'data-tab': 'status', 'data-tab-title': _('Status') }, [
-			E('h3', {}, [_('Status and active connections')]), status, actions
+			E('h3', {}, [_('Status')]), status, actions
 		]));
 		// LuCI re-renders this map after staging changes or adding a row.
 		const renderContents = map.renderContents.bind(map);
 		map.renderContents = () => {
 			rowFeedback.clear(); rowExamples.clear();
 			return renderContents().then(node => {
-				for (const [field, label] of [[serviceEnabled, _('Enable service')], [ipv6Enabled, _('Enable IPv6 exceptions')], [manageUpstream, _('Manage AdGuard upstream')], [clearCredentials, _('Use anonymous authentication')]]) {
+				for (const [field, label] of [[serviceEnabled, _('Enable service')], [observability, _('Enable DNS traffic diagnostics')], [ipv6Enabled, _('Enable IPv6 exceptions')], [manageUpstream, _('Manage AdGuard upstream')], [clearCredentials, _('Use anonymous authentication')]]) {
 					const control = map.findElement('id', field.cbid('globals'));
 					(control?.matches('input[type="checkbox"]') ? control : control?.querySelector('input[type="checkbox"]'))?.setAttribute('aria-label', label);
 				}
@@ -606,13 +622,26 @@ return view.extend({
 				return node;
 			});
 		};
+		const refreshDevices = () => {
+			if (currentStatus.status?.observability !== true) return Promise.resolve();
+			return callDevices(4).then(result => {
+				if (currentStatus.status?.observability === true) devices = result;
+			}).catch(() => { devices = []; });
+		};
 		poll.add(() => Promise.all([callStatus(), uci.changes()]).then(([result, changes]) => {
-			currentStatus = result; pending = !!changes['tunnel-detour']?.length; updateState();
+			const justEnabled = result.status?.observability === true && currentStatus.status?.observability !== true;
+			currentStatus = result;
+			if (result.status?.observability !== true) devices = [];
+			pending = !!changes['tunnel-detour']?.length; updateState();
+			if (justEnabled) return refreshDevices().then(updateState);
 		}).catch(() => {
+			currentStatus = { unavailable: true };
+			devices = [];
+			updateState();
 			banner.className = 'td-banner alert-message warning';
 			banner.textContent = _('Service status unavailable. Retrying automatically; form edits have not been applied.');
 		}), 3);
-		poll.add(() => callDevices(4).then(result => { devices = result; }).catch(() => { devices = []; }), 30);
+		poll.add(refreshDevices, 30);
 		poll.add(() => inboundView.poll(), 3);
 		return map.render().then(node => {
 			node.addEventListener('input', () => { markDirty(); scheduleValidation(); testResult.textContent = ''; });

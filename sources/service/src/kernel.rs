@@ -263,6 +263,16 @@ impl Kernel {
         Self::resolver_transition(resolver).await.map(|_| ())
     }
 
+    pub(crate) async fn resolver_guard_applied(
+        path: &crate::upstream_route::ResolverPath,
+    ) -> Result<bool, ServiceError> {
+        let Some(handle) = Self::table_handle().await? else {
+            return Ok(false);
+        };
+        let paths = Self::previous_resolver_guards(handle).await?;
+        Ok(paths.as_slice() == std::slice::from_ref(path))
+    }
+
     async fn resolver_transition(
         resolver: &crate::upstream_route::ResolverPath,
     ) -> Result<(Option<u64>, Vec<crate::upstream_route::ResolverPath>), ServiceError> {
@@ -501,7 +511,11 @@ impl Kernel {
         };
         if let Err(error) = ipv4 {
             if let Err(cleanup) = ipv6 {
-                tracing::error!(code = cleanup.code(), "IPv6 routing cleanup also failed");
+                tracing::error!(
+                    target: "tunnel_detour::health",
+                    code = cleanup.code(),
+                    "IPv6 routing cleanup also failed"
+                );
             }
             return Err(error);
         }

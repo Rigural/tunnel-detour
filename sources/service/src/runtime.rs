@@ -3,6 +3,7 @@ use std::{
     io::{self, Write},
     net::SocketAddr,
     num::NonZeroUsize,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -22,8 +23,13 @@ use tunnel_detour_core::{
 };
 
 use crate::{
-    ConfigError, ServiceConfig, ServicePhase, StatusHandle, dns::DnsHandler, kernel::Kernel,
-    proxy::ProxyHandler, upstream::RealResolver,
+    ConfigError, ServiceConfig, ServicePhase, StatusHandle,
+    dns::DnsHandler,
+    kernel::Kernel,
+    observability::{AppliedConsent, Consent},
+    proxy::ProxyHandler,
+    status::SnapshotPublication,
+    upstream::RealResolver,
 };
 
 #[derive(Debug, Error)]
@@ -60,6 +66,8 @@ pub enum ServiceError {
     Connection(#[from] ConnectionError),
     #[error("DNS upstream supplied an invalid or oversized response")]
     Protocol,
+    #[error("DNS upstream returned an unsuccessful response ({0})")]
+    UpstreamResponse(hickory_proto::op::ResponseCode),
     #[error("DNS upstream did not supply a usable destination for the enabled WAN families")]
     NoAddress,
     #[error("DNS alias chain is cyclic or too long")]
@@ -90,6 +98,10 @@ pub enum ServiceError {
     IdentifierExhausted,
     #[error("kernel objects conflict with existing routing or firewall configuration")]
     KernelConflict,
+    #[error("inbound firewall4 NAT policy could not be verified ({stage})")]
+    InboundNatConflict { stage: &'static str },
+    #[error("inbound firewall4 NAT inspection failed")]
+    InboundNatInspection(#[source] Box<ServiceError>),
     #[error("the selected IPv6 LAN or preferred WAN source is unavailable")]
     Ipv6Path,
     #[error("IPv6 routing ownership state failed")]
@@ -125,6 +137,9 @@ impl ServiceError {
                 "adguard_upstream_conflict"
             }
             Self::Adguard(crate::adguard::AdguardError::Ipv6Disabled) => "adguard_ipv6_disabled",
+            Self::Adguard(crate::adguard::AdguardError::RemoteEndpoint) => {
+                "adguard_endpoint_not_local"
+            }
             Self::Adguard(
                 crate::adguard::AdguardError::UnsupportedGeneralUpstreams
                 | crate::adguard::AdguardError::UnsupportedUpstreams,
@@ -141,6 +156,7 @@ impl ServiceError {
             Self::Dns(_) => "dns_error",
             Self::Connection(_) => "connection_rejected",
             Self::Protocol => "invalid_dns_response",
+            Self::UpstreamResponse(_) => "upstream_dns_rejected",
             Self::NoAddress => "no_usable_address",
             Self::AliasLoop => "dns_alias_loop",
             Self::ForbiddenTarget => "forbidden_destination",
@@ -155,10 +171,21 @@ impl ServiceError {
             Self::Task(_) => "task_failed",
             Self::Clock => "invalid_clock",
             Self::IdentifierExhausted => "identifier_exhausted",
-            Self::KernelConflict => "kernel_conflict",
+            Self::KernelConflict
+            | Self::InboundNatConflict { .. }
+            | Self::InboundNatInspection(_) => "kernel_conflict",
             Self::Ipv6Path => "ipv6_path_unavailable",
             Self::Ipv6State(_) => "ipv6_routing_state_invalid",
             Self::KernelCommand { .. } => "kernel_command_failed",
+        }
+    }
+
+    /// Return fixed operational context without including rule contents or traffic details.
+    pub fn inbound_nat_stage(&self) -> Option<&'static str> {
+        match self {
+            Self::InboundNatConflict { stage } => Some(stage),
+            Self::InboundNatInspection(_) => Some("inspection"),
+            _ => None,
         }
     }
 
@@ -181,10 +208,27 @@ impl ServiceError {
             | Self::Clock
             | Self::IdentifierExhausted
             | Self::KernelConflict
+            | Self::InboundNatConflict { .. }
+            | Self::InboundNatInspection(_)
             | Self::Ipv6Path
             | Self::Ipv6State(_)
             | Self::KernelCommand { .. } => true,
             _ => false,
+        }
+    }
+
+    pub(crate) fn degradation_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Adguard(crate::adguard::AdguardError::Ipv6Disabled)
+            | Self::Dnsmasq(
+                crate::dnsmasq::DnsmasqError::Profile
+                | crate::dnsmasq::DnsmasqError::State
+                | crate::dnsmasq::DnsmasqError::Apply,
+            ) => Some(self.code()),
+            Self::Dns(DnsWireError::Store(StoreError::Lease(
+                tunnel_detour_core::FakeIpError::Exhausted,
+            ))) => Some("mapping_pool_exhausted"),
+            _ => None,
         }
     }
 }
@@ -209,74 +253,150 @@ pub struct BoundService {
     ipv6_routing: Option<Arc<crate::ipv6_routing::Ipv6Routing>>,
     policy: Arc<Mutex<ExceptionPolicy>>,
     status: StatusHandle,
+    status_owner: Option<[u64; 2]>,
+    _status_writer: Option<fs::File>,
+    status_publication: SnapshotPublication,
+    observability_log: crate::ObservabilityLog,
+    config_path: Option<PathBuf>,
 }
 
 impl BoundService {
     pub async fn bind(config: ServiceConfig) -> Result<Self, ServiceError> {
-        if let Some(ipv6) = &config.ipv6 {
-            ipv6.inspect(&config.lan_device).await?;
-        }
+        let preflight = match &config.ipv6 {
+            Some(ipv6) => ipv6.inspect(&config.lan_device).await,
+            None => Ok(()),
+        };
         let config = Arc::new(config);
         let state_config = config.clone();
-        let policy = tokio::task::spawn_blocking(move || {
-            prepare_parent(&state_config.state_file)?;
-            prepare_parent(&state_config.status_file)?;
-            let state_parent = state_config.state_file.parent().ok_or(ConfigError::Paths)?;
-            let status_parent = state_config
-                .status_file
-                .parent()
-                .ok_or(ConfigError::Paths)?;
-            let state_name = state_config
-                .state_file
-                .file_name()
-                .ok_or(ConfigError::Paths)?;
-            let status_name = state_config
-                .status_file
-                .file_name()
-                .ok_or(ConfigError::Paths)?;
-            if fs::canonicalize(state_parent)? == fs::canonicalize(status_parent)?
-                && [
-                    "",
-                    ".lock",
-                    ".adguard.json",
-                    ".adguard.json.lock",
-                    ".adguard-preview.json",
-                    ".dnsmasq.json",
-                    ".dnsmasq.json.lock",
-                    ".ipv6-routing.json",
-                    ".ipv6-routing.json.lock",
-                ]
-                .iter()
-                .any(|suffix| {
-                    let mut name = state_name.to_os_string();
-                    name.push(suffix);
-                    name == status_name
-                })
-            {
-                return Err(ServiceError::Config(ConfigError::Paths));
-            }
-            let capacity =
-                NonZeroUsize::new(state_config.limits.max_mappings).ok_or(ConfigError::Limits)?;
-            let store =
-                LeaseStore::open(&state_config.state_file, state_config.fake_range, capacity)?;
-            let mut policy = ExceptionPolicy::with_families(
-                state_config.rules.clone(),
-                store,
-                Duration::from_secs(state_config.limits.ttl_seconds),
-                if state_config.ipv6.is_some() {
-                    DnsAddressFamilies::DualStack
+        let (policy, status_owner, clear_before_bind, status_writer) =
+            tokio::task::spawn_blocking(move || {
+                prepare_parent(&state_config.state_file)?;
+                prepare_parent(&state_config.status_file)?;
+                let state_parent = state_config.state_file.parent().ok_or(ConfigError::Paths)?;
+                let status_parent = state_config
+                    .status_file
+                    .parent()
+                    .ok_or(ConfigError::Paths)?;
+                let state_name = state_config
+                    .state_file
+                    .file_name()
+                    .ok_or(ConfigError::Paths)?;
+                let status_name = state_config
+                    .status_file
+                    .file_name()
+                    .ok_or(ConfigError::Paths)?;
+                if !state_config.from_uci
+                    && crate::management::is_uci_status_path(&state_config.status_file)?
+                {
+                    return Err(ConfigError::Paths.into());
+                }
+                let writer =
+                    crate::integration_state::status_writer_path(&state_config.status_file);
+                let writer_name = writer.file_name().ok_or(ConfigError::Paths)?;
+                if fs::canonicalize(state_parent)? == fs::canonicalize(status_parent)?
+                    && [
+                        "",
+                        ".lock",
+                        ".adguard.json",
+                        ".adguard.json.lock",
+                        ".adguard-preview.json",
+                        ".dnsmasq.json",
+                        ".dnsmasq.json.lock",
+                        ".ipv6-routing.json",
+                        ".ipv6-routing.json.lock",
+                    ]
+                    .iter()
+                    .any(|suffix| {
+                        let mut name = state_name.to_os_string();
+                        name.push(suffix);
+                        name == status_name || (!state_config.from_uci && name == writer_name)
+                    })
+                {
+                    return Err(ServiceError::Config(ConfigError::Paths));
+                }
+                let status_writer = if state_config.from_uci {
+                    Ok(None)
                 } else {
-                    DnsAddressFamilies::Ipv4Only
-                },
-            )
-            .map_err(|error| ServiceError::Config(ConfigError::Range(error)))?;
-            policy.set_mapping_limit_per_rule(
-                NonZeroUsize::new(state_config.limits.max_mappings_per_rule)
-                    .ok_or(ConfigError::Limits)?,
-            );
-            Ok::<_, ServiceError>(policy)
-        })
-        .await??;
+                    crate::management::status_writer(
+                        &state_config.status_file,
+                        preflight.is_ok(),
+                        || ConfigError::Paths.into(),
+                    )
+                };
+                let (preflight, status_writer) = match (preflight, status_writer) {
+                    // Cleanup is optional after a refused startup. An inaccessible
+                    // writer prohibits cleanup without replacing the original error.
+                    (Err(error), Err(_)) => return Err(error),
+                    (preflight, writer) => (preflight, writer?),
+                };
+                let store = preflight
+                    .and_then(|()| {
+                        let capacity = NonZeroUsize::new(state_config.limits.max_mappings)
+                            .ok_or(ConfigError::Limits)?;
+                        LeaseStore::open(
+                            &state_config.state_file,
+                            state_config.fake_range,
+                            capacity,
+                        )
+                        .map_err(ServiceError::from)
+                    })
+                    .inspect_err(|error| {
+                        // A refused preflight or corrupt lease can leave a prior snapshot.
+                        // Purge it only under idle ownership, preserving the startup error.
+                        if !state_config.observability_enabled()
+                            && !matches!(error, ServiceError::Store(StoreError::Lock(_)))
+                        {
+                            crate::management::clear_when_idle(&state_config.state_file, |lock| {
+                                if state_config.from_uci
+                                    || crate::management::snapshot_matches_lock(
+                                        &state_config.status_file,
+                                        lock,
+                                    )?
+                                {
+                                    crate::management::clear_snapshot(
+                                        &state_config.status_file,
+                                        false,
+                                    )?;
+                                }
+                                Ok(())
+                            });
+                        }
+                    })?;
+                let (status_owner, clear_before_bind) = if state_config.from_uci {
+                    (None, true)
+                } else {
+                    let identity = store.lock_identity()?;
+                    let previous = crate::management::snapshot_owner(&state_config.status_file)?;
+                    if previous.is_some_and(|owner| owner != identity) {
+                        return Err(ConfigError::Paths.into());
+                    }
+                    (Some(identity), previous.is_some())
+                };
+                let mut policy = ExceptionPolicy::with_families(
+                    state_config.rules.clone(),
+                    store,
+                    Duration::from_secs(state_config.limits.ttl_seconds),
+                    if state_config.ipv6.is_some() {
+                        DnsAddressFamilies::DualStack
+                    } else {
+                        DnsAddressFamilies::Ipv4Only
+                    },
+                )
+                .map_err(|error| ServiceError::Config(ConfigError::Range(error)))?;
+                policy.set_mapping_limit_per_rule(
+                    NonZeroUsize::new(state_config.limits.max_mappings_per_rule)
+                        .ok_or(ConfigError::Limits)?,
+                );
+                Ok::<_, ServiceError>((policy, status_owner, clear_before_bind, status_writer))
+            })
+            .await??;
+        let mut consent = AppliedConsent::for_json(config.observability);
+        if config.from_uci {
+            consent = AppliedConsent::confirm_uci(false, config.observability).await;
+        }
+        if clear_before_bind {
+            crate::management::clear_snapshot(&config.status_file, false)?;
+        }
         let transport = tokio::task::block_in_place(crate::transport_worker::TransportWorker::new)?;
         let dns_tcp = TcpListener::bind(config.dns_listen).await?;
         let dns_udp = Arc::new(UdpSocket::bind(dns_tcp.local_addr()?).await?);
@@ -299,6 +419,18 @@ impl BoundService {
             None
         };
         let ipv6_routing = crate::ipv6_routing::Ipv6Routing::prepare(&config).await?;
+        if !clear_before_bind {
+            // A legacy JSON snapshot has no ownership stamp. Adopt its path
+            // only after all startup checks for this controller have passed.
+            if crate::management::snapshot_owner(&config.status_file)?
+                .is_some_and(|owner| Some(owner) != status_owner)
+            {
+                return Err(ConfigError::Paths.into());
+            }
+            crate::management::clear_snapshot(&config.status_file, false)?;
+        }
+        let status = StatusHandle::new();
+        status.set_observability(consent)?;
         Ok(Self {
             transport,
             config,
@@ -308,7 +440,12 @@ impl BoundService {
             proxy_ipv6,
             ipv6_routing,
             policy: Arc::new(Mutex::new(policy)),
-            status: StatusHandle::new(),
+            status,
+            status_owner,
+            _status_writer: status_writer,
+            status_publication: SnapshotPublication::default(),
+            observability_log: crate::ObservabilityLog::default(),
+            config_path: None,
         })
     }
 
@@ -320,6 +457,45 @@ impl BoundService {
     }
     pub fn status(&self) -> StatusHandle {
         self.status.clone()
+    }
+
+    /// Share the daemon's local logging gate with the reload path.
+    pub fn with_observability_log(mut self, log: crate::ObservabilityLog) -> Self {
+        log.set_enabled(self.status.is_observing().is_ok_and(|enabled| enabled));
+        self.observability_log = log;
+        self
+    }
+
+    async fn set_uci_observability(&self, consent: Consent) -> Result<(), ServiceError> {
+        let applied = AppliedConsent::confirm_uci(false, consent).await;
+        self.apply_observability(applied)
+    }
+
+    fn apply_observability(&self, applied: AppliedConsent) -> Result<(), ServiceError> {
+        let enabled = applied.consent.enabled();
+        self.observability_log.set_enabled(enabled);
+        if self.status.set_observability(applied)? {
+            if enabled {
+                tracing::info!(target: "tunnel_detour::diagnostics", "DNS traffic diagnostics enabled");
+            }
+            if let Err(error) = self.write_status() {
+                // Snapshot I/O errors already attempted removal. An internal
+                // failure preparing the new snapshot must not skip that purge.
+                if !matches!(error, ServiceError::Io(_)) {
+                    tokio::task::block_in_place(|| {
+                        crate::observability::discard_snapshot(&self.config.status_file)
+                    })?;
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-read diagnostics consent on HUP for an explicitly supplied JSON configuration.
+    pub fn with_config_path(mut self, path: PathBuf) -> Self {
+        self.config_path = Some(path);
+        self
     }
 
     async fn accept_proxy(&self) -> io::Result<(TcpStream, SocketAddr)> {
@@ -350,6 +526,9 @@ impl BoundService {
         if self.config.from_uci {
             crate::cache_guard::preserve(self.config.fake_range).await?;
         }
+        if self.status.is_observing()? {
+            tracing::info!(target: "tunnel_detour::diagnostics", "DNS traffic diagnostics enabled");
+        }
         self.write_status()?;
         let resolver = match RealResolver::new(self.config.clone()).await {
             Ok(resolver) => resolver,
@@ -368,6 +547,7 @@ impl BoundService {
         {
             if let Err(cleanup_error) = kernel.stop_routes().await {
                 tracing::error!(
+                    target: "tunnel_detour::health",
                     code = cleanup_error.code(),
                     "routing cleanup failed after kernel setup failure"
                 );
@@ -384,6 +564,7 @@ impl BoundService {
                 let cleanup = kernel.stop_routes().await;
                 if let Err(cleanup_error) = cleanup {
                     tracing::error!(
+                        target: "tunnel_detour::health",
                         code = cleanup_error.code(),
                         "routing cleanup failed after startup failure"
                     );
@@ -415,7 +596,7 @@ impl BoundService {
             loop {
                 let requested = tokio::select! {
                     () = cancel.cancelled() => return Ok::<_, ServiceError>(()),
-                    signal = reload.recv(), if self.config.from_uci => {
+                    signal = reload.recv(), if self.config.from_uci || self.config_path.is_some() => {
                         if signal.is_none() { return Err(ServiceError::Cancelled); }
                         true
                     },
@@ -431,6 +612,7 @@ impl BoundService {
                         if audit_healthy {
                             self.status.failure(&error)?;
                             tracing::warn!(
+                                target: "tunnel_detour::health",
                                 code = error.code(),
                                 "managed DNS audit failed; new exception work is fenced"
                             );
@@ -440,10 +622,52 @@ impl BoundService {
                     }
                     continue;
                 }
-                let candidate = match crate::uci::load_uci(false).await {
+                if let Some(path) = &self.config_path {
+                    let candidate = tokio::task::block_in_place(|| ServiceConfig::load_file(path));
+                    match candidate {
+                        Ok(candidate) => {
+                            self.apply_observability(AppliedConsent::for_json(
+                                candidate.observability,
+                            ))?;
+                            if audit_healthy && resolver.snapshot().is_ok() {
+                                self.status
+                                    .resolver_applied(&applied.config, &applied.path)?;
+                            }
+                            self.status.restart_required(
+                                !self.config.same_runtime(&candidate)
+                                    || !self.config.same_resolver_settings(&candidate),
+                            )?;
+                            self.write_status()?;
+                        }
+                        Err(error) => {
+                            self.apply_observability(AppliedConsent::default())?;
+                            if audit_healthy && resolver.snapshot().is_ok() {
+                                self.status.resolver_pending(None)?;
+                                self.status.failure(&error)?;
+                            }
+                            self.status.restart_required(false)?;
+                            self.write_status()?;
+                        }
+                    }
+                    continue;
+                }
+                let sections = crate::uci::read_sections().await;
+                let requested = sections
+                    .as_ref()
+                    .map_or(Consent::Off, |sections| sections.consent("globals"));
+                let control = self
+                    .status
+                    .applied_consent()?
+                    .invalidate_uci(false, requested);
+                self.apply_observability(control)?;
+                let candidate = match match sections {
+                    Ok(sections) => crate::uci::load_dns_sections(sections, false).await,
+                    Err(error) => Err(error),
+                } {
                     Ok(Some(candidate)) => Arc::new(candidate),
                     Ok(None) => return Ok(()),
                     Err(error) => {
+                        self.set_uci_observability(Consent::Off).await?;
                         self.status.resolver_pending(None)?;
                         self.status.failure(&error)?;
                         self.write_status()?;
@@ -455,6 +679,28 @@ impl BoundService {
                     // Never partially apply different listeners or exception rules.
                     self.status
                         .resolver_pending(Some(candidate.real_upstream))?;
+                    self.write_status()?;
+                    continue;
+                }
+                // A package-wide configuration event can concern only inbound ports.
+                // Verify the applied route and frontend before skipping a full rewrite.
+                if audit_healthy
+                    && pending_path.is_none()
+                    && resolver.snapshot().is_ok()
+                    && candidate.same_resolver_settings(&applied.config)
+                    && crate::upstream_route::ResolverPath::prepare(&candidate)
+                        .await
+                        .is_ok_and(|path| path == applied.path)
+                    && Kernel::resolver_guard_applied(&applied.path)
+                        .await
+                        .is_ok_and(|applied| applied)
+                    && manager
+                        .forwarding_applied(&candidate)
+                        .await
+                        .is_ok_and(|applied| applied)
+                {
+                    self.status.resolver_applied(&candidate, &applied.path)?;
+                    self.set_uci_observability(candidate.observability).await?;
                     self.write_status()?;
                     continue;
                 }
@@ -490,6 +736,8 @@ impl BoundService {
                     kernel.resolver_guards(std::slice::from_ref(&path)).await?;
                     resolver.activate(candidate.clone(), path.clone())?;
                     self.status.resolver_applied(&candidate, &path)?;
+                    self.status.clear_frontend_degradation()?;
+                    self.set_uci_observability(candidate.observability).await?;
                     applied = crate::upstream::ResolverSnapshot {
                         config: candidate.clone(),
                         path,
@@ -500,6 +748,7 @@ impl BoundService {
                 }
                 .await;
                 if let Err(error) = update {
+                    self.apply_observability(AppliedConsent::default())?;
                     if pending_path.is_some()
                         || matches!(&error, ServiceError::Adguard(_) | ServiceError::Dnsmasq(_))
                     {
@@ -508,6 +757,7 @@ impl BoundService {
                     }
                     self.status.failure(&error)?;
                     tracing::warn!(
+                        target: "tunnel_detour::health",
                         code = error.code(),
                         "resolver change was not applied; established TCP streams are preserved"
                     );
@@ -524,7 +774,13 @@ impl BoundService {
                 Ok(()) => { cancel.cancel(); serving.await },
                 Err(error) => {
                     cancel.cancel();
-                    if let Err(stop_error) = serving.await { tracing::error!(code = stop_error.code(), "service stopped after setup failure"); }
+                    if let Err(stop_error) = serving.await {
+                        tracing::error!(
+                            target: "tunnel_detour::health",
+                            code = stop_error.code(),
+                            "service stopped after setup failure"
+                        );
+                    }
                     self.status.failure(&error)?; Err(error)
                 },
             },
@@ -534,6 +790,7 @@ impl BoundService {
         if let Err(error) = &cleanup {
             if result.is_err() {
                 tracing::error!(
+                    target: "tunnel_detour::health",
                     code = error.code(),
                     "routing cleanup also failed; ownership state retained"
                 );
@@ -551,6 +808,7 @@ impl BoundService {
         if let Err(error) = &disable {
             if result.is_err() || cleanup.is_err() {
                 tracing::error!(
+                    target: "tunnel_detour::health",
                     code = error.code(),
                     "DNS forwarding cleanup also failed; ownership state retained"
                 );
@@ -564,23 +822,34 @@ impl BoundService {
             } else {
                 ServicePhase::Failed
             })?;
+        self.status.clear_connections()?;
         self.write_status()?;
         result.and(cleanup).and(disable)
     }
 
     fn write_status(&self) -> Result<(), ServiceError> {
         let mut status = self.status.snapshot()?;
-        status.mapping_usage = Some(
-            self.policy
-                .lock()
-                .map_err(|_| ServiceError::Poisoned)?
-                .mapping_usage()?,
-        );
-        let path = self.config.status_file.clone();
-        tokio::task::block_in_place(move || {
-            let mut temporary = NamedTempFile::new_in(path.parent().ok_or(ConfigError::Paths)?)?;
-            temporary.write_all(&serde_json::to_vec(&status)?)?;
-            temporary.persist(path).map_err(|error| error.error)?;
+        status.status_owner = self.status_owner;
+        if status.observability {
+            status.set_mapping_usage(
+                self.policy
+                    .lock()
+                    .map_err(|_| ServiceError::Poisoned)?
+                    .mapping_usage()?,
+            );
+        }
+        let path = &self.config.status_file;
+        let parent = path.parent().ok_or(ConfigError::Paths)?;
+        tokio::task::block_in_place(|| {
+            let bytes = serde_json::to_vec(&status)?;
+            let written = (|| {
+                let mut temporary = NamedTempFile::new_in(parent)?;
+                temporary.write_all(&bytes)?;
+                temporary.persist(path).map_err(|error| error.error)?;
+                Ok(())
+            })();
+            self.status_publication
+                .complete(path, status.observability, written)?;
             Ok(())
         })
     }
@@ -613,7 +882,6 @@ impl BoundService {
             .ok_or(ConfigError::Limits)?;
         let mut jobs = JoinSet::new();
         let mut packet = vec![0; usize::from(u16::MAX)];
-        let mut next_id = 0_u64;
         let mut ticker = interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut outcome = async { loop {
@@ -621,58 +889,63 @@ impl BoundService {
                 () = cancel.cancelled() => break Ok(()),
                 result = self.dns_udp.recv_from(&mut packet), if jobs.len() < job_limit => {
                     let (length, peer) = match result { Ok(result) => result, Err(error) => break Err(error.into()) };
-                    if !peer.ip().is_loopback() { self.status.failure(&ServiceError::Unauthorized)?; continue; }
+                    let observation = self.status.observation()?;
+                    if !peer.ip().is_loopback() { self.status.request_failure(&observation, &ServiceError::Unauthorized)?; continue; }
                     match dns_slots.clone().try_acquire_owned() {
                         Ok(permit) => {
                             let handler = dns.clone(); let socket = self.dns_udp.clone(); let packet = packet[..length].to_vec();
-                            jobs.spawn(async move { let _permit = permit; handler.udp(socket, peer, packet).await });
+                            jobs.spawn(async move { let _permit = permit; (observation, handler.udp(socket, peer, packet).await) });
                         },
-                        Err(_) => self.status.failure(&ServiceError::Busy)?,
+                        Err(_) => self.status.request_failure(&observation, &ServiceError::Busy)?,
                     }
                 },
                 result = self.dns_tcp.accept(), if jobs.len() < job_limit => {
                     let (stream, peer) = match result { Ok(result) => result, Err(error) => break Err(error.into()) };
-                    if !peer.ip().is_loopback() { self.status.failure(&ServiceError::Unauthorized)?; continue; }
+                    let observation = self.status.observation()?;
+                    if !peer.ip().is_loopback() { self.status.request_failure(&observation, &ServiceError::Unauthorized)?; continue; }
                     match dns_slots.clone().try_acquire_owned() {
                         Ok(permit) => {
                             let handler = dns.clone(); let token = cancel.clone();
-                            jobs.spawn(async move { let _permit = permit; handler.tcp(stream, token).await });
+                            jobs.spawn(async move { let _permit = permit; (observation, handler.tcp(stream, token).await) });
                         },
-                        Err(_) => self.status.failure(&ServiceError::Busy)?,
+                        Err(_) => self.status.request_failure(&observation, &ServiceError::Busy)?,
                     }
                 },
                 result = self.accept_proxy(), if jobs.len() < job_limit => {
                     let (stream, peer) = match result { Ok(result) => result, Err(error) => break Err(error.into()) };
+                    let observation = self.status.observation()?;
                     match proxy_slots.clone().try_acquire_owned() {
                         Ok(permit) => {
-                            next_id = next_id.checked_add(1).ok_or(ServiceError::IdentifierExhausted)?;
-                            let id = next_id.to_string(); let handler = proxy.clone(); let token = cancel.clone();
-                            jobs.spawn(async move { let _permit = permit; handler.serve(id, stream, peer, token).await });
+                            let handler = proxy.clone(); let token = cancel.clone();
+                            jobs.spawn(async move { let _permit = permit; let result = handler.serve(&observation, stream, peer, token).await; (observation, result) });
                         },
-                        Err(_) => self.status.failure(&ServiceError::Busy)?,
+                        Err(_) => self.status.request_failure(&observation, &ServiceError::Busy)?,
                     }
                 },
                 result = jobs.join_next(), if !jobs.is_empty() => {
                     match result {
-                        Some(Ok(Ok(()))) => {},
-                        Some(Ok(Err(error))) => {
+                        Some(Ok((_, Ok(())))) => {},
+                        Some(Ok((observation, Err(error)))) => {
                             if error.is_critical() { break Err(error); }
-                            self.status.failure(&error)?;
-                            if let ServiceError::Io(cause) = &error {
-                                tracing::warn!(code = error.code(), kind = ?cause.kind(), errno = cause.raw_os_error(), "request failed");
-                            } else {
-                                tracing::warn!(code = error.code(), "request failed");
-                            }
+                            self.status.request_failure(&observation, &error)?;
                         },
                         Some(Err(error)) => break Err(ServiceError::Task(error)),
                         None => {},
                     }
                 },
                 _ = ticker.tick() => {
+                    if self.config.from_uci {
+                        let current = self.status.applied_consent()?;
+                        self.apply_observability(current.invalidate_uci(false, current.consent))?;
+                    }
                     if let Some(ipv6) = &self.config.ipv6
                         && let Err(error) = ipv6.inspect(&self.config.lan_device).await
                     { break Err(error); }
-                    if let Err(error) = self.write_status() { break Err(error); }
+                    self.status.set_transport_degraded(self.transport.initialization_failed()?)?;
+                    if (self.status.take_health_change()?
+                        || self.status.is_observing()?
+                        || self.status_publication.retry_pending())
+                        && let Err(error) = self.write_status() { break Err(error); }
                 },
             }
         }}.await;
@@ -682,6 +955,7 @@ impl BoundService {
         {
             // Even a broken status collector must not detach admitted jobs.
             tracing::error!(
+                target: "tunnel_detour::health",
                 code = report.code(),
                 "fatal traffic failure could not be recorded"
             );
@@ -698,9 +972,11 @@ impl BoundService {
         // mid-poll: even if shutdown races an fsync, its completion stays owned by this JoinSet.
         while let Some(result) = jobs.join_next().await {
             match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    let report = if outcome.is_err() {
+                Ok((_, Ok(()))) => {}
+                Ok((observation, Err(error))) => {
+                    let report = if !error.is_critical() {
+                        self.status.request_failure(&observation, &error)
+                    } else if outcome.is_err() {
                         self.status.secondary_failure(&error)
                     } else {
                         self.status.failure(&error)

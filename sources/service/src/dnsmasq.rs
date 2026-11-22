@@ -478,6 +478,15 @@ impl DnsmasqManager {
         validate_frontend(config, &self.ownership.managed, false).await
     }
 
+    pub(crate) async fn forwarding_applied(
+        &self,
+        config: &ServiceConfig,
+    ) -> Result<bool, ServiceError> {
+        no_pending_changes().await?;
+        validate_frontend(config, &self.ownership.managed, true).await?;
+        Ok(!self.ownership.pending)
+    }
+
     pub(crate) async fn reconcile(
         &mut self,
         selection: Option<(SocketAddrV4, &RuleSet)>,

@@ -59,10 +59,8 @@ finish. Use fresh filenames; this mode does not target physical hardware.
 14. Expand **Advanced relay settings**. Change the connection limit and connect timeout, save
     and apply. Both persist after a fresh page load; defaults remain visible for other limits.
     A relay capture-port conflict identifies the reserved internal port and the existing service.
-15. With real relay sessions, the active table distinguishes original IPv6 clients, fixed IPv4
-    targets, connecting/connected state and age. Status refresh must preserve expanded public
-    address details and selection. Recent target failures show actionable notices without a
-    history of client endpoints. This display requires a live laboratory session for acceptance.
+15. With diagnostics opted in, R156c verifies the live relay table. Status refresh must
+    preserve expanded public address details and selection.
 16. At a 390-pixel viewport, publications and active connections show labeled rows without
     expanding the document beyond its client width. Verify the edit modal, Settings and an
     exception draft. Text/select editors remain usable, address selection survives a status
@@ -79,3 +77,29 @@ administration workflow, draft retention, address suggestions and honest status 
 Actual clipboard paste, plain-HTTP fallback, responsive layout and external reachability require
 their own acceptance before making claims about them. R062 owns DHCPv6 renewal and reservation
 preservation; the native administrator creates reservations explicitly.
+
+## R156c inbound traffic diagnostics
+
+Use the R077 pause described above. The fixture holds a real relay connection and enables
+inbound diagnostics. Open **Inbound ports** in the disposable LuCI instance in Chrome.
+
+1. Verify that the live row shows the fixture's original IPv6 client, fixed IPv4 target, state
+   and age. Clear **Enable inbound traffic diagnostics** and click **Save**. The existing row
+   remains visible while the change is staged.
+2. Suspend only the inbound daemon. Use **Save & Apply** and check **Revocation pending** with
+   the row and diagnostic totals hidden. Resume the same PID and check the confirmed off state.
+3. Enable inbound diagnostics again and apply. Verify a new consent epoch in the fixture's UCI
+   and zero rows from the previous period. Expand the applied destination address and verify
+   that it is selectable after a status refresh.
+4. Temporarily remove `inbound.enabled` from the disposable instance's saved UCI while keeping
+   consent on, then reload. Check that the previous applied publication and addresses remain
+   visible with an explanation that the saved changes did not apply. Restore `inbound.enabled`
+   and save an invalid publication target with consent on. Verify that diagnostics are paused
+   and the previous addresses remain selectable. Restore the valid target and verify that
+   ordinary status returns in the same process. Repeat the pause check with the occupied
+   management HTTP port as the internal relay port. The port conflict remains visible.
+5. Verify the diagnostic display at 390 CSS pixels and restore the viewport. Create the
+   `.continue` file so R077 can prove the held connection still transfers data and clean up.
+
+If the applied snapshot is unavailable, LuCI reports that the inbound process is running and
+keeps form edits. R156 owns consent transitions and R159b owns publication failure and recovery.

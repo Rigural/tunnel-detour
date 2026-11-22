@@ -54,7 +54,73 @@ async fn draft_adguard(request: &Value) -> Result<AdguardSettings, ServiceError>
 }
 
 fn read_private(path: &Path) -> Result<Option<Vec<u8>>, ServiceError> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    read_private_bounded(path, INPUT_LIMIT)
+}
+
+/// Read the ownership identity from a private runtime snapshot, when present.
+pub(crate) fn snapshot_owner(path: &Path) -> Result<Option<[u64; 2]>, ServiceError> {
+    #[derive(serde::Deserialize)]
+    struct SnapshotOwner {
+        #[serde(alias = "observability_owner")]
+        status_owner: Option<[u64; 2]>,
+    }
+
+    let Some(bytes) = read_private(path)? else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_slice::<SnapshotOwner>(&bytes)?.status_owner)
+}
+
+pub(crate) fn status_writer(
+    path: &Path,
+    create: bool,
+    conflict: impl FnOnce() -> ServiceError,
+) -> Result<Option<File>, ServiceError> {
+    use crate::integration_state::IntegrationStateError::{Io, Json, Lock, Unsafe};
+
+    crate::integration_state::try_status_writer(path, create).map_err(|error| match error {
+        Io(error) | Lock(std::fs::TryLockError::Error(error)) => error.into(),
+        Json(error) => error.into(),
+        Lock(std::fs::TryLockError::WouldBlock) | Unsafe => conflict(),
+    })
+}
+
+pub(crate) fn snapshot_matches_lock(path: &Path, lock: &File) -> Result<bool, ServiceError> {
+    let identity = crate::integration_state::lock_identity(lock)?;
+    Ok(snapshot_owner(path)? == Some(identity))
+}
+
+/// Identify package-managed status files even when the parent directory has an alias.
+pub(crate) fn is_uci_status_path(path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let reserved = [uci::STATUS_FILE, crate::inbound_uci::STATUS].map(Path::new);
+    if reserved.contains(&path) {
+        return Ok(true);
+    }
+    let parent_identity = |path: &Path| match path.parent().map(fs::metadata) {
+        Some(Ok(metadata)) => Ok(Some((metadata.dev(), metadata.ino()))),
+        Some(Err(error)) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(None),
+    };
+    let Some(parent) = parent_identity(path)? else {
+        return Ok(false);
+    };
+    for reserved_path in reserved {
+        if path.file_name() == reserved_path.file_name()
+            && parent_identity(reserved_path)? == Some(parent)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn read_private_bounded(
+    path: &Path,
+    limit: u64,
+) -> Result<Option<Vec<u8>>, ServiceError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let mut options = OpenOptions::new();
     options.read(true).custom_flags(
         i32::try_from((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits())
@@ -66,15 +132,147 @@ fn read_private(path: &Path) -> Result<Option<Vec<u8>>, ServiceError> {
         Err(error) => return Err(error.into()),
     };
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.nlink() != 1
+    {
         return Err(ServiceError::Protocol);
     }
     let mut bytes = Vec::new();
-    file.take(INPUT_LIMIT + 1).read_to_end(&mut bytes)?;
-    if u64::try_from(bytes.len()).map_err(|_| ServiceError::Protocol)? > INPUT_LIMIT {
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).map_err(|_| ServiceError::Protocol)? > limit {
         return Err(ServiceError::Protocol);
     }
     Ok(Some(bytes))
+}
+
+fn redact_observations(status: &mut Value, inbound: bool) -> bool {
+    let Some(fields) = status.as_object_mut() else {
+        return false;
+    };
+    let legacy = !fields.contains_key("observability");
+    let mut changed =
+        fields.insert("observability".into(), Value::Bool(false)) != Some(Value::Bool(false));
+    for key in [
+        "connections",
+        "dns_queries",
+        "failures",
+        "last_request_error",
+        "completed_connections",
+        "bytes_to_wan",
+        "bytes_from_wan",
+        "mapping_usage",
+        "relay",
+        "observability_epoch",
+        "observability_grant",
+    ] {
+        changed |= fields.remove(key).is_some();
+    }
+    // A legacy ownership stamp belongs to the snapshot, not to its diagnostic period.
+    if let Some(owner) = fields.remove("observability_owner") {
+        fields.entry("status_owner").or_insert(owner);
+        changed = true;
+    }
+    if legacy && !inbound {
+        // Older DNS versions shared last_error between lifecycle and request failures.
+        changed |= fields.remove("last_error").is_some();
+    }
+    changed
+}
+
+/// Scrub prior diagnostics before startup only when no running daemon owns the state.
+pub fn clear_uci_observations(inbound: bool) {
+    let state_path = Path::new(if inbound {
+        crate::inbound_uci::STATE
+    } else {
+        uci::STATE_FILE
+    });
+    tokio::task::block_in_place(|| {
+        clear_when_idle(state_path, |_| {
+            clear_snapshot(crate::observability::uci_status_path(inbound), inbound)
+        });
+    });
+}
+
+pub(crate) fn finish_uci_cleanup(inbound: bool) -> Result<(), ServiceError> {
+    clear_snapshot(crate::observability::uci_status_path(inbound), inbound)?;
+    crate::observability::revoke_uci_grant(inbound)
+}
+
+async fn uci_status(inbound: bool, pid: Option<u64>) -> Result<(Value, bool, bool), ServiceError> {
+    let bytes = tokio::task::block_in_place(|| {
+        read_private(crate::observability::uci_status_path(inbound))
+    })?;
+    let mut status = match bytes {
+        Some(bytes) => serde_json::from_slice::<Value>(&bytes)?,
+        None => Value::Null,
+    };
+    let section = if inbound { "inbound" } else { "globals" };
+    let requested = uci::read_sections()
+        .await
+        .map_or(crate::observability::Consent::Off, |sections| {
+            sections.consent(section)
+        });
+    let current = (pid.is_some() && status["process_id"].as_u64() == pid)
+        || (pid.is_none() && matches!(status["phase"].as_str(), Some("failed" | "stopped")));
+    let observing = current && pid.is_some() && status["observability"] == true;
+    let revocation_pending = if !observing {
+        false
+    } else if !requested.enabled() {
+        // A reader can observe the withdrawal before procd runs. Remove the
+        // grant before responding, even if the UCI transaction later rolls back.
+        crate::observability::revoke_uci_grant(inbound)?;
+        true
+    } else {
+        !crate::observability::read_uci_grant(inbound).is_ok_and(|grant| {
+            grant.is_some_and(|token| status["observability_grant"] == json!(token))
+        }) || status["observability_epoch"] != json!(requested.epoch())
+    };
+    if !observing || revocation_pending || !requested.enabled() {
+        redact_observations(&mut status, inbound);
+    }
+    if let Some(fields) = status.as_object_mut() {
+        fields.remove("observability_epoch");
+        fields.remove("observability_revocation");
+        fields.remove("observability_grant");
+        fields.remove("observability_owner");
+        fields.remove("status_owner");
+    }
+    Ok((
+        if current { status } else { Value::Null },
+        requested.enabled(),
+        revocation_pending,
+    ))
+}
+
+pub(crate) fn clear_snapshot(path: &Path, inbound: bool) -> Result<(), ServiceError> {
+    tokio::task::block_in_place(|| {
+        let parent = path.parent().ok_or(crate::ConfigError::Paths)?;
+        match fs::symlink_metadata(parent) {
+            Ok(_) => crate::runtime::prepare_parent(path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        let bytes = match read_private(path) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(crate::observability::discard_snapshot(path)?),
+        };
+        if let Some(bytes) = bytes {
+            let Ok(mut status) = serde_json::from_slice::<Value>(&bytes) else {
+                return Ok(crate::observability::discard_snapshot(path)?);
+            };
+            if !status.is_object() {
+                return Ok(crate::observability::discard_snapshot(path)?);
+            }
+            if redact_observations(&mut status, inbound)
+                && crate::integration_state::atomic_write(path, &status).is_err()
+            {
+                crate::observability::discard_snapshot(path)?;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Validate with the same parser and capacity as production configuration.
@@ -238,18 +436,10 @@ pub async fn rpc_call(method: &str, input: &[u8]) -> Result<Value, ServiceError>
             let pid = (instance["running"] == true)
                 .then(|| instance["pid"].as_u64())
                 .flatten();
-            let bytes = tokio::task::block_in_place(|| {
-                read_private(Path::new(crate::inbound_uci::STATUS))
-            })?;
-            let status: Value = match bytes {
-                Some(bytes) => serde_json::from_slice(&bytes)?,
-                None => Value::Null,
-            };
-            let current = (pid.is_some() && status["process_id"].as_u64() == pid)
-                || (pid.is_none()
-                    && matches!(status["phase"].as_str(), Some("failed" | "stopped")));
+            let (status, observability_requested, revocation_pending) =
+                uci_status(true, pid).await?;
             Ok(
-                json!({"enabled":crate::inbound_uci::is_enabled().await?,"running":pid.is_some(),"status":if current {status} else {Value::Null}}),
+                json!({"enabled":crate::inbound_uci::is_enabled().await.ok(),"running":pid.is_some(),"observability_requested":observability_requested,"observability_revocation_pending":revocation_pending,"status":status}),
             )
         }
         "check_inbound" => {
@@ -288,17 +478,10 @@ pub async fn rpc_call(method: &str, input: &[u8]) -> Result<Value, ServiceError>
                         .find(|instance| instance["running"] == true)
                         .and_then(|instance| instance["pid"].as_u64())
                 });
-            let bytes = tokio::task::block_in_place(|| read_private(Path::new(uci::STATUS_FILE)))?;
-            let status = match bytes {
-                Some(bytes) => serde_json::from_slice::<Value>(&bytes)?,
-                None => Value::Null,
-            };
-            // A status snapshot from a prior process must never claim current readiness.
-            let current = (pid.is_some() && status["process_id"].as_u64() == pid)
-                || (pid.is_none()
-                    && matches!(status["phase"].as_str(), Some("failed" | "stopped")));
+            let (status, observability_requested, revocation_pending) =
+                uci_status(false, pid).await?;
             Ok(
-                json!({"enabled":uci::is_enabled().await?, "dns_integration":uci::configured_integration().await?, "running": pid.is_some(), "status": if current { status } else { Value::Null }}),
+                json!({"enabled":uci::is_enabled().await.ok(), "dns_integration":uci::configured_integration().await?, "running":pid.is_some(), "observability_requested":observability_requested,"observability_revocation_pending":revocation_pending, "status":status}),
             )
         }
         "validate" => {
@@ -378,24 +561,49 @@ pub async fn rpc_call(method: &str, input: &[u8]) -> Result<Value, ServiceError>
     }
 }
 
-fn idle_lock() -> Result<Option<File>, ServiceError> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+pub(crate) fn idle_lock(path: &Path) -> Result<Option<File>, ServiceError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let mut options = OpenOptions::new();
     options.read(true).write(true).custom_flags(
-        i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits()).map_err(|_| ServiceError::Protocol)?,
+        i32::try_from((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits())
+            .map_err(|_| tunnel_detour_core::StoreError::UnsafeFile)?,
     );
-    let lock = match options.open(format!("{}.lock", uci::STATE_FILE)) {
+    let lock = match options.open(crate::integration_state::appended_path(path, ".lock")) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     let metadata = lock.metadata()?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
-        return Err(ServiceError::Protocol);
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.nlink() != 1
+    {
+        return Err(tunnel_detour_core::StoreError::UnsafeFile.into());
     }
     lock.try_lock()
         .map_err(tunnel_detour_core::StoreError::from)?;
     Ok(Some(lock))
+}
+
+/// Startup recovery may scrub a snapshot without taking over the daemon's work.
+/// Keep the primary startup failure when the old snapshot cannot safely be changed.
+pub(crate) fn clear_when_idle(path: &Path, clear: impl FnOnce(&File) -> Result<(), ServiceError>) {
+    let result = match idle_lock(path) {
+        Ok(Some(lock)) => clear(&lock),
+        Ok(None)
+        | Err(ServiceError::Store(tunnel_detour_core::StoreError::Lock(
+            std::fs::TryLockError::WouldBlock,
+        ))) => return,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
+        tracing::warn!(
+            target: "tunnel_detour::health",
+            code = error.code(),
+            "prior traffic diagnostics could not be cleared before startup"
+        );
+    }
 }
 
 /// Remove remote forwarding only after the running service released its state lock.
@@ -403,7 +611,7 @@ fn idle_lock() -> Result<Option<File>, ServiceError> {
 pub async fn cleanup_uci(uninstall: bool) -> Result<(), ServiceError> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(50);
     let _lock = loop {
-        match tokio::task::block_in_place(idle_lock) {
+        match tokio::task::block_in_place(|| idle_lock(Path::new(uci::STATE_FILE))) {
             Ok(lock) => break lock,
             Err(ServiceError::Store(tunnel_detour_core::StoreError::Lock(
                 std::fs::TryLockError::WouldBlock,
@@ -416,7 +624,11 @@ pub async fn cleanup_uci(uninstall: bool) -> Result<(), ServiceError> {
     if uninstall {
         crate::cleanup_inbound_uci().await?;
     }
-    crate::frontend::cleanup_all(Path::new(uci::STATE_FILE)).await?;
+    let cleaned = crate::frontend::cleanup_all(Path::new(uci::STATE_FILE)).await;
+    if !uninstall {
+        return cleaned.and(finish_uci_cleanup(false));
+    }
+    cleaned?;
     if uninstall {
         crate::ipv6_routing::Ipv6Routing::cleanup(Path::new(uci::STATE_FILE)).await?;
         crate::cache_guard::remove().await?;
@@ -435,9 +647,13 @@ pub async fn cleanup_uci(uninstall: bool) -> Result<(), ServiceError> {
             format!("{}.ipv6-routing.json", uci::STATE_FILE),
             format!("{}.ipv6-routing.json.lock", uci::STATE_FILE),
             uci::STATUS_FILE.to_string(),
+            "/var/run/tunnel-detour/observability.revoked".to_string(),
+            "/var/run/tunnel-detour/observability.grant".to_string(),
             crate::inbound_uci::STATE.to_string(),
             format!("{}.lock", crate::inbound_uci::STATE),
             crate::inbound_uci::STATUS.to_string(),
+            "/var/run/tunnel-detour/inbound/observability.revoked".to_string(),
+            "/var/run/tunnel-detour/inbound/observability.grant".to_string(),
             "/etc/config/tunnel-detour".to_string(),
         ] {
             match fs::remove_file(path) {

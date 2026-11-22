@@ -103,7 +103,7 @@ pub(crate) fn existing<T: DeserializeOwned>(
 pub(crate) struct PrivateJournal {
     path: PathBuf,
     new_lock: bool,
-    _lock: File,
+    lock: File,
 }
 
 impl PrivateJournal {
@@ -136,8 +136,12 @@ impl PrivateJournal {
         Ok(Self {
             path,
             new_lock,
-            _lock: lock,
+            lock,
         })
+    }
+
+    pub(crate) fn lock_identity(&self) -> std::io::Result<[u64; 2]> {
+        lock_identity(&self.lock)
     }
 
     /// The caller validates the deserialized policy before saving or mutating a frontend.
@@ -152,6 +156,41 @@ impl PrivateJournal {
     pub(crate) fn save<T: Serialize>(&self, state: &T) -> Result<(), IntegrationStateError> {
         atomic_write(&self.path, state)
     }
+}
+
+pub(crate) fn status_writer_path(path: &Path) -> PathBuf {
+    appended_path(path, ".writer.lock")
+}
+
+/// Hold this lock for the lifetime of a JSON status writer, including periods
+/// when publication fails and the snapshot must be removed.
+pub(crate) fn try_status_writer(
+    path: &Path,
+    create: bool,
+) -> Result<Option<File>, IntegrationStateError> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(create)
+        .mode(0o600)
+        .custom_flags(
+            i32::try_from((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits())
+                .map_err(|_| IntegrationStateError::Unsafe)?,
+        );
+    let lock = match options.open(status_writer_path(path)) {
+        Ok(lock) => lock,
+        Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    private(&lock.metadata()?)?;
+    lock.try_lock()?;
+    Ok(Some(lock))
+}
+
+pub(crate) fn lock_identity(lock: &File) -> std::io::Result<[u64; 2]> {
+    let metadata = lock.metadata()?;
+    Ok([metadata.dev(), metadata.ino()])
 }
 
 pub(crate) fn atomic_write<T: Serialize>(

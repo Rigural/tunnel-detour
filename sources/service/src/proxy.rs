@@ -42,7 +42,7 @@ async fn dial_result(
 impl ProxyHandler {
     pub async fn serve(
         &self,
-        id: String,
+        observation: &crate::status::Observation,
         incoming: TcpStream,
         peer: SocketAddr,
         cancel: CancellationToken,
@@ -71,6 +71,7 @@ impl ProxyHandler {
             result = timeout(self.config.dns_timeout(), self.resolver.resolve(&domain, peer.ip(), original.ip())) => result.map_err(|_| ServiceError::Timeout)??,
             () = cancel.cancelled() => return Ok(()),
         };
+        self.status.clear_frontend_degradation()?;
         let (outgoing, destination) = tokio::select! {
             result = timeout(Duration::from_secs(self.config.limits.connect_timeout_seconds), self.connect(addresses, original.port())) => result.map_err(|_| ServiceError::Timeout)??,
             () = cancel.cancelled() => return Ok(()),
@@ -83,12 +84,14 @@ impl ProxyHandler {
                 .authorize_tcp(original.ip(), original.port(), now()?)?;
             Ok::<_, ServiceError>(())
         })?;
-        self.status.insert(ConnectionStatus {
-            id: id.clone(),
-            domain,
-            client: peer,
-            destination,
-            started_at: now()?,
+        let id = self.status.insert(observation, |id| {
+            Ok(ConnectionStatus {
+                id,
+                domain,
+                client: peer,
+                destination,
+                started_at: now()?,
+            })
         })?;
         let result = match self
             .transport
@@ -103,15 +106,17 @@ impl ProxyHandler {
             )
             .await
         {
-            Ok(crate::transport_worker::Outcome::Complete(bytes)) => Ok(bytes),
+            Ok(crate::transport_worker::Outcome::Complete) => Ok(()),
             Ok(crate::transport_worker::Outcome::Cancelled) => Err(ServiceError::Cancelled),
             Ok(_) => Err(ServiceError::Timeout),
             Err(error) => Err(ServiceError::Io(error)),
         };
-        self.status.finish(&id, result.as_ref().ok().copied())?;
+        if let Some(id) = id {
+            self.status.finish(observation, &id, result.is_ok())?;
+        }
         match result {
             Err(ServiceError::Cancelled) => Ok(()),
-            other => other.map(|_| ()),
+            other => other,
         }
     }
 

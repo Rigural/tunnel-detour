@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+- Control DNS and inbound traffic diagnostics independently in LuCI, UCI and JSON
+  configuration. Both default to off on fresh installs and upgrades. Withdrawing
+  consent hides and discards the previous diagnostic period while established
+  connections continue under the applied policy.
+- Show pending revocation, unapplied settings and temporary status failures in
+  LuCI. Keep each JSON status file under its daemon's ownership. If status
+  publication fails after a purge, traffic continues while publication retries.
+
+### Fixed
+
+- Reject unresolved DNS referrals before connecting over WAN. Clean up Fake-IP
+  firewall chains without reading unrelated nftables rules and sets.
+- Repair missing inbound IPv6 redirects while preserving administrator rules in
+  place. Report conflicts when rule ownership cannot be verified. If software
+  flow retirement fails, attempt to block new admissions and purge owned IPv6
+  connection tracking entries independently, with separate outcomes in the log.
+- Report transport worker startup failures with a stable health code while
+  diagnostics are off. Clear the degraded status after a subsequent worker
+  confirms successful initialization.
+
+### Development
+
+- Use incremental Rust development builds with lightweight debug information.
+  Add a full-symbol profile and document how to use Foundation's shared build cache.
+- Use the exact images built for each OpenWrt laboratory run. Report a leftover
+  native management network before starting any scenario.
+
 ## 0.2.0 — release candidate
 
 - Manage exceptions through either a router-local AdGuard Home API or an existing
