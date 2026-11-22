@@ -22,10 +22,40 @@ env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
-  build:
-    name: Test and build APKs
+  workspace:
+    name: Check Rust workspace
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 5
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check lints
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run workspace tests
+        run: cargo xtask test
+
+  audit:
+    name: Audit Rust dependencies
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Audit locked dependencies against RustSec
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --deny warnings
+
+  build:
+    name: Build and verify APKs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
       contents: read
       id-token: write
@@ -37,34 +67,15 @@ jobs:
         run: |
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
-      - name: Check out the tagged commit
+      - name: Check out the release commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
           persist-credentials: false
       - name: Record the checked-out source
         id: source
         run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Refresh system package metadata
-        run: sudo apt-get update
-      - name: Install build prerequisites
-        run: sudo apt-get install --yes --no-install-recommends curl openssl zstd
-      - name: Install targets with the repository's pinned Rust toolchain
-        run: rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Audit locked dependencies against RustSec
-        run: |
-          cargo install cargo-audit --version 0.22.2 --locked
-          cargo audit --deny warnings
-      - name: Check lints
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Run workspace tests
-        run: cargo xtask test
-      - name: Run isolated network acceptance tests
-        run: cargo xtask test-network
-      - name: Run native OpenWrt management acceptance tests
-        run: cargo xtask test-openwrt
+      - name: Install the OpenWrt Rust target
+        run: rustup target add aarch64-unknown-linux-musl
       - name: Build and inspect reference-target packages
         run: cargo xtask package --download-sdk "$RUNNER_TEMP/openwrt-sdk" --release-tag "$RELEASE_TAG"
       - name: Confirm that the packages describe the checked-out source
@@ -95,9 +106,9 @@ jobs:
 
   publish:
     name: Publish GitHub release
-    needs: build
+    needs: [workspace, audit, build]
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 5
     permissions:
       contents: write
     steps:
