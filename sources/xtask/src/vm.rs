@@ -254,9 +254,10 @@ fn shell_argument(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn guest_exec(arguments: &str) -> String {
+fn guest_exec(shell: &str, arguments: &str) -> String {
     format!(
-        "exec /bin/sh -c {} tunnel-detour-vm {arguments}",
+        "exec {} -c {} tunnel-detour-vm {arguments}",
+        shell_argument(shell),
         shell_argument(GUEST_EXEC)
     )
 }
@@ -451,7 +452,7 @@ impl VmTransport {
             })
             .collect::<Vec<_>>()
             .join(" ");
-        let remote = guest_exec(&arguments);
+        let remote = guest_exec("/bin/sh", &arguments);
         Ok([
             "exec",
             "-i",
@@ -544,14 +545,17 @@ mod tests {
         let command = format!(
             "/bin/sh -ec {} fixture {}",
             shell_argument(
-                "test ! -e /proc/$$/fd/8; read -r line; printf '%s\\n' \"$line\" \"$1\"; printf 'guest stderr\\n' >&2"
+                "test ! -e /proc/$$/fd/8; test ! -e /proc/$$/fd/142; read -r line; printf '%s\\n' \"$line\" \"$1\"; printf 'guest stderr\\n' >&2"
             ),
             shell_argument("an argument with 'quotes'")
         );
-        // Duplicate the input pipe into a non-close-on-exec descriptor.
-        let mut child = Command::new("/bin/sh")
+        // OpenWrt ash and Bash support multi-digit redirections; host dash does not.
+        let mut child = Command::new("/bin/bash")
             .arg("-ec")
-            .arg(format!("exec 8<&0\n{}", guest_exec(&command)))
+            .arg(format!(
+                "exec 8<&0 142<&0\ntest -p /proc/$$/fd/8\ntest -p /proc/$$/fd/142\n{}",
+                guest_exec("/bin/bash", &command)
+            ))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -4,7 +4,7 @@ Domain-based VPN exceptions for OpenWrt. Selected HTTP and HTTPS traffic uses WA
 while other traffic keeps its existing route. LuCI manages the rules and TLS passes
 through without decryption.
 
-Built for OpenWrt One on OpenWrt 25.12.6. Current version: **0.3.1**.
+Built for OpenWrt One on OpenWrt 25.12.6. Current version: **0.3.2**.
 [Changelog](CHANGELOG.md) · [Releases](https://github.com/Rigural/tunnel-detour/releases) ·
 [LuCI preview](docs/screenshots/status.jpg)
 

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.2
+
+- Fix the QEMU launcher test on Linux hosts whose default shell cannot close
+  multi-digit file descriptors.
+
 ## 0.3.1
 
 - Update the `url` dependency to 2.5.9 to address
