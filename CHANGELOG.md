@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1
+
+- Update the `url` dependency to 2.5.9 to address
+  [RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592.html).
+
 ## 0.3.0
 
 ### Added

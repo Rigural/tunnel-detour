@@ -1,287 +1,72 @@
 # Tunnel Detour
 
-Current source version: **0.3.0**. See [CHANGELOG.md](CHANGELOG.md) for the version notes.
+Domain-based VPN exceptions for OpenWrt. Selected HTTP and HTTPS traffic uses WAN,
+while other traffic keeps its existing route. LuCI manages the rules and TLS passes
+through without decryption.
 
-Domain-based VPN exceptions for OpenWrt, implemented in Rust, with optional AdGuard Home integration. Selected HTTP and
-HTTPS connections use WAN through DNS Fake-IP mappings and a transparent TCP relay. Other traffic
-keeps its existing route. LuCI manages one exception list and its forwarding rules automatically,
-using either AdGuard Home or an existing dnsmasq frontend. TLS passes through without decryption.
+Built for OpenWrt One on OpenWrt 25.12.6. Current version: **0.3.1**.
+[Changelog](CHANGELOG.md) · [Releases](https://github.com/Rigural/tunnel-detour/releases) ·
+[LuCI preview](docs/screenshots/status.jpg)
 
-The initial target is OpenWrt One with OpenWrt 25.12.6, firewall4/nftables and APK packages.
-Exceptions support TCP ports 80 and 443, with IPv4 compatibility mode and optional IPv6,
-including IPv6-only destinations. QUIC is rejected to allow TCP fallback; HTTP/3 remains deferred.
-Exception traffic fails closed when its path is unavailable.
+## Setup
 
-Exception clients must use the configured DNS frontend and normal hostname validation.
-Fake-IP preserves DNS hostname identity; it does not authenticate an HTTP Host header or the
-hostname inside opaque TLS. Treat the selected LAN as trusted, or restrict **Trusted exception
-clients** to IPv4/IPv6 CIDRs within it. This is not a boundary against a malicious authorized client.
+1. Download and install both APKs from the release: `tunnel-detour` and `luci-app-tunnel-detour`.
+2. In LuCI **Settings**, select the LAN, WAN and existing DNS frontend: AdGuard Home or
+   dnsmasq. Set a DNS-over-TCP resolver reachable through the VPN or a local route,
+   separate from Fake-IP forwarding.
+3. Add names under **Exceptions**, then enable the service and **Save & Apply**.
+   Clients must use the configured DNS frontend. Limit access to trusted LAN clients.
 
-## LuCI interface
-
-Status shows service health and adds live connections when traffic diagnostics are enabled.
-Exceptions provides per-rule validation, match
-examples and undo before saving. Settings groups network selection and the DNS integration;
-AdGuard credentials and its connection test appear only when that integration is selected.
-Credentials are write-only in LuCI and stored outside UCI in a root-owned private file.
-Upgrade/startup migrates legacy credentials; leave both fields empty to retain them, or use the
-explicit anonymous-authentication option. Save prepares one private draft; its nonsecret UCI revision selects it
-on apply, and discarding UCI changes retains the applied credentials. A superseded draft fails
-closed. A read-only LuCI session cannot retrieve or replace stored credentials.
-
-Inbound ports manages publications independently of DNS exceptions. See
-[Inbound ports](#inbound-ports) for target address families, DHCP and setup.
-
-Screenshots use an isolated demo with synthetic domains, addresses and connection data.
-
-![Service status and active connections](docs/screenshots/status.jpg)
-
-<details>
-<summary>Exceptions, settings and inbound ports</summary>
-
-![Exception scopes and matching examples](docs/screenshots/exceptions.jpg)
-
-![Network settings and DNS integration](docs/screenshots/settings.jpg)
-
-![Inbound port publications](docs/screenshots/inbound.jpg)
-
-</details>
-
-## Inbound ports
-
-Internet clients connect to the router's public IPv6 address. Replies use WAN while ordinary
-traffic keeps its existing route. This feature works with DNS exceptions disabled; enabling
-**IPv6 exceptions** in Settings is not required for inbound publications.
-
-| LAN server address | Supported transports | Forwarding path |
-| --- | --- | --- |
-| IPv6 | TCP, UDP or both | Native IPv6 forwarding |
-| IPv4 | TCP | IPv6-to-IPv4 TCP relay |
-
-For an IPv4 server, the publication must contain its IPv4 address. Entering an IPv6 address
-selects native IPv6 forwarding. The IPv4 server sees the router as its source; LuCI shows the
-original IPv6 client in the active relay connections.
-
-1. Reserve the server's LAN address in OpenWrt's native DHCP page, or use an existing stable
-   address. Tunnel Detour does not create or edit DHCP reservations. Neighbor suggestions do
-   not establish address stability.
-2. Open **Inbound ports**, enable the feature and select the LAN and WAN networks.
-3. Add a publication with the protocol, external port, LAN server address and internal port.
-   Choose **Internet only**, or explicitly allow **Internet and LAN** access to the public address.
-4. **Save & Apply**, then run **Check applied inbound configuration**. Test with the server
-   listening, including a connection from an independent external IPv6 network.
-
-Internet-and-LAN access keeps local connections on LAN and presents the router's source
-address to the server. Connection, connect-timeout and inactivity limits are configurable.
-At capacity, up to 32 extra ingress connections wait at most 250 ms for a slot.
-Ports occupied by other router services are refused, with their known use displayed.
-Replacing this package's own publications requires confirmation and retains their disabled
-settings; applying changes closes affected connections.
-
-Back up existing manual forwarding and routing settings before migrating them. Conflicting
-redirects require explicit migration; Tunnel Detour does not automatically adopt unrelated rules.
-The package writes its generated redirects to UCI and updates their live rules without reloading
-the entire firewall. Runtime-only administrator rules retain their order and handles; new
-package dispatch rules do not copy administrator logging or counters. Avoid editing the same
-live rules directly with `nft` during Apply: raw edits do not acquire the firewall4 lock and
-can race the final check.
-Applied state and successful LAN access do not prove Internet reachability. Software flow
-offloading through OpenWrt's `inet fw4 ft` is supported. Retiring a publication refreshes that
-table and its native rule, so other accelerated flows may briefly use ordinary forwarding.
-If that update fails, the service attempts both to close new admissions and to purge IPv6
-conntrack entries for all package publications. If either operation fails, the system log
-reports both outcomes separately. A successful purge does not mean new admissions were
-blocked if the guard could not be written. A foreign flowtable or hardware
-offloading makes inbound admission fail with `kernel_conflict`. Hardware acceleration and
-full device acceptance remain separate validation work.
-
-## Domain rules
+Exceptions cover TCP ports 80 and 443. IPv6 exceptions are optional, QUIC is rejected
+to allow TCP fallback, and exceptions fail closed if their WAN path is unavailable.
 
 | Rule | Matches |
 | --- | --- |
-| `example.test` | The exact hostname |
+| `example.test` | Exact hostname |
 | `*.example.test` | One subdomain level |
-| `**.example.test` | All subdomain levels, excluding the root |
-| `***.example.test` | The root and all subdomain levels |
+| `**.example.test` | All subdomains |
+| `***.example.test` | The hostname and all subdomains |
 
-Rules combine. Adding a narrower rule does not cancel a broader one.
+## Inbound ports
 
-## Configuration
+In LuCI **Inbound ports**, select the LAN and WAN and map an external port on the
+router's public IPv6 address to a stable LAN address. IPv6 targets support TCP and UDP.
+IPv4 targets support TCP through the relay. Replies use WAN, and publications can run
+independently of DNS exceptions. Check applied configuration and test from an external
+IPv6 network.
 
-The packages are named `tunnel-detour` and `luci-app-tunnel-detour`. Neither DNS frontend is
-installed automatically. Choose the frontend already serving your LAN:
+## Diagnostics
 
-- **AdGuard Home:** configure its router-local API access. Existing filtering, client policies
-  and local names are preserved. API failure never selects another integration automatically.
-- **Existing dnsmasq:** requires one running standard OpenWrt instance. Tunnel Detour owns only
-  domain-specific forwards; DHCP, local names and unrelated upstreams remain with dnsmasq.
-  Custom filters, extra configuration files, DNSSEC and overlapping local or conditional rules
-  are rejected rather than bypassed. Aliases and cached connections are rechecked before WAN.
-
-New installs are disabled and require an explicit integration choice. Existing configurations
-without a selector keep using AdGuard Home. Configure LAN/WAN networks and a separate real DNS
-resolver, add exceptions, then enable the service. The real resolver uses DNS over TCP to a
-literal IPv4 or IPv6 endpoint and must avoid the frontend's Fake-IP path. Use `[IPv6]:port`
-for a custom IPv6 port; omitting the port selects 53. Its existing VPN or local interface is pinned;
-WAN fallback is refused. No DNS provider or fallback is selected automatically.
-IPv6 resolver paths require loopback, the selected LAN or a native WireGuard device.
-
-For IPv6 exceptions, enable the option in Settings and select the IPv6 WAN network. It requires
-existing usable LAN prefixes and a preferred global WAN source; DHCP and IPv6 announcements
-are not changed. Status shows the applied device/source. Both address families share one
-per-hostname lease, and losing its LAN or WAN context closes exception connections.
-Compatibility mode suppresses AAAA and rejects cached synthetic IPv6 addresses.
-
-Direct same-host HTTPS ServiceMode records retain supported TCP parameters and use synthetic
-address hints with bounded TTLs. HTTP/3 ALPN is removed. Alternate targets, aliases, unsupported
-ports, ECH and unknown or unavailable mandatory parameters retain empty answers. SVCB queries
-for selected hostnames and port-qualified HTTPS records stay suppressed; this is a limited HTTP
-mapping, not general SVCB or ECH support. Ordinary hostnames retain their upstream DNS records.
-
-AdGuard upstream management is optional. Preview the proposed general upstream or explicitly
-import its current TCP resolver, then accept and Save & Apply within ten minutes. Tunnel Detour
-keeps a recoverable baseline, preserves bootstrap and conditional settings, and audits for
-conflicting edits. AdGuard has no conditional-write API: use Tunnel Detour as the only upstream
-editor while this option is enabled. Detected conflicts require a fresh review. Resolver changes
-preserve established TCP streams and Fake-IP mappings. System DNS, DHCP and IPv6 announcements
-remain outside this setting.
-
-Changing integration first checks the replacement, then removes the previous owned forwards.
-If cleanup fails, recovery state is retained and activation fails closed. Keep the old frontend
-and its API available until the transition completes. Inactive AdGuard credentials remain in
-private configuration for recovery; disabling or uninstalling removes owned forwards and restores
-an adopted general upstream only while its ownership is still provable.
-After activation, `/etc/nftables.d/tunnel-detour-cache-guard.nft` protects cached synthetic
-addresses across stops and reboots, including failed service startup. Uninstall removes
-this file and its firewall guards.
-Synthetic answers are not DNSSEC authenticated.
-
-New hostname allocations default to 512 permanent identities per matching rule and 4096 total.
-Settings exposes both budgets and Status shows occupancy. Expiry never releases an identity;
-known hostnames can renew when a budget is full. The most specific matching rule owns admission,
-and its budget counts all stored names it matches, including expired entries.
-
-The controller retains privileges for DNS policy and OpenWrt configuration. Each opaque TCP
-transport runs as the platform's `nobody` user in an empty private filesystem root, with no
-supplementary groups, no effective capabilities and no privilege escalation through exec.
-The controller passes only the authorized connected sockets, supervises cancellation and reaps
-the process. Unexpected inherited descriptors refuse the connection. An architecture-checked
-seccomp allowlist denies new network sockets, process signals, filesystem access and process
-creation; its installation is required. Anonymous local socket pairs are allowed for Tokio's
-wakeup mechanism. Both independent features reuse one empty runtime root, avoiding directory
-growth after hard crashes; uninstall removes it. This isolates copying; DNS parsing and policy
-remain in the privileged controller.
-
-## Local diagnostics
-
-DNS and inbound traffic diagnostics are off by default, including on upgraded configurations
-without an `observability` option. Enable them independently in LuCI under **Settings** and
-**Inbound ports**. The UCI flags are `tunnel-detour.globals.observability` and
-`tunnel-detour.inbound.observability` (`0` or `1`). JSON daemon configurations use the top-level
-Boolean `observability`, which defaults to `false`.
-For a running JSON DNS daemon, send SIGHUP after editing the file to apply diagnostics consent.
-The status field `restart_required` indicates other settings that will take effect on restart.
-The JSON inbound daemon applies both consent and publication configuration on SIGHUP. Use a
-separate status path for each JSON daemon. An operational JSON snapshot identifies its owner
-even with diagnostics off. Startup and inbound configuration validation reject a snapshot from
-a different owner. Each running JSON daemon also locks its status path while publication is
-unavailable. The OpenWrt UCI status paths are reserved.
-
-Opting in shows live connection addresses and aggregate request and session counters to authorized
-Status readers, including users with read-only access.
-DNS diagnostics also show exception hostnames and Fake-IP pool occupancy. OpenWrt status snapshots
-live in `/var/run`. They keep active details and bounded counters for the current opt-in period.
-The local OpenWrt system log receives operational warnings and errors with stable codes and with
-traffic details omitted. Optional diagnostics events require opt-in. Log retention and forwarding
-follow the router's logging configuration. On Apply, revocation hides optional data immediately.
-Status shows that revocation is pending until the daemon discards it. LuCI assigns a new consent
-period on each activation and saves it with the option. Every subsequent activation starts a
-fresh period even when procd handles multiple applied changes together. If LuCI rolls back an
-applied withdrawal and restores consent, the previous period remains hidden and the service
-collects only fresh diagnostics. Withdrawing consent removes an existing grant and needs no
-new file allocation. If storage prevents a new grant, diagnostics stay off. If the applied
-status cannot be published after a purge, LuCI reports it as temporarily unavailable. The
-service keeps traffic running and retries publication. If a saved UCI resolver or publication
-change is rejected while the previous policy remains active, diagnostics pause. Applying a
-valid configuration with consent enabled opens a fresh period.
-When editing UCI directly,
-invoke the service's `reload` successfully after each commit. Existing system-log entries and the
-independent logging settings of AdGuard Home or dnsmasq follow those services' policies.
-
-For an inbound `kernel_conflict`, look for `nat_stage` in the system log. `inspection` means
-nftables could not be read. `dispatch`, `rule_order` and `owned_rule` identify a zone jump, an
-earlier rule or a changed redirect that prevents verification. `concurrent_change` means the
-live rules could still be verified after the UCI commit, but the resulting plan differs
-from the one prepared before it. Review firewall4 zone family,
-source selectors and earlier rules before applying the corrected configuration. These messages
-contain no addresses, ports or rule contents.
-For `transport_worker_failed`, the system log reports a fixed startup stage, such as
-`worker_root` or `sandbox`, even with traffic diagnostics off. It does not include
-connection information. At `inherited_descriptors`, a fixed reason distinguishes
-inspection errors from an unexpected descriptor. Only opt-in diagnostics can show
-the descriptor type, its close-on-exec flag, or a system error number; they never show descriptor
-numbers, paths, or contents. A verified later worker can clear the degradation without
-restarting or reconfiguring the service.
-
-Tunnel Detour keeps the configuration, Fake-IP hostname assignments and lease timestamps it needs
-to route cached addresses safely, along with ownership journals for cleanup and recovery. The
-basic Status view and explicit configuration checks remain available with diagnostics off.
-Configuration commands return stable error codes for service failures. Remove `observability` and
-`observability_epoch` from both UCI sections before installing a version that predates diagnostics
-consent. The benchmark fixtures explicitly enable diagnostics when they measure request and relay totals.
+DNS and inbound traffic diagnostics are independently opt-in, including on upgrade.
+Enable them in **Settings** or **Inbound ports** to show connection details and
+counters in LuCI. Turning diagnostics off discards the current diagnostic period.
 
 ## Development
 
-Use Rust 1.96. Network laboratories require Linux and Docker; APK builds require the
-OpenWrt 25.12.6 mediatek/filogic SDK and the `aarch64-unknown-linux-musl` Rust target.
+Use Rust 1.96. Network and OpenWrt labs require Linux and Docker. APK builds also
+require the OpenWrt 25.12.6 mediatek/filogic SDK and the `aarch64-unknown-linux-musl` target.
 
 ```sh
 cargo fmt --all -- --check
-cargo test --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --locked
 cargo xtask package --sdk /path/to/openwrt-sdk
 ```
 
-APKs, source SBOM, build metadata and checksums are written to
-`target/packages/mediatek-filogic/`. Use the [requirement coverage map](sources/tests/requirements.md)
-to select the local laboratory:
+APK files, checksums, source SBOM and build metadata go to `target/packages/mediatek-filogic/`.
 
-- `cargo xtask test-network` runs the isolated Linux network tests in Docker.
-- `cargo xtask test-openwrt` runs the native OpenWrt 25.12.6 scenarios in Docker.
-- `cargo xtask test-openwrt-flow r054` runs a scenario on the pinned OpenWrt x86 kernel in
-  a QEMU guest inside Docker. The driver uses software emulation, so it does not require KVM.
-  The first run needs the Docker image inputs and the pinned kernel; subsequent runs can reuse
-  the cached inputs. These commands report test results on standard output.
+- `cargo xtask test-network` runs the isolated network suite.
+- `cargo xtask test-openwrt` runs the native OpenWrt suite.
+- `cargo xtask test-openwrt-flow r054` runs the selected scenario with the pinned OpenWrt
+  kernel in QEMU. The first run fetches the image inputs and kernel. Lab results go to stdout.
 
-Real-router tests require separate SSH authorization.
-`cargo xtask test-openwrt` uses a reserved Docker management subnet. If an interrupted run
-left its network behind, the runner reports the network before starting any scenario. Use
-`docker network inspect <reported-network>` to verify it is empty and no run is using it
-before removing that network with `docker network rm <reported-network>`. The harness never
-removes a pre-existing network. It retries a published HTTP connection failure once, only
-when the management endpoint responds inside the guest but the host connection is refused.
+See the [test coverage map](sources/tests/requirements.md). Tests on real router hardware
+require separate SSH authorization.
 
-### Local Rust builds and caches
-
-Development builds and tests use incremental compilation and keep source line information for
-workspace crates. Dependencies omit debug information. For full debugger symbols in both the
-workspace and its dependencies, use `cargo build --locked --profile debugging`. Use `--timings`
-to measure builds. Each checkout uses its own `target/` by default.
-
-On a host with the optional `foundation-build-cache` tool, run direct Cargo commands through it
-to record successful build artifacts. Use a stable flow name for each command and target scope.
-
-```sh
-foundation-build-cache run --flow tunnel-detour.check.core -- check --locked -p tunnel-detour-core
-foundation-build-cache run --flow tunnel-detour.test.workspace -- test --locked --workspace
-```
-
-Use plain Cargo on other hosts and run `cargo xtask` directly for packaging and laboratory work.
-When enabled for this checkout, the Foundation collector prunes inactive native artifacts. An
-optional `sccache` wrapper shares eligible compiler outputs across builds. Configure the wrapper,
-its cache size, and any Cargo job limit in your user-level configuration.
+Use `cargo build --locked --profile debugging` for full debug symbols. On hosts with the
+optional Foundation cache, an example is
+`foundation-build-cache run --flow tunnel-detour.test.workspace -- test --locked --workspace`.
 
 ## License
 
-The project's original code is licensed under the GNU General Public License, version 3 only
-(`GPL-3.0-only`). See [LICENSE](LICENSE) for the full terms.
+[GNU GPL version 3 only](LICENSE) (`GPL-3.0-only`).
